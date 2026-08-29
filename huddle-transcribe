@@ -127,7 +127,7 @@ if [[ $LIST -eq 1 ]]; then
     exit 1
   fi
   printf "%-8s  %-19s  %-8s  %s\n" "SESSION" "DATE" "DURATION" "TITLE"
-  while IFS=$'\t' read -r sid date dur title merged app mic; do
+  while IFS=$'\t' read -r sid date dur title _merged _app _mic; do
     printf "%-8s  %-19s  %-8s  %s\n" "${sid:0:8}" "${date%.*}" "$(fmt_duration "$dur")" "$title"
   done <<<"$rows"
   exit 0
@@ -144,17 +144,20 @@ find_session_by_date() {
     exit 1
   }
   local best_sid="" best_diff=""
-  while IFS=$'\t' read -r sid date dur title merged app mic; do
+  while IFS=$'\t' read -r sid date _dur _title _merged _app _mic; do
     local row_ts
     row_ts=$(TZ="UTC" date -j -f "%Y-%m-%d %H:%M:%S" "${date%.*}" "+%s" 2>/dev/null) || continue
     local diff=$((row_ts - target_ts))
     ((diff < 0)) && diff=$((-diff))
     if [[ -z "$best_diff" || $diff -lt $best_diff ]]; then
       best_diff=$diff
-      best_sid="$sid|$date|$dur|$title|$merged|$app|$mic"
+      best_sid="$sid"
     fi
   done < <(sql "$SESSION_QUERY")
-  echo "$best_sid"
+  # best_sid is a bare hex session id (no delimiters), safe to re-look-up
+  # cleanly rather than round-tripping title/filename fields through a
+  # delimiter that could appear in a session title.
+  [[ -n "$best_sid" ]] && find_session_by_id "$best_sid"
 }
 
 find_session_by_id() {
@@ -170,7 +173,7 @@ SELECTED=""
 if [[ -z "$TARGET" || "$TARGET" == "latest" ]]; then
   SELECTED=$(find_latest_session)
 elif [[ "$TARGET" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-  SELECTED=$(find_session_by_date "$TARGET" | tr '|' '\t')
+  SELECTED=$(find_session_by_date "$TARGET")
 else
   SELECTED=$(find_session_by_id "$TARGET")
 fi
