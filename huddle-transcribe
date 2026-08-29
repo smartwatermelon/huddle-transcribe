@@ -57,6 +57,10 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --output-dir)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --output-dir requires a PATH argument" >&2
+        exit 1
+      fi
       OUTPUT_DIR="$2"
       shift 2
       ;;
@@ -209,7 +213,7 @@ echo "Title:    $STITLE"
 echo "Source:   $SOURCE_PATH"
 echo "Output:   $OUT_TXT"
 
-if [[ ! -f "$SOURCE_PATH" ]]; then
+if [[ $MARK_REVIEWED -ne 1 && ! -f "$SOURCE_PATH" ]]; then
   echo "Error: source audio file not found at $SOURCE_PATH" >&2
   exit 1
 fi
