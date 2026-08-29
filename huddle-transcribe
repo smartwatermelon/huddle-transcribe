@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# huddle-transcribe: select, transcribe, and diarize MacWhisper meeting recordings via `mw`.
+set -euo pipefail
+
+DB="$HOME/Library/Application Support/MacWhisper/Database/main.sqlite"
+MEDIA_DIR="$HOME/Library/Application Support/MacWhisper/Database/ExternalMedia"
+CONFIG_FILE="$HOME/.config/huddle-transcribe/config"
+DEFAULT_OUTPUT_DIR="$HOME/Library/CloudStorage/GoogleDrive-andrew.rich@beacon.bio/My Drive/Slack transcripts"
+MIN_DURATION_SECONDS=300
+MW_BIN="/usr/local/bin/mw"
+
+OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
+if [[ -f "$CONFIG_FILE" ]]; then
+  config_output_dir=$(sed -n -E 's/^OUTPUT_DIR=["'"'"']?([^"'"'"']*)["'"'"']?[[:space:]]*$/\1/p' "$CONFIG_FILE" | tail -1)
+  [[ -n "$config_output_dir" ]] && OUTPUT_DIR="$config_output_dir"
+fi
+
+DRY_RUN=0
+LIST=0
+MARK_REVIEWED=0
+ASSUME_YES=0
+TARGET=""
+
+usage() {
+  cat <<'EOF'
+Usage: huddle-transcribe [OPTIONS] [SESSION_ID_OR_DATE]
+
+Arguments:
+  SESSION_ID_OR_DATE   'latest' (default), YYYY-MM-DD, or a MacWhisper session UUID
+
+Options:
+  --dry-run             Show which session would be selected, don't transcribe
+  --list                List recent MacWhisper sessions (last 10) with metadata
+  --mark-reviewed       Set reviewed=true, delete source .m4a for SESSION_ID_OR_DATE
+  --yes                 Skip confirmation prompt
+  --output-dir PATH     Override default output dir
+  -h, --help            Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --list)
+      LIST=1
+      shift
+      ;;
+    --mark-reviewed)
+      MARK_REVIEWED=1
+      shift
+      ;;
+    --yes)
+      ASSUME_YES=1
+      shift
+      ;;
+    --output-dir)
+      OUTPUT_DIR="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      TARGET="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ ! -x "$MW_BIN" ]]; then
+  echo "Error: mw CLI not found at $MW_BIN. Check MacWhisper install." >&2
+  exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+sql() {
+  sqlite3 -separator $'\t' "$DB" "$1"
+}
+
+# Columns: session_id \t dateCreated \t duration \t title \t merged_filename \t app_audio_filename \t mic_audio_filename
+SESSION_QUERY="
+SELECT
+  lower(hex(s.id)),
+  s.dateCreated,
+  COALESCE(rm.duration, sar.duration, 0),
+  COALESCE(s.userChosenTitle, s.aiTitle, rm.title, sar.title, 'Untitled'),
+  COALESCE((SELECT filename FROM mediafile WHERE sessionID = s.id AND type = 'mergedMultitrack' LIMIT 1), ''),
+  COALESCE((SELECT filename FROM mediafile WHERE sessionID = s.id AND type = 'meetingAppAudio' LIMIT 1), ''),
+  COALESCE((SELECT filename FROM mediafile WHERE sessionID = s.id AND type = 'meetingMicAudio' LIMIT 1), '')
+FROM session s
+LEFT JOIN recordedmeeting rm ON rm.id = s.recordedMeetingID
+LEFT JOIN systemaudiorecording sar ON sar.id = s.systemAudioRecordingID
+WHERE COALESCE(rm.duration, sar.duration, 0) > $MIN_DURATION_SECONDS
+ORDER BY s.dateCreated DESC
+"
+
+slugify() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g'
+}
+
+fmt_duration() {
+  local secs="$1"
+  local m=$((${secs%.*} / 60))
+  local s=$((${secs%.*} % 60))
+  printf "%dm%02ds" "$m" "$s"
+}
+
+# --- --list ---
+if [[ $LIST -eq 1 ]]; then
+  rows=$(sql "$SESSION_QUERY LIMIT 10")
+  if [[ -z "$rows" ]]; then
+    echo "No qualifying sessions found (duration > ${MIN_DURATION_SECONDS}s)." >&2
+    exit 1
+  fi
+  printf "%-8s  %-19s  %-8s  %s\n" "SESSION" "DATE" "DURATION" "TITLE"
+  while IFS=$'\t' read -r sid date dur title merged app mic; do
+    printf "%-8s  %-19s  %-8s  %s\n" "${sid:0:8}" "${date%.*}" "$(fmt_duration "$dur")" "$title"
+  done <<<"$rows"
+  exit 0
+fi
+
+# --- session selection ---
+find_session_by_date() {
+  local target_date="$1"
+  # Target 8:00 AM PT on that date; TZ=America/Los_Angeles lets `date` resolve
+  # PST/PDT correctly instead of a hardcoded UTC offset.
+  local target_ts
+  target_ts=$(TZ="America/Los_Angeles" date -j -f "%Y-%m-%d %H:%M:%S" "${target_date} 08:00:00" "+%s" 2>/dev/null) || {
+    echo "Error: invalid date '$target_date' (expected YYYY-MM-DD)" >&2
+    exit 1
+  }
+  local best_sid="" best_diff=""
+  while IFS=$'\t' read -r sid date dur title merged app mic; do
+    local row_ts
+    row_ts=$(TZ="UTC" date -j -f "%Y-%m-%d %H:%M:%S" "${date%.*}" "+%s" 2>/dev/null) || continue
+    local diff=$((row_ts - target_ts))
+    ((diff < 0)) && diff=$((-diff))
+    if [[ -z "$best_diff" || $diff -lt $best_diff ]]; then
+      best_diff=$diff
+      best_sid="$sid|$date|$dur|$title|$merged|$app|$mic"
+    fi
+  done < <(sql "$SESSION_QUERY")
+  echo "$best_sid"
+}
+
+find_session_by_id() {
+  local partial="$1"
+  sql "$SESSION_QUERY" | awk -F'\t' -v id="$partial" 'index(tolower($1), tolower(id)) == 1 {print; exit}'
+}
+
+find_latest_session() {
+  sql "$SESSION_QUERY LIMIT 1"
+}
+
+SELECTED=""
+if [[ -z "$TARGET" || "$TARGET" == "latest" ]]; then
+  SELECTED=$(find_latest_session)
+elif [[ "$TARGET" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+  SELECTED=$(find_session_by_date "$TARGET" | tr '|' '\t')
+else
+  SELECTED=$(find_session_by_id "$TARGET")
+fi
+
+if [[ -z "$SELECTED" ]]; then
+  echo "Error: no qualifying session found for '$TARGET'. Try --list." >&2
+  exit 1
+fi
+
+IFS=$'\t' read -r SID SDATE SDUR STITLE SMERGED SAPP SMIC <<<"$SELECTED"
+
+# Prefer merged multitrack, then app audio, then mic audio.
+SOURCE_FILENAME=""
+if [[ -n "$SMERGED" ]]; then
+  SOURCE_FILENAME="$SMERGED"
+elif [[ -n "$SAPP" ]]; then
+  SOURCE_FILENAME="$SAPP"
+elif [[ -n "$SMIC" ]]; then
+  SOURCE_FILENAME="$SMIC"
+else
+  echo "Error: session $SID has no usable audio file." >&2
+  exit 1
+fi
+
+SOURCE_PATH="$MEDIA_DIR/$SOURCE_FILENAME"
+SESSION_DATE_ONLY="${SDATE%% *}"
+if ! [[ "$SESSION_DATE_ONLY" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+  echo "Error: unexpected session date format '$SDATE'" >&2
+  exit 1
+fi
+SLUG=$(slugify "$STITLE")
+OUT_BASENAME="${SESSION_DATE_ONLY}_${SLUG}"
+OUT_TXT="$OUTPUT_DIR/${OUT_BASENAME}.txt"
+OUT_META="$OUTPUT_DIR/${OUT_BASENAME}.meta.json"
+
+echo "Session:  ${SID:0:8}"
+echo "Date:     $SDATE"
+echo "Duration: $(fmt_duration "$SDUR")"
+echo "Title:    $STITLE"
+echo "Source:   $SOURCE_PATH"
+echo "Output:   $OUT_TXT"
+
+if [[ ! -f "$SOURCE_PATH" ]]; then
+  echo "Error: source audio file not found at $SOURCE_PATH" >&2
+  exit 1
+fi
+
+# --- --mark-reviewed ---
+if [[ $MARK_REVIEWED -eq 1 ]]; then
+  if [[ ! -f "$OUT_META" ]]; then
+    echo "Error: no metadata sidecar found at $OUT_META. Transcribe first." >&2
+    exit 1
+  fi
+  if [[ $ASSUME_YES -ne 1 ]]; then
+    read -r -p "Mark reviewed and delete source .m4a ($SOURCE_PATH)? [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || {
+      echo "Aborted."
+      exit 1
+    }
+  fi
+  tmp=$(mktemp)
+  trap 'rm -f "$tmp"' EXIT
+  if ! jq '.reviewed = true | .deleted_source = true' "$OUT_META" >"$tmp" || [[ ! -s "$tmp" ]]; then
+    echo "Error: failed to update metadata sidecar $OUT_META" >&2
+    exit 1
+  fi
+  mv "$tmp" "$OUT_META"
+  trap - EXIT
+  rm -f "$SOURCE_PATH"
+  echo "Marked reviewed and deleted source: $SOURCE_PATH"
+  exit 0
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "(dry run — no transcription performed)"
+  exit 0
+fi
+
+if [[ $ASSUME_YES -ne 1 ]]; then
+  read -r -p "Transcribe this session? [y/N] " reply
+  [[ "$reply" =~ ^[Yy]$ ]] || {
+    echo "Aborted."
+    exit 1
+  }
+fi
+
+"$MW_BIN" transcribe \
+  --speakers \
+  --speaker-names \
+  --timestamps \
+  --format txt \
+  --overwrite \
+  -o "$OUT_TXT" \
+  "$SOURCE_PATH"
+
+if ! grep -q "^Speaker " "$OUT_TXT" 2>/dev/null; then
+  echo "Warning: no 'Speaker' labels found in output. Check MacWhisper Settings > speaker detection." >&2
+fi
+
+jq -n \
+  --arg session_id "$SID" \
+  --arg date "$SESSION_DATE_ONLY" \
+  --argjson duration_seconds "$SDUR" \
+  --arg source_file "$SOURCE_FILENAME" \
+  --arg output_file "$(basename "$OUT_TXT")" \
+  '{
+    session_id: $session_id,
+    date: $date,
+    duration_seconds: $duration_seconds,
+    source_file: $source_file,
+    output_file: $output_file,
+    reviewed: false,
+    deleted_source: false
+  }' >"$OUT_META"
+
+echo "Transcript written: $OUT_TXT"
+echo "Metadata written:   $OUT_META"
