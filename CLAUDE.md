@@ -143,10 +143,17 @@ and why.
 
 **A PR that touches `.github/workflows/` gets no Claude review.**
 `claude-code-action` refuses to run against a PR that modifies its own
-workflow, so `claude-blocking-review` reports a green SKIP. On `@v3.0.0` that
-skip is mislabelled "Doc-only skip" regardless of the real reason. Treat a
-green blocking-review on a workflow-touching PR as "did not run", and get
-the diff reviewed another way.
+workflow, so `claude-blocking-review` reports a green SKIP having reviewed
+nothing. The step log names the real reason ("workflow-self-modification").
+Treat a green blocking-review on a workflow-touching PR as "did not run",
+and get the diff reviewed another way — a local adversarial-reviewer pass
+over the committed diff is what caught the last round of defects here.
+
+The reusable workflows are tracked on floating tags (`@v3`,
+`@dependabot-auto-merge-v1`) rather than exact versions, deliberately, so
+security fixes arrive without a Dependabot round-trip. See the comment in
+`claude-blocking-review.yml` for the incident behind that choice; do not
+"harden" it back to an exact pin without reading it first.
 
 ## The destructive path
 

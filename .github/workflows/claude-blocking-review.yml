@@ -11,8 +11,23 @@ permissions:
   id-token: write
 
 jobs:
+  # Tracks floating @v3, not an exact @v3.x.y, on upstream's own
+  # recommendation (smartwatermelon/github-workflows#138). Exact tags are
+  # immutable, so a caller pinned to one keeps resolving to whatever that
+  # commit contained -- which is how 19 repos kept running a
+  # claude-code-action vulnerable to GHSA-8q5r-mmjf-575q long after the fix
+  # shipped, each looking perfectly conformant in its own workflow file
+  # (github-workflows#126). Floating @v3 trades pin auditability for
+  # picking up security fixes automatically; that is the same tradeoff
+  # dependabot-auto-merge.yml documents and accepts in this repo.
+  #
+  # Note for anyone reading a green check on a PR that touches
+  # .github/workflows/: this review SKIPS such PRs. claude-code-action
+  # refuses to review a PR that can modify its own reviewer, so the job
+  # reports success without having reviewed anything. Get that diff
+  # reviewed some other way.
   claude-review:
-    uses: smartwatermelon/github-workflows/.github/workflows/claude-blocking-review.yml@v3.2.1
+    uses: smartwatermelon/github-workflows/.github/workflows/claude-blocking-review.yml@v3 # zizmor: ignore[unpinned-uses]
     with:
       pr_number: ${{ github.event.pull_request.number }}
     secrets:
