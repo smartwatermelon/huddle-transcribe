@@ -1,0 +1,68 @@
+name: Lint
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes, and the checked-out credential would
+          # otherwise persist in .git/config for later steps to reach.
+          persist-credentials: false
+
+      # Pin both tools to the versions used in local dev rather than taking
+      # whatever apt ships. ubuntu's shellcheck lags several releases and
+      # disagrees with newer ones on which checks fire, which would let CI
+      # pass on a script that fails locally (or the reverse). Checksums are
+      # verified so a moved tag cannot swap the binary.
+      - name: Install ShellCheck v0.11.0
+        run: |
+          curl -Lfso /tmp/shellcheck.tar.xz \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          expected_sha256="8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198"
+          echo "${expected_sha256}  /tmp/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/shellcheck.tar.xz -C /tmp
+          sudo install -m 0755 /tmp/shellcheck-v0.11.0/shellcheck /usr/local/bin/shellcheck
+          shellcheck --version | grep -q "version: 0.11.0"
+
+      - name: Install shfmt v3.14.0
+        run: |
+          curl -Lfso /tmp/shfmt \
+            https://github.com/mvdan/sh/releases/download/v3.14.0/shfmt_v3.14.0_linux_amd64
+          expected_sha256="fe42021c7272ef2d67ea36cbc3031683c625d0badec733ef3a57b567246a0b66"
+          echo "${expected_sha256}  /tmp/shfmt" | sha256sum -c -
+          sudo install -m 0755 /tmp/shfmt /usr/local/bin/shfmt
+          shfmt --version | grep -q "v3.14.0"
+
+      # -S info, not the default: the project standard is a clean run at
+      # info severity with no `# shellcheck disable` directives anywhere.
+      - name: ShellCheck
+        run: shellcheck -S info huddle-transcribe
+
+      # -i 2 -ci is the repo's format. Bare `shfmt` defaults to tabs and
+      # would report the entire file as unformatted.
+      - name: shfmt
+        run: shfmt -i 2 -ci -d huddle-transcribe
+
+      # The script is the deliverable and it is installed by symlink, so a
+      # lost exec bit breaks a fresh clone in a way nothing else here
+      # catches.
+      - name: Check executable bit
+        run: |
+          if [ ! -x huddle-transcribe ]; then
+            echo "::error file=huddle-transcribe::huddle-transcribe must be executable (git update-index --chmod=+x huddle-transcribe)" >&2
+            exit 1
+          fi
+
+      - name: Check --help runs
+        run: |
+          ./huddle-transcribe --help >/dev/null
