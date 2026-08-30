@@ -1,2 +1,8 @@
 .claude/
 .DS_Store
+
+# Defensive: transcripts default to ~/Documents/huddle-transcripts, outside
+# the repo. These patterns only matter if OUTPUT_DIR is pointed at a clone,
+# in which case they keep meeting content from being committed.
+huddle-transcripts/
+*.meta.json

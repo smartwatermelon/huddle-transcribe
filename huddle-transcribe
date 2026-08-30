@@ -11,7 +11,22 @@ MW_BIN="/usr/local/bin/mw"
 
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 if [[ -f "$CONFIG_FILE" ]]; then
+  # Parsed with sed rather than sourced, deliberately: the config file
+  # cannot execute shell code. Only a single OUTPUT_DIR= line is honored.
+  # The value is taken literally and never evaluated, so a path containing
+  # `$VAR` or backticks is treated as those characters -- they are legal in
+  # a directory name, and are not expanded or run. It is used only inside
+  # double quotes downstream, so it never re-enters a parsing context.
   config_output_dir=$(sed -n -E 's/^OUTPUT_DIR=["'"'"']?([^"'"'"']*)["'"'"']?[[:space:]]*$/\1/p' "$CONFIG_FILE" | tail -1)
+  # Because the value is never evaluated by the shell, a leading ~ arrives
+  # literally and would create a directory actually named "~". Expand it
+  # here; anything else stays untouched.
+  tilde="~"
+  if [[ "$config_output_dir" == "$tilde" ]]; then
+    config_output_dir="$HOME"
+  elif [[ "$config_output_dir" == "$tilde/"* ]]; then
+    config_output_dir="$HOME/${config_output_dir:2}"
+  fi
   [[ -n "$config_output_dir" ]] && OUTPUT_DIR="$config_output_dir"
 fi
 
@@ -29,9 +44,11 @@ Arguments:
   SESSION_ID_OR_DATE   'latest' (default), YYYY-MM-DD, or a MacWhisper session UUID
 
 Options:
-  --dry-run             Show which session would be selected, don't transcribe
+  --dry-run             Show which session would be selected; changes nothing
   --list                List recent MacWhisper sessions (last 10) with metadata
-  --mark-reviewed       Set reviewed=true, delete source .m4a for SESSION_ID_OR_DATE
+  --mark-reviewed       Set reviewed=true and remove the source .m4a for
+                        SESSION_ID_OR_DATE (moved to Trash where trash(1) is
+                        available, otherwise deleted outright)
   --yes                 Skip confirmation prompt
   --output-dir PATH     Override default output dir
   -h, --help            Show this help
@@ -74,10 +91,29 @@ while [[ $# -gt 0 ]]; do
       exit 1
       ;;
     *)
+      if [[ -n "$TARGET" ]]; then
+        echo "Error: unexpected extra argument '$1' (already selecting '$TARGET')" >&2
+        exit 1
+      fi
+      # An empty argument is almost always an unset variable in a caller's
+      # script (`huddle-transcribe "$SESSION"`). Treating it as "latest"
+      # would silently operate on the newest recording -- and with
+      # --mark-reviewed --yes, delete its audio.
+      if [[ -z "$1" ]]; then
+        echo "Error: empty SESSION_ID_OR_DATE argument" >&2
+        exit 1
+      fi
       TARGET="$1"
       shift
       ;;
   esac
+done
+
+for dep in sqlite3 jq; do
+  if ! command -v "$dep" >/dev/null 2>&1; then
+    echo "Error: required command '$dep' not found on PATH." >&2
+    exit 1
+  fi
 done
 
 if [[ ! -x "$MW_BIN" ]]; then
@@ -85,22 +121,49 @@ if [[ ! -x "$MW_BIN" ]]; then
   exit 1
 fi
 
+# Checked explicitly so a missing MacWhisper install reports itself, rather
+# than surfacing as `Error: in prepare, no such table: session`.
+if [[ ! -r "$DB" ]]; then
+  echo "Error: MacWhisper database not readable at $DB" >&2
+  echo "Is MacWhisper Pro installed and has it recorded at least one meeting?" >&2
+  exit 1
+fi
+
 mkdir -p "$OUTPUT_DIR"
 
+# Rows are separated by a unit-separator (0x1F), not a tab. Tab is IFS
+# whitespace, so `IFS=$'\t' read` COLLAPSES runs of consecutive tabs into a
+# single delimiter -- which silently shifts every later field whenever a
+# column is empty. That is the common case here: a session normally has
+# just one of the three media types, leaving two empty filename columns.
+# 0x1F is not IFS whitespace, so empty fields are preserved positionally,
+# and it cannot occur in a filename or a meeting title.
+SEP=$'\x1f'
+
 sql() {
-  sqlite3 -separator $'\t' "$DB" "$1"
+  sqlite3 -separator "$SEP" "$DB" "$1"
 }
 
-# Columns: session_id \t dateCreated \t duration \t title \t merged_filename \t app_audio_filename \t mic_audio_filename
+# A newline inside a field would still split one row into two, so the title
+# is scrubbed of tab/CR/LF in SQL -- it is the only free-text field a user
+# can type anything into. It is also selected LAST, so that even an
+# unscrubbed control character truncates the title rather than displacing a
+# filename column and pointing SOURCE_PATH at a fragment of a name.
+#
+# Columns, separated by $SEP (0x1F):
+#   session_id, dateCreated, duration,
+#   merged_filename, app_audio_filename, mic_audio_filename, title
 SESSION_QUERY="
 SELECT
   lower(hex(s.id)),
   s.dateCreated,
   COALESCE(rm.duration, sar.duration, 0),
-  COALESCE(s.userChosenTitle, s.aiTitle, rm.title, sar.title, 'Untitled'),
   COALESCE((SELECT filename FROM mediafile WHERE sessionID = s.id AND type = 'mergedMultitrack' LIMIT 1), ''),
   COALESCE((SELECT filename FROM mediafile WHERE sessionID = s.id AND type = 'meetingAppAudio' LIMIT 1), ''),
-  COALESCE((SELECT filename FROM mediafile WHERE sessionID = s.id AND type = 'meetingMicAudio' LIMIT 1), '')
+  COALESCE((SELECT filename FROM mediafile WHERE sessionID = s.id AND type = 'meetingMicAudio' LIMIT 1), ''),
+  replace(replace(replace(
+    COALESCE(s.userChosenTitle, s.aiTitle, rm.title, sar.title, 'Untitled'),
+    char(9), ' '), char(10), ' '), char(13), ' ')
 FROM session s
 LEFT JOIN recordedmeeting rm ON rm.id = s.recordedMeetingID
 LEFT JOIN systemaudiorecording sar ON sar.id = s.systemAudioRecordingID
@@ -109,14 +172,24 @@ ORDER BY s.dateCreated DESC
 "
 
 slugify() {
-  echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g'
+  local slug
+  slug=$(echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')
+  # A title that is empty, or made entirely of punctuation or non-ASCII
+  # characters, reduces to "". That would produce an output basename of
+  # "<date>_.txt" -- a hidden dotfile that the user is unlikely to find.
+  [[ -n "$slug" ]] || slug="untitled"
+  echo "$slug"
 }
 
 fmt_duration() {
-  local secs="$1"
-  local m=$((${secs%.*} / 60))
-  local s=$((${secs%.*} % 60))
-  printf "%dm%02ds" "$m" "$s"
+  local secs="${1:-0}"
+  # Durations arrive from SQLite as either an integer or a float
+  # ("1076" or "1076.5"); strip any fractional part before arithmetic,
+  # since bash cannot do floating point. A non-numeric or empty value
+  # would otherwise abort the script on an arithmetic syntax error.
+  secs="${secs%.*}"
+  [[ "$secs" =~ ^[0-9]+$ ]] || secs=0
+  printf "%dm%02ds" "$((secs / 60))" "$((secs % 60))"
 }
 
 # --- --list ---
@@ -127,8 +200,9 @@ if [[ $LIST -eq 1 ]]; then
     exit 1
   fi
   printf "%-8s  %-19s  %-8s  %s\n" "SESSION" "DATE" "DURATION" "TITLE"
-  while IFS=$'\t' read -r sid date dur title _merged _app _mic; do
-    printf "%-8s  %-19s  %-8s  %s\n" "${sid:0:8}" "${date%.*}" "$(fmt_duration "$dur")" "$title"
+  while IFS="$SEP" read -r sid date dur _merged _app _mic title; do
+    pretty_dur=$(fmt_duration "$dur")
+    printf "%-8s  %-19s  %-8s  %s\n" "${sid:0:8}" "${date%.*}" "$pretty_dur" "$title"
   done <<<"$rows"
   exit 0
 fi
@@ -136,54 +210,155 @@ fi
 # --- session selection ---
 find_session_by_date() {
   local target_date="$1"
-  # Target 8:00 AM PT on that date; TZ=America/Los_Angeles lets `date` resolve
-  # PST/PDT correctly instead of a hardcoded UTC offset.
-  local target_ts
-  target_ts=$(TZ="America/Los_Angeles" date -j -f "%Y-%m-%d %H:%M:%S" "${target_date} 08:00:00" "+%s" 2>/dev/null) || {
-    echo "Error: invalid date '$target_date' (expected YYYY-MM-DD)" >&2
+  # Validate the date is real, not merely well-shaped -- the caller's regex
+  # only checks the digit pattern, so 2026-02-30 and 2026-13-01 reach here.
+  # Done in pure bash rather than with date(1): `date -j` is BSD-only and
+  # `date -d` is GNU-only, so either choice breaks on the other platform,
+  # and BSD date silently ROLLS an out-of-range day (2026-02-30 becomes
+  # 2026-03-02, exit 0) which makes it a poor validator regardless.
+  local y="${target_date:0:4}" mo="${target_date:5:2}" d="${target_date:8:2}"
+  # 10# forces base 10: a leading zero would otherwise be read as octal,
+  # making 08 and 09 arithmetic errors.
+  y=$((10#$y))
+  mo=$((10#$mo))
+  d=$((10#$d))
+  local days_in_month=31
+  case "$mo" in
+    4 | 6 | 9 | 11) days_in_month=30 ;;
+    2)
+      days_in_month=28
+      if ((y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))); then
+        days_in_month=29
+      fi
+      ;;
+    *) ;; # 31-day months and out-of-range values; the bounds check follows
+  esac
+  if ((mo < 1 || mo > 12 || d < 1 || d > days_in_month)); then
+    echo "Error: invalid date '$target_date' (expected a real YYYY-MM-DD)" >&2
     exit 1
-  }
-  local best_sid="" best_diff=""
-  while IFS=$'\t' read -r sid date _dur _title _merged _app _mic; do
-    local row_ts
-    row_ts=$(TZ="UTC" date -j -f "%Y-%m-%d %H:%M:%S" "${date%.*}" "+%s" 2>/dev/null) || continue
-    local diff=$((row_ts - target_ts))
-    ((diff < 0)) && diff=$((-diff))
-    if [[ -z "$best_diff" || $diff -lt $best_diff ]]; then
-      best_diff=$diff
-      best_sid="$sid"
-    fi
-  done < <(sql "$SESSION_QUERY")
+  fi
+
+  # Match on the stored calendar date, not on a distance between timestamps.
+  # The previous version anchored the target at 08:00 America/Los_Angeles
+  # but parsed row timestamps as UTC, so the comparison mixed two zones and
+  # a 16h half-width window spanned 32h -- a session stored at 00:30 on the
+  # 27th matched BOTH the 26th and the 27th. Comparing the date prefix is
+  # exact, timezone-agnostic, needs no window, and matches what --list
+  # prints, which is what a user is reading when they type a date.
+  local matches=0 best_sid="" all_rows
+  # Collect first, then loop over the result. Piping sql directly into the
+  # loop would mask its exit status (SC2312), and a process substitution
+  # cannot report a failed query at all -- an unreadable or corrupt
+  # database would silently look like "no sessions found".
+  if ! all_rows=$(sql "$SESSION_QUERY"); then
+    echo "Error: failed to query MacWhisper database at $DB" >&2
+    exit 1
+  fi
+  [[ -n "$all_rows" ]] || return 0
+  # Rows arrive newest-first, so the first match on a day is that day's
+  # latest session.
+  while IFS="$SEP" read -r sid date _dur _merged _app _mic _title; do
+    [[ "${date%% *}" == "$target_date" ]] || continue
+    matches=$((matches + 1))
+    [[ -n "$best_sid" ]] || best_sid="$sid"
+  done <<<"$all_rows"
+
+  if [[ -z "$best_sid" ]]; then
+    echo "Error: no qualifying session on $target_date. Try --list." >&2
+    return 1
+  fi
+  if ((matches > 1)); then
+    echo "Note: $matches sessions on $target_date; using the most recent (${best_sid:0:8}). Pass a session id to pick another." >&2
+  fi
   # best_sid is a bare hex session id (no delimiters), safe to re-look-up
   # cleanly rather than round-tripping title/filename fields through a
   # delimiter that could appear in a session title.
-  [[ -n "$best_sid" ]] && find_session_by_id "$best_sid"
+  find_session_by_id "$best_sid"
 }
 
 find_session_by_id() {
   local partial="$1"
-  sql "$SESSION_QUERY" | awk -F'\t' -v id="$partial" 'index(tolower($1), tolower(id)) == 1 {print; exit}'
+  # Session ids are selected as lower(hex(s.id)) -- bare hex, no dashes.
+  # A UUID copied out of MacWhisper's own UI is dashed, so strip dashes
+  # before matching or such an id never matches anything.
+  partial="${partial//-/}"
+  if [[ -z "$partial" ]]; then
+    echo "Error: empty session id" >&2
+    exit 1
+  fi
+  if ! [[ "$partial" =~ ^[0-9a-fA-F]+$ ]]; then
+    echo "Error: '$1' is not a session id (expected hex, or a YYYY-MM-DD date). Try --list." >&2
+    exit 1
+  fi
+  # Check the query separately rather than piping it straight into awk: a
+  # pipeline masks sqlite3's exit status, so an unreadable or corrupt
+  # database reported "no such session" instead of naming the real problem.
+  local all_rows
+  if ! all_rows=$(sql "$SESSION_QUERY"); then
+    echo "Error: failed to query MacWhisper database at $DB" >&2
+    exit 1
+  fi
+  # Split on $SEP, matching the rest of the script. With -F'\t' there are no
+  # tabs in the row, so $1 would be the entire line and the prefix match
+  # would work only because the id happens to sit first -- correct today,
+  # but silently wrong after any column reorder.
+  local hits
+  hits=$(awk -F"$SEP" -v id="$partial" 'index(tolower($1), tolower(id)) == 1' <<<"$all_rows")
+  [[ -n "$hits" ]] || return 1
+  # An ambiguous prefix must not resolve silently: --mark-reviewed removes
+  # audio, and "here is my guess" is the wrong default for that.
+  local hit_count
+  hit_count=$(grep -c . <<<"$hits")
+  if ((hit_count > 1)); then
+    echo "Error: session id '$1' is ambiguous; it matches:" >&2
+    awk -F"$SEP" '{printf "  %s  %s  %s\n", $1, $2, $7}' <<<"$hits" >&2
+    echo "Pass more characters of the id." >&2
+    # Exit 3, not 1: the caller uses this to tell "already explained the
+    # problem in detail" apart from a plain no-match, and suppress its own
+    # generic message.
+    exit 3
+  fi
+  printf '%s\n' "$hits"
 }
 
 find_latest_session() {
-  sql "$SESSION_QUERY LIMIT 1"
+  local row
+  # Same reasoning as find_session_by_id: report a query failure as one
+  # rather than letting it look like an empty database.
+  if ! row=$(sql "$SESSION_QUERY LIMIT 1"); then
+    echo "Error: failed to query MacWhisper database at $DB" >&2
+    exit 1
+  fi
+  [[ -n "$row" ]] || return 1
+  printf '%s\n' "$row"
 }
 
+# These helpers end in a conditional whose false branch returns 1, and an
+# unguarded assignment under `set -e` would abort here silently. Guard each
+# one, but track whether the helper already explained itself: find_session_
+# by_date prints a specific reason ("no session on <date>"), and following
+# that with the generic message below is just noise.
 SELECTED=""
+selection_explained=0
 if [[ -z "$TARGET" || "$TARGET" == "latest" ]]; then
-  SELECTED=$(find_latest_session)
+  SELECTED=$(find_latest_session) || true
 elif [[ "$TARGET" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-  SELECTED=$(find_session_by_date "$TARGET")
+  SELECTED=$(find_session_by_date "$TARGET") || selection_explained=1
 else
-  SELECTED=$(find_session_by_id "$TARGET")
+  SELECTED=$(find_session_by_id "$TARGET") || [[ $? -ne 3 ]] || selection_explained=1
 fi
 
 if [[ -z "$SELECTED" ]]; then
-  echo "Error: no qualifying session found for '$TARGET'. Try --list." >&2
+  if [[ $selection_explained -eq 0 ]]; then
+    echo "Error: no qualifying session found for '$TARGET'. Try --list." >&2
+  fi
   exit 1
 fi
 
-IFS=$'\t' read -r SID SDATE SDUR STITLE SMERGED SAPP SMIC <<<"$SELECTED"
+# STITLE is read last so it absorbs any remaining tabs rather than shifting
+# the filename columns. `read` returns nonzero on a final line with no
+# trailing newline, which `set -e` would treat as fatal, hence `|| true`.
+IFS="$SEP" read -r SID SDATE SDUR SMERGED SAPP SMIC STITLE <<<"$SELECTED" || true
 
 # Prefer merged multitrack, then app audio, then mic audio.
 SOURCE_FILENAME=""
@@ -205,13 +380,19 @@ if ! [[ "$SESSION_DATE_ONLY" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
   exit 1
 fi
 SLUG=$(slugify "$STITLE")
-OUT_BASENAME="${SESSION_DATE_ONLY}_${SLUG}"
+# The session id prefix disambiguates two sessions on the same date whose
+# titles slugify identically ("SRE Daily Huddle" and "SRE/Daily Huddle"
+# both become "sre-daily-huddle"). Without it the second transcribe
+# silently overwrote the first, and --mark-reviewed could then delete the
+# audio of a session whose transcript had already been replaced.
+OUT_BASENAME="${SESSION_DATE_ONLY}_${SLUG}_${SID:0:8}"
 OUT_TXT="$OUTPUT_DIR/${OUT_BASENAME}.txt"
 OUT_META="$OUTPUT_DIR/${OUT_BASENAME}.meta.json"
 
 echo "Session:  ${SID:0:8}"
 echo "Date:     $SDATE"
-echo "Duration: $(fmt_duration "$SDUR")"
+SDUR_PRETTY=$(fmt_duration "$SDUR")
+echo "Duration: $SDUR_PRETTY"
 echo "Title:    $STITLE"
 echo "Source:   $SOURCE_PATH"
 echo "Output:   $OUT_TXT"
@@ -221,34 +402,114 @@ if [[ $MARK_REVIEWED -ne 1 && ! -f "$SOURCE_PATH" ]]; then
   exit 1
 fi
 
+# --dry-run is checked before --mark-reviewed, and must stay that way.
+# --dry-run is the flag a user reaches for when they are unsure what will be
+# selected; combining it with --mark-reviewed previously deleted the audio
+# anyway, because the deletion block ran first.
+if [[ $DRY_RUN -eq 1 ]]; then
+  if [[ $MARK_REVIEWED -eq 1 ]]; then
+    echo "(dry run — would mark reviewed and delete $SOURCE_PATH)"
+  else
+    echo "(dry run — no transcription performed)"
+  fi
+  exit 0
+fi
+
 # --- --mark-reviewed ---
 if [[ $MARK_REVIEWED -eq 1 ]]; then
   if [[ ! -f "$OUT_META" ]]; then
     echo "Error: no metadata sidecar found at $OUT_META. Transcribe first." >&2
     exit 1
   fi
+  # The sidecar is matched by filename, which is derived from date + title.
+  # Confirm it actually describes the session just resolved before deleting
+  # anything: a retitled or same-day session could otherwise map onto a
+  # sidecar belonging to a different recording.
+  meta_session_id=$(jq -r '.session_id // empty' "$OUT_META" 2>/dev/null || true)
+  if [[ -z "$meta_session_id" ]]; then
+    echo "Error: $OUT_META is missing a session_id. Refusing to delete source audio." >&2
+    exit 1
+  fi
+  if [[ "$meta_session_id" != "$SID" ]]; then
+    echo "Error: sidecar $OUT_META describes session ${meta_session_id:0:8}, but the selected session is ${SID:0:8}." >&2
+    echo "Refusing to delete source audio. Pass the session id explicitly to disambiguate." >&2
+    exit 1
+  fi
+  # Deletion is irreversible and the transcript is the only thing that
+  # survives it, so require that the transcript exists and is non-empty.
+  if [[ ! -s "$OUT_TXT" ]]; then
+    echo "Error: transcript $OUT_TXT is missing or empty. Refusing to delete source audio." >&2
+    exit 1
+  fi
   if [[ $ASSUME_YES -ne 1 ]]; then
-    read -r -p "Mark reviewed and delete source .m4a ($SOURCE_PATH)? [y/N] " reply
+    if command -v trash >/dev/null 2>&1; then
+      delete_verb="move to Trash"
+    else
+      delete_verb="permanently delete"
+    fi
+    read -r -p "Mark reviewed and $delete_verb source .m4a ($SOURCE_PATH)? [y/N] " reply
     [[ "$reply" =~ ^[Yy]$ ]] || {
       echo "Aborted."
       exit 1
     }
   fi
-  tmp=$(mktemp)
+  # Order matters, and both obvious orderings are wrong:
+  #
+  #   record then delete -> a failed delete leaves the sidecar claiming a
+  #                         deletion that never happened;
+  #   delete then record -> a failed sidecar write leaves the audio gone
+  #                         while the sidecar still says deleted_source:false.
+  #
+  # So split the write. Build the updated sidecar into a temp file FIRST --
+  # that is the fallible part (jq missing, ENOSPC, permissions) and it
+  # touches nothing real. Then delete the audio. Then rename the temp file
+  # into place; a same-directory rename is atomic and essentially cannot
+  # fail once the temp file exists. That leaves no window in which the
+  # sidecar and the filesystem disagree.
+  #
+  # mktemp beside the sidecar, not in $TMPDIR: rename is only atomic within
+  # one filesystem, and $TMPDIR is frequently on another one when
+  # OUTPUT_DIR points at an external or synced volume.
+  tmp=$(mktemp "${OUT_META}.XXXXXX")
   trap 'rm -f "$tmp"' EXIT
   if ! jq '.reviewed = true | .deleted_source = true' "$OUT_META" >"$tmp" || [[ ! -s "$tmp" ]]; then
-    echo "Error: failed to update metadata sidecar $OUT_META" >&2
+    echo "Error: failed to prepare metadata sidecar $OUT_META. Source audio left in place." >&2
     exit 1
   fi
+
+  # Prefer trash(1) (macOS 14+) so a mistake is recoverable from Finder.
+  # This is the only irreversible step in the script, and the guards above
+  # are the sole protection once the audio is really gone.
+  source_was_present=1
+  if [[ ! -f "$SOURCE_PATH" ]]; then
+    source_was_present=0
+  elif command -v trash >/dev/null 2>&1; then
+    if ! trash "$SOURCE_PATH"; then
+      echo "Error: failed to trash $SOURCE_PATH. Sidecar left unchanged." >&2
+      exit 1
+    fi
+  elif ! rm -f "$SOURCE_PATH"; then
+    echo "Error: failed to delete $SOURCE_PATH. Sidecar left unchanged." >&2
+    exit 1
+  fi
+  # Belt-and-braces for the trash(1) branch specifically: rm -f reports its
+  # own failures, but trash can exit 0 without having moved the file.
+  if [[ -e "$SOURCE_PATH" ]]; then
+    echo "Error: $SOURCE_PATH still present after removal. Sidecar left unchanged." >&2
+    exit 1
+  fi
+
   mv "$tmp" "$OUT_META"
   trap - EXIT
-  rm -f "$SOURCE_PATH"
-  echo "Marked reviewed and deleted source: $SOURCE_PATH"
-  exit 0
-fi
-
-if [[ $DRY_RUN -eq 1 ]]; then
-  echo "(dry run — no transcription performed)"
+  if [[ $source_was_present -eq 1 ]]; then
+    if command -v trash >/dev/null 2>&1; then
+      echo "Marked reviewed and moved source to Trash: $SOURCE_PATH"
+    else
+      echo "Marked reviewed and deleted source: $SOURCE_PATH"
+    fi
+  else
+    echo "Marked reviewed (source audio was already gone): $SOURCE_PATH"
+  fi
   exit 0
 fi
 
@@ -260,23 +521,53 @@ if [[ $ASSUME_YES -ne 1 ]]; then
   }
 fi
 
-"$MW_BIN" transcribe \
+# Transcribe to a temp path and move into place only once mw has succeeded
+# and produced a non-empty file. Writing straight to $OUT_TXT means an
+# interrupted or failed run (Ctrl-C, crash, full disk) destroys a previously
+# good transcript, since mw is invoked with --overwrite.
+TXT_TMP=$(mktemp "${OUT_TXT}.partial.XXXXXX")
+trap 'rm -f "$TXT_TMP"' EXIT
+if ! "$MW_BIN" transcribe \
   --speakers \
   --speaker-names \
   --timestamps \
   --format txt \
   --overwrite \
-  -o "$OUT_TXT" \
-  "$SOURCE_PATH"
+  -o "$TXT_TMP" \
+  "$SOURCE_PATH"; then
+  echo "Error: mw transcribe failed for $SOURCE_PATH" >&2
+  # No sidecar is written on failure. That is deliberate: --mark-reviewed
+  # refuses to run without one, so a failed transcription can never lead to
+  # the source audio being deleted.
+  exit 1
+fi
 
-if ! grep -q "^Speaker " "$OUT_TXT" 2>/dev/null; then
+if [[ ! -s "$TXT_TMP" ]]; then
+  echo "Error: mw reported success but produced no transcript at $OUT_TXT" >&2
+  exit 1
+fi
+
+if ! grep -q "^Speaker " "$TXT_TMP" 2>/dev/null; then
   echo "Warning: no 'Speaker' labels found in output. Check MacWhisper Settings > speaker detection." >&2
 fi
 
-jq -n \
+# --argjson parses its value as JSON and aborts on anything non-numeric, so
+# guard the duration rather than letting a surprising DB value abort the run.
+META_DURATION="$SDUR"
+[[ "$META_DURATION" =~ ^[0-9]+(\.[0-9]+)?$ ]] || META_DURATION=0
+
+# Build BOTH temp files before renaming EITHER into place. The transcript
+# and its sidecar are a pair: --mark-reviewed refuses to run without a
+# sidecar, so a transcript that landed while the sidecar write failed can
+# never be cleaned up, and the meeting has to be transcribed again. Doing
+# every fallible step first means the only thing left after them is two
+# same-directory renames.
+meta_tmp=$(mktemp "${OUT_META}.XXXXXX")
+trap 'rm -f "$TXT_TMP" "$meta_tmp"' EXIT
+if ! jq -n \
   --arg session_id "$SID" \
   --arg date "$SESSION_DATE_ONLY" \
-  --argjson duration_seconds "$SDUR" \
+  --argjson duration_seconds "$META_DURATION" \
   --arg source_file "$SOURCE_FILENAME" \
   --arg output_file "$(basename "$OUT_TXT")" \
   '{
@@ -287,7 +578,14 @@ jq -n \
     output_file: $output_file,
     reviewed: false,
     deleted_source: false
-  }' >"$OUT_META"
+  }' >"$meta_tmp"; then
+  echo "Error: failed to write metadata sidecar $OUT_META. Transcript not saved." >&2
+  exit 1
+fi
+
+mv "$TXT_TMP" "$OUT_TXT"
+mv "$meta_tmp" "$OUT_META"
+trap - EXIT
 
 echo "Transcript written: $OUT_TXT"
 echo "Metadata written:   $OUT_META"
