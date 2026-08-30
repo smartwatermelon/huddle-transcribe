@@ -7,10 +7,6 @@ MEDIA_DIR="$HOME/Library/Application Support/MacWhisper/Database/ExternalMedia"
 CONFIG_FILE="$HOME/.config/huddle-transcribe/config"
 DEFAULT_OUTPUT_DIR="$HOME/Documents/huddle-transcripts"
 MIN_DURATION_SECONDS=300
-# Half-width of the window a YYYY-MM-DD target may match within, measured
-# from an 08:00 local anchor. 16h covers a full day's recordings in either
-# direction without spilling into an adjacent day's meetings.
-DATE_MATCH_WINDOW=$((16 * 3600))
 MW_BIN="/usr/local/bin/mw"
 
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
@@ -214,14 +210,42 @@ fi
 # --- session selection ---
 find_session_by_date() {
   local target_date="$1"
-  # Target 8:00 AM PT on that date; TZ=America/Los_Angeles lets `date` resolve
-  # PST/PDT correctly instead of a hardcoded UTC offset.
-  local target_ts
-  target_ts=$(TZ="America/Los_Angeles" date -j -f "%Y-%m-%d %H:%M:%S" "${target_date} 08:00:00" "+%s" 2>/dev/null) || {
-    echo "Error: invalid date '$target_date' (expected YYYY-MM-DD)" >&2
+  # Validate the date is real, not merely well-shaped -- the caller's regex
+  # only checks the digit pattern, so 2026-02-30 and 2026-13-01 reach here.
+  # Done in pure bash rather than with date(1): `date -j` is BSD-only and
+  # `date -d` is GNU-only, so either choice breaks on the other platform,
+  # and BSD date silently ROLLS an out-of-range day (2026-02-30 becomes
+  # 2026-03-02, exit 0) which makes it a poor validator regardless.
+  local y="${target_date:0:4}" mo="${target_date:5:2}" d="${target_date:8:2}"
+  # 10# forces base 10: a leading zero would otherwise be read as octal,
+  # making 08 and 09 arithmetic errors.
+  y=$((10#$y))
+  mo=$((10#$mo))
+  d=$((10#$d))
+  local days_in_month=31
+  case "$mo" in
+    4 | 6 | 9 | 11) days_in_month=30 ;;
+    2)
+      days_in_month=28
+      if ((y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))); then
+        days_in_month=29
+      fi
+      ;;
+    *) ;; # 31-day months and out-of-range values; the bounds check follows
+  esac
+  if ((mo < 1 || mo > 12 || d < 1 || d > days_in_month)); then
+    echo "Error: invalid date '$target_date' (expected a real YYYY-MM-DD)" >&2
     exit 1
-  }
-  local best_sid="" best_diff="" all_rows
+  fi
+
+  # Match on the stored calendar date, not on a distance between timestamps.
+  # The previous version anchored the target at 08:00 America/Los_Angeles
+  # but parsed row timestamps as UTC, so the comparison mixed two zones and
+  # a 16h half-width window spanned 32h -- a session stored at 00:30 on the
+  # 27th matched BOTH the 26th and the 27th. Comparing the date prefix is
+  # exact, timezone-agnostic, needs no window, and matches what --list
+  # prints, which is what a user is reading when they type a date.
+  local matches=0 best_sid="" all_rows
   # Collect first, then loop over the result. Piping sql directly into the
   # loop would mask its exit status (SC2312), and a process substitution
   # cannot report a failed query at all -- an unreadable or corrupt
@@ -231,28 +255,20 @@ find_session_by_date() {
     exit 1
   fi
   [[ -n "$all_rows" ]] || return 0
+  # Rows arrive newest-first, so the first match on a day is that day's
+  # latest session.
   while IFS="$SEP" read -r sid date _dur _merged _app _mic _title; do
-    local row_ts
-    row_ts=$(TZ="UTC" date -j -f "%Y-%m-%d %H:%M:%S" "${date%.*}" "+%s" 2>/dev/null) || continue
-    local diff=$((row_ts - target_ts))
-    ((diff < 0)) && diff=$((-diff))
-    if [[ -z "$best_diff" || $diff -lt $best_diff ]]; then
-      best_diff=$diff
-      best_sid="$sid"
-    fi
+    [[ "${date%% *}" == "$target_date" ]] || continue
+    matches=$((matches + 1))
+    [[ -n "$best_sid" ]] || best_sid="$sid"
   done <<<"$all_rows"
+
   if [[ -z "$best_sid" ]]; then
-    echo "Error: no qualifying session found near $target_date. Try --list." >&2
+    echo "Error: no qualifying session on $target_date. Try --list." >&2
     return 1
   fi
-  # Nearest-match was previously unbounded: asking for a date with no
-  # recording returned whatever session was closest, even months away, and
-  # presented it as a match. With --mark-reviewed that meant deleting audio
-  # for a meeting the user never named. Require the match to fall on the
-  # requested day (the 08:00 anchor makes DATE_MATCH_WINDOW a half-width).
-  if ((best_diff > DATE_MATCH_WINDOW)); then
-    echo "Error: no session on $target_date (nearest is $((best_diff / 3600))h away). Try --list." >&2
-    return 1
+  if ((matches > 1)); then
+    echo "Note: $matches sessions on $target_date; using the most recent (${best_sid:0:8}). Pass a session id to pick another." >&2
   fi
   # best_sid is a bare hex session id (no delimiters), safe to re-look-up
   # cleanly rather than round-tripping title/filename fields through a
@@ -274,15 +290,47 @@ find_session_by_id() {
     echo "Error: '$1' is not a session id (expected hex, or a YYYY-MM-DD date). Try --list." >&2
     exit 1
   fi
+  # Check the query separately rather than piping it straight into awk: a
+  # pipeline masks sqlite3's exit status, so an unreadable or corrupt
+  # database reported "no such session" instead of naming the real problem.
+  local all_rows
+  if ! all_rows=$(sql "$SESSION_QUERY"); then
+    echo "Error: failed to query MacWhisper database at $DB" >&2
+    exit 1
+  fi
   # Split on $SEP, matching the rest of the script. With -F'\t' there are no
   # tabs in the row, so $1 would be the entire line and the prefix match
   # would work only because the id happens to sit first -- correct today,
   # but silently wrong after any column reorder.
-  sql "$SESSION_QUERY" | awk -F"$SEP" -v id="$partial" 'index(tolower($1), tolower(id)) == 1 {print; exit}'
+  local hits
+  hits=$(awk -F"$SEP" -v id="$partial" 'index(tolower($1), tolower(id)) == 1' <<<"$all_rows")
+  [[ -n "$hits" ]] || return 1
+  # An ambiguous prefix must not resolve silently: --mark-reviewed removes
+  # audio, and "here is my guess" is the wrong default for that.
+  local hit_count
+  hit_count=$(grep -c . <<<"$hits")
+  if ((hit_count > 1)); then
+    echo "Error: session id '$1' is ambiguous; it matches:" >&2
+    awk -F"$SEP" '{printf "  %s  %s  %s\n", $1, $2, $7}' <<<"$hits" >&2
+    echo "Pass more characters of the id." >&2
+    # Exit 3, not 1: the caller uses this to tell "already explained the
+    # problem in detail" apart from a plain no-match, and suppress its own
+    # generic message.
+    exit 3
+  fi
+  printf '%s\n' "$hits"
 }
 
 find_latest_session() {
-  sql "$SESSION_QUERY LIMIT 1"
+  local row
+  # Same reasoning as find_session_by_id: report a query failure as one
+  # rather than letting it look like an empty database.
+  if ! row=$(sql "$SESSION_QUERY LIMIT 1"); then
+    echo "Error: failed to query MacWhisper database at $DB" >&2
+    exit 1
+  fi
+  [[ -n "$row" ]] || return 1
+  printf '%s\n' "$row"
 }
 
 # These helpers end in a conditional whose false branch returns 1, and an
@@ -297,7 +345,7 @@ if [[ -z "$TARGET" || "$TARGET" == "latest" ]]; then
 elif [[ "$TARGET" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
   SELECTED=$(find_session_by_date "$TARGET") || selection_explained=1
 else
-  SELECTED=$(find_session_by_id "$TARGET") || true
+  SELECTED=$(find_session_by_id "$TARGET") || [[ $? -ne 3 ]] || selection_explained=1
 fi
 
 if [[ -z "$SELECTED" ]]; then
@@ -405,13 +453,30 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
       exit 1
     }
   fi
-  # mktemp beside the sidecar, not in $TMPDIR: the mv below is only atomic
-  # within one filesystem, and $TMPDIR is frequently on another one when
-  # OUTPUT_DIR points at an external or synced volume.
-  # Delete first, then record it. Writing deleted_source=true before the
-  # delete left the sidecar permanently claiming a deletion that never
-  # happened whenever the delete failed (read-only volume, permissions).
+  # Order matters, and both obvious orderings are wrong:
   #
+  #   record then delete -> a failed delete leaves the sidecar claiming a
+  #                         deletion that never happened;
+  #   delete then record -> a failed sidecar write leaves the audio gone
+  #                         while the sidecar still says deleted_source:false.
+  #
+  # So split the write. Build the updated sidecar into a temp file FIRST --
+  # that is the fallible part (jq missing, ENOSPC, permissions) and it
+  # touches nothing real. Then delete the audio. Then rename the temp file
+  # into place; a same-directory rename is atomic and essentially cannot
+  # fail once the temp file exists. That leaves no window in which the
+  # sidecar and the filesystem disagree.
+  #
+  # mktemp beside the sidecar, not in $TMPDIR: rename is only atomic within
+  # one filesystem, and $TMPDIR is frequently on another one when
+  # OUTPUT_DIR points at an external or synced volume.
+  tmp=$(mktemp "${OUT_META}.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT
+  if ! jq '.reviewed = true | .deleted_source = true' "$OUT_META" >"$tmp" || [[ ! -s "$tmp" ]]; then
+    echo "Error: failed to prepare metadata sidecar $OUT_META. Source audio left in place." >&2
+    exit 1
+  fi
+
   # Prefer trash(1) (macOS 14+) so a mistake is recoverable from Finder.
   # This is the only irreversible step in the script, and the guards above
   # are the sole protection once the audio is really gone.
@@ -433,12 +498,7 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
     echo "Error: $SOURCE_PATH still present after removal. Sidecar left unchanged." >&2
     exit 1
   fi
-  tmp=$(mktemp "${OUT_META}.XXXXXX")
-  trap 'rm -f "$tmp"' EXIT
-  if ! jq '.reviewed = true | .deleted_source = true' "$OUT_META" >"$tmp" || [[ ! -s "$tmp" ]]; then
-    echo "Error: failed to update metadata sidecar $OUT_META" >&2
-    exit 1
-  fi
+
   mv "$tmp" "$OUT_META"
   trap - EXIT
   if [[ $source_was_present -eq 1 ]]; then
@@ -487,25 +547,23 @@ if [[ ! -s "$TXT_TMP" ]]; then
   exit 1
 fi
 
-mv "$TXT_TMP" "$OUT_TXT"
-trap - EXIT
-
-if ! grep -q "^Speaker " "$OUT_TXT" 2>/dev/null; then
+if ! grep -q "^Speaker " "$TXT_TMP" 2>/dev/null; then
   echo "Warning: no 'Speaker' labels found in output. Check MacWhisper Settings > speaker detection." >&2
 fi
 
 # --argjson parses its value as JSON and aborts on anything non-numeric, so
-# guard the duration rather than letting a surprising DB value abort the run
-# after the transcript is already on disk -- that would leave a transcript
-# with no sidecar, which --mark-reviewed then refuses to clean up forever.
+# guard the duration rather than letting a surprising DB value abort the run.
 META_DURATION="$SDUR"
 [[ "$META_DURATION" =~ ^[0-9]+(\.[0-9]+)?$ ]] || META_DURATION=0
 
-# Build to a temp file and move into place: writing jq's output straight to
-# "$OUT_META" would truncate an existing sidecar before jq runs, destroying
-# a previous reviewed/deleted_source state if jq then failed.
+# Build BOTH temp files before renaming EITHER into place. The transcript
+# and its sidecar are a pair: --mark-reviewed refuses to run without a
+# sidecar, so a transcript that landed while the sidecar write failed can
+# never be cleaned up, and the meeting has to be transcribed again. Doing
+# every fallible step first means the only thing left after them is two
+# same-directory renames.
 meta_tmp=$(mktemp "${OUT_META}.XXXXXX")
-trap 'rm -f "$meta_tmp"' EXIT
+trap 'rm -f "$TXT_TMP" "$meta_tmp"' EXIT
 if ! jq -n \
   --arg session_id "$SID" \
   --arg date "$SESSION_DATE_ONLY" \
@@ -521,9 +579,11 @@ if ! jq -n \
     reviewed: false,
     deleted_source: false
   }' >"$meta_tmp"; then
-  echo "Error: failed to write metadata sidecar $OUT_META" >&2
+  echo "Error: failed to write metadata sidecar $OUT_META. Transcript not saved." >&2
   exit 1
 fi
+
+mv "$TXT_TMP" "$OUT_TXT"
 mv "$meta_tmp" "$OUT_META"
 trap - EXIT
 

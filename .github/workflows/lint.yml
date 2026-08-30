@@ -46,12 +46,12 @@ jobs:
       # -S info, not the default: the project standard is a clean run at
       # info severity with no `# shellcheck disable` directives anywhere.
       - name: ShellCheck
-        run: shellcheck -S info huddle-transcribe
+        run: shellcheck -S info huddle-transcribe tests/run-tests.sh
 
       # -i 2 -ci is the repo's format. Bare `shfmt` defaults to tabs and
       # would report the entire file as unformatted.
       - name: shfmt
-        run: shfmt -i 2 -ci -d huddle-transcribe
+        run: shfmt -i 2 -ci -d huddle-transcribe tests/run-tests.sh
 
       # The script is the deliverable and it is installed by symlink, so a
       # lost exec bit breaks a fresh clone in a way nothing else here
@@ -66,3 +66,21 @@ jobs:
       - name: Check --help runs
         run: |
           ./huddle-transcribe --help >/dev/null
+
+      # The behavioral suite is the only check that exercises what this
+      # script actually does -- session selection, row parsing, and the
+      # --mark-reviewed guards that stand between a typo and a deleted
+      # recording. Linting alone would pass every data-loss bug this repo
+      # has had. sqlite3 and jq are preinstalled on ubuntu-latest; assert
+      # that rather than discovering it as a confusing test failure.
+      - name: Check test prerequisites
+        run: |
+          for dep in sqlite3 jq; do
+            if ! command -v "$dep" >/dev/null 2>&1; then
+              echo "::error::$dep is required by tests/run-tests.sh but is not installed" >&2
+              exit 1
+            fi
+          done
+
+      - name: Behavioral tests
+        run: ./tests/run-tests.sh

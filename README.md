@@ -40,10 +40,13 @@ huddle-transcribe [OPTIONS] [SESSION_ID_OR_DATE]
 - `SESSION_ID_OR_DATE` — optional. If omitted, uses the most recent
   MacWhisper session.
   - `latest` (default)
-  - `YYYY-MM-DD` — a session recorded on that date. Dashed UUIDs and bare
-    hex both work; the match must fall on the requested day, so a date with
-    no recording is an error rather than a silent jump to a distant session.
-  - a MacWhisper session UUID (or unambiguous prefix)
+  - `YYYY-MM-DD` — a session recorded on that calendar date. A date with no
+    recording is an error, not a silent jump to the nearest session. If a
+    day holds several sessions, the most recent is used and the others are
+    reported.
+  - a MacWhisper session UUID, dashed or bare hex, or an unambiguous prefix
+    of one. An ambiguous prefix is an error listing the matches, rather
+    than a guess.
 
 ### Options
 
@@ -95,6 +98,22 @@ OUTPUT_DIR="/path/to/transcripts"
 A leading `~` is expanded. Because the file is parsed rather than sourced,
 shell variables such as `$HOME` are *not* expanded — write the path out or
 use `~`.
+
+## Development
+
+There is no build step. Before committing:
+
+```bash
+shellcheck -S info huddle-transcribe tests/run-tests.sh
+shfmt -i 2 -ci -d huddle-transcribe tests/run-tests.sh
+./tests/run-tests.sh
+```
+
+`tests/run-tests.sh` builds a synthetic MacWhisper database and a stub `mw`,
+then runs the real script against them, so the suite needs neither MacWhisper
+nor a licence. It covers argument handling, session selection, row parsing,
+and every `--mark-reviewed` guard. It does not cover the real `mw` binary's
+own behavior. CI runs the same three commands.
 
 ## Session selection
 

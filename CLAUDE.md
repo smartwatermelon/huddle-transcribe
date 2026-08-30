@@ -13,10 +13,14 @@ suite — the repo is the script, a README, a LICENSE, and the CI workflows.
 ## Commands
 
 ```bash
-shellcheck -S info huddle-transcribe   # must be clean before commit
-shfmt -i 2 -ci -d huddle-transcribe    # show formatting diff
-shfmt -i 2 -ci -w huddle-transcribe    # apply formatting
+./tests/run-tests.sh                                        # 51 behavioral tests
+shellcheck -S info huddle-transcribe tests/run-tests.sh     # must be clean
+shfmt -i 2 -ci -d huddle-transcribe tests/run-tests.sh      # show diff
+shfmt -i 2 -ci -w huddle-transcribe tests/run-tests.sh      # apply formatting
 ```
+
+CI runs exactly these. Run the test suite before every commit — the linters
+pass on every data-loss bug this repo has had.
 
 `shfmt -i 2 -ci` is the repo's format — plain `shfmt` defaults to tabs and
 will rewrite the whole file. Always pass both flags.
@@ -33,11 +37,11 @@ verifying a change; `--dry-run` is honored even alongside `--mark-reviewed`.
 Any invocation without them runs a real transcription, and `--mark-reviewed`
 **removes the source `.m4a`** — never run it to test something.
 
-There is no test suite, but the script is testable without MacWhisper: build
-a synthetic SQLite DB with the four tables the query touches (`session`,
-`recordedmeeting`, `systemaudiorecording`, `mediafile`), a stub `mw` on
-`$PATH`, and repoint `DB`/`MEDIA_DIR`/`MW_BIN`/`CONFIG_FILE` in a copy of
-the script. That is how the current behavior was verified.
+`tests/run-tests.sh` does exactly this: it builds a synthetic SQLite DB with
+the four tables the query touches (`session`, `recordedmeeting`,
+`systemaudiorecording`, `mediafile`) plus a stub `mw`, then repoints
+`DB`/`MEDIA_DIR`/`MW_BIN`/`CONFIG_FILE` in a copy of the script. Add a case
+there for any behavior change; the fixture is cheap to extend.
 
 ## Runtime dependencies are not present in every checkout
 
@@ -47,9 +51,15 @@ without MacWhisper Pro installed, both are missing and the script exits early
 with a specific error for each. It also checks for `sqlite3` and `jq` up
 front.
 
-Verify their presence before claiming a change was tested against real data;
-when they are absent, use the synthetic-DB harness described above and say
-which parts were exercised that way.
+The test suite needs none of that. Verify MacWhisper's presence before
+claiming a change was tested against real data; otherwise run the suite and
+say so. The one thing nothing here covers is the real `mw` binary's flag
+handling.
+
+The script deliberately shells out only to POSIX-portable utilities —
+notably it does **not** call `date(1)`, because `date -j` is BSD-only and
+`date -d` is GNU-only. Date validation is pure bash arithmetic. Keep it that
+way so the suite runs on a Linux CI runner.
 
 ## Architecture
 
@@ -88,18 +98,15 @@ recordings.
 **Audio source preference** is merged multitrack → app/system audio → mic
 audio, resolved from the three filename columns after selection.
 
-**Date selection walks the whole list.** `find_session_by_date` converts the
-target to 8:00 AM `America/Los_Angeles`, converts each row's `dateCreated` as
-UTC, and keeps the smallest absolute difference — then rejects the winner if
-it falls outside `DATE_MATCH_WINDOW` (16h either side of the anchor). Without
-that bound, a date with no recording silently resolved to the nearest session
-months away and presented it as a match. It re-looks-up the winner via
-`find_session_by_id` with the bare hex id rather than reusing the row it
-already read; preserve that indirection.
-
-Note the asymmetry worth knowing: the anchor is Pacific, row timestamps are
-parsed as UTC. That assumes MacWhisper stores `dateCreated` in UTC, which is
-unverified — it matters only for meetings near midnight.
+**Date selection matches the calendar date, not a timestamp distance.**
+`find_session_by_date` compares the `YYYY-MM-DD` prefix of each row's
+`dateCreated` against the target. An earlier version anchored the target at
+08:00 America/Los_Angeles while parsing rows as UTC and allowed a 16h
+half-width window; the mixed zones meant a session stored at 00:30 matched
+both that day and the one before. Prefix comparison is exact, needs no
+window, and matches what `--list` prints. It re-looks-up the winner via
+`find_session_by_id` rather than reusing the row it read; preserve that
+indirection.
 
 **The sidecar is the state.** `reviewed` and `deleted_source` live only in
 `<basename>.meta.json`; nothing is written back to MacWhisper's database. The
@@ -124,13 +131,22 @@ Precedence is `--output-dir` > config file > `~/Documents/huddle-transcripts`.
 
 ## CI
 
-`lint.yml` runs shellcheck, shfmt, an exec-bit check, and `--help` on every
-PR, with both tools pinned by version and SHA so CI and local dev agree.
+`lint.yml` runs shellcheck, shfmt, an exec-bit check, `--help`, and the
+behavioral suite on every PR, with both tools pinned by version and SHA so
+CI and local dev agree.
+
 The other three workflows are thin caller stubs for reusable workflows in
 `smartwatermelon/github-workflows`. Read the header comment in
 `dependabot-auto-merge.yml` before editing it — it documents several things
 that must NOT be added to that file (`secrets: inherit`, `actions/checkout`)
 and why.
+
+**A PR that touches `.github/workflows/` gets no Claude review.**
+`claude-code-action` refuses to run against a PR that modifies its own
+workflow, so `claude-blocking-review` reports a green SKIP. On `@v3.0.0` that
+skip is mislabelled "Doc-only skip" regardless of the real reason. Treat a
+green blocking-review on a workflow-touching PR as "did not run", and get
+the diff reviewed another way.
 
 ## The destructive path
 
