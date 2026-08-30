@@ -40,15 +40,18 @@ huddle-transcribe [OPTIONS] [SESSION_ID_OR_DATE]
 - `SESSION_ID_OR_DATE` — optional. If omitted, uses the most recent
   MacWhisper session.
   - `latest` (default)
-  - `YYYY-MM-DD` — session closest to that date
+  - `YYYY-MM-DD` — a session recorded on that date. Dashed UUIDs and bare
+    hex both work; the match must fall on the requested day, so a date with
+    no recording is an error rather than a silent jump to a distant session.
   - a MacWhisper session UUID (or unambiguous prefix)
 
 ### Options
 
 ```
---dry-run                Show which session would be selected, don't transcribe
+--dry-run                Show which session would be selected; changes nothing
 --list                   List recent qualifying MacWhisper sessions with metadata
---mark-reviewed          Set reviewed=true, delete source .m4a for the selected session
+--mark-reviewed          Set reviewed=true and remove the source .m4a for the
+                         selected session
 --yes                    Skip confirmation prompt
 --output-dir PATH        Override the configured output directory
 -h, --help               Show usage
@@ -69,8 +72,11 @@ huddle-transcribe 2026-08-27
 # List recent sessions
 huddle-transcribe --list
 
-# Mark a transcript reviewed and delete its source audio
-huddle-transcribe --mark-reviewed 2026-08-27 --yes
+# Confirm what --mark-reviewed would act on, without touching anything
+huddle-transcribe --dry-run --mark-reviewed 2026-08-27
+
+# Mark a transcript reviewed and remove its source audio
+huddle-transcribe --mark-reviewed 2026-08-27
 ```
 
 ## Configuration
@@ -86,6 +92,10 @@ Google Drive or Dropbox:
 OUTPUT_DIR="/path/to/transcripts"
 ```
 
+A leading `~` is expanded. Because the file is parsed rather than sourced,
+shell variables such as `$HOME` are *not* expanded — write the path out or
+use `~`.
+
 ## Session selection
 
 Sessions come from MacWhisper's own SQLite database. A session qualifies if
@@ -98,24 +108,28 @@ and then microphone audio.
 For a session dated `2026-08-27` titled "SRE Daily Huddle", the script
 writes:
 
-- `2026-08-27_sre-daily-huddle.txt` — the diarized transcript
-- `2026-08-27_sre-daily-huddle.meta.json` — a metadata sidecar:
+- `2026-08-27_sre-daily-huddle_243d5daf.txt` — the diarized transcript
+- `2026-08-27_sre-daily-huddle_243d5daf.meta.json` — a metadata sidecar:
 
 ```json
 {
-  "session_id": "243d5daf-...",
+  "session_id": "243d5daf...",
   "date": "2026-08-27",
   "duration_seconds": 1076,
   "source_file": "..._merged-audio_....m4a",
-  "output_file": "2026-08-27_sre-daily-huddle.txt",
+  "output_file": "2026-08-27_sre-daily-huddle_243d5daf.txt",
   "reviewed": false,
   "deleted_source": false
 }
 ```
 
+The trailing session-id fragment keeps two same-day meetings apart when
+their titles reduce to the same slug (`SRE Daily Huddle` and
+`SRE/Daily Huddle` both slugify to `sre-daily-huddle`).
+
 ## Source file lifecycle
 
-The script never deletes source audio on transcription. Once a transcript
+The script never removes source audio on transcription. Once a transcript
 has been reviewed and is no longer needed, run:
 
 ```bash
@@ -123,7 +137,21 @@ huddle-transcribe --mark-reviewed 2026-08-27
 ```
 
 This sets `reviewed: true` and `deleted_source: true` in the sidecar and
-deletes the source `.m4a`.
+removes the source `.m4a`. Where `trash(1)` is available (macOS 14+) the
+file goes to the Trash and stays recoverable from Finder; otherwise it is
+deleted outright.
+
+This is the only destructive operation in the script, so it is fenced:
+
+- it refuses to run unless a sidecar exists for the selected session, and
+  that sidecar's `session_id` matches the session actually resolved;
+- it refuses to run if the transcript is missing or empty;
+- it prompts unless `--yes` is passed;
+- the sidecar is updated only *after* the audio is confirmed gone, so a
+  failed removal never leaves the sidecar claiming otherwise.
+
+Pair it with `--dry-run` first if you want to see which session and file a
+given argument resolves to.
 
 ## License
 
