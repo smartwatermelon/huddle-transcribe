@@ -4,19 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single Bash script, `huddle-transcribe`, that wraps MacWhisper Pro's `mw`
-CLI. It picks a meeting recording out of MacWhisper's own SQLite database,
-transcribes it with speaker diarization, and writes a `.txt` transcript plus a
-`.meta.json` sidecar. There is no build step, no package manager, and no test
-suite — the repo is the script, a README, a LICENSE, and the CI workflows.
+Two Bash scripts. `huddle-transcribe` wraps MacWhisper Pro's `mw` CLI: it
+picks a meeting recording out of MacWhisper's own SQLite database, transcribes
+it with speaker diarization, and writes a `.txt` transcript plus a
+`.meta.json` sidecar. `huddle-watch` drives it from launchd, waking on a
+database change and transcribing each session that has newly become ready.
+
+There is no build step and no package manager. The test suite is a single
+Bash script, `tests/run-tests.sh`; the rest of the repo is the two scripts, a
+README, a LICENSE, and the CI workflows.
 
 ## Commands
 
 ```bash
-./tests/run-tests.sh                                        # 51 behavioral tests
-shellcheck -S info huddle-transcribe tests/run-tests.sh     # must be clean
-shfmt -i 2 -ci -d huddle-transcribe tests/run-tests.sh      # show diff
-shfmt -i 2 -ci -w huddle-transcribe tests/run-tests.sh      # apply formatting
+./tests/run-tests.sh                                                     # 189 behavioral tests
+shellcheck -S info huddle-transcribe huddle-watch tests/run-tests.sh     # must be clean
+shfmt -i 2 -ci -d huddle-transcribe huddle-watch tests/run-tests.sh      # show diff
+shfmt -i 2 -ci -w huddle-transcribe huddle-watch tests/run-tests.sh      # apply formatting
 ```
 
 CI runs exactly these. Run the test suite before every commit — the linters
@@ -24,6 +28,15 @@ pass on every data-loss bug this repo has had.
 
 `shfmt -i 2 -ci` is the repo's format — plain `shfmt` defaults to tabs and
 will rewrite the whole file. Always pass both flags.
+
+`.editorconfig` encodes that same format, and it is load-bearing rather than
+decorative. shfmt reads formatting options from it, and the global pre-commit
+shell hook applies its own defaults (`-i 2 -ci -bn`) *only* when a repo has no
+`.editorconfig`. `-bn` puts binary operators at the start of a continuation
+line, which is the opposite of what CI's `shfmt -i 2 -ci` accepts — so without
+this file the hook rewrites every `... &&` line ending into a leading `&&` and
+CI then rejects it, on a loop no amount of reformatting escapes. Do not delete
+it, and keep `binary_next_line = false` in agreement with CI's flags.
 
 Exercising the script:
 
@@ -121,6 +134,29 @@ id suffix is what keeps two same-day sessions with colliding slugs from
 overwriting each other — and, because `--mark-reviewed` finds its sidecar by
 that same basename, it is also what stops the delete path from acting on a
 different session's sidecar. Do not drop it.
+
+### huddle-watch state
+
+The watcher's own state is one line per session in
+`~/.local/state/huddle-transcribe/watch-state`: `<session-id> done` for a
+finished session, `<session-id> <n>` for one that has failed `n` times. It is
+rewritten via `mktemp` + `mv` beside itself, like every other write in this
+repo.
+
+**A first run seeds instead of transcribing.** Otherwise switching the watcher
+on re-transcribes the entire backlog. The seeding gate is `[[ ! -s ]]`, not
+`-f`: a zero-byte state file is what an interrupted `mv` leaves behind, so it
+must be treated as never-seeded rather than as an empty seed.
+
+That gate is why the seeded file always opens with a `#` header line. A first
+run that finds nothing ready seeds zero sessions, and without the header it
+would leave a zero-byte file — which the `-s` gate then reads as unseeded, so
+the next run seeds the first genuinely-ready session as `done` and never
+transcribes it, silently. The header keeps a completed seed non-empty while
+leaving the gate's meaning intact. Every reader skips `$STATE_COMMENT` lines:
+`state_status`, `--status`'s record count, and `--status`'s given-up `awk`.
+`state_set` and `--retry` preserve it for free, since both rewrite by
+filtering out the lines they are replacing.
 
 ## Configuration
 
