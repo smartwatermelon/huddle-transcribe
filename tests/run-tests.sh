@@ -737,8 +737,9 @@ watch_reset
 # Seed first, then make one session newly ready, so the failure path has
 # exactly one candidate to retry.
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'cccc3333', isBeingRetranscribed = 0;" 2>/dev/null \
-  || sqlite3 "$WDB" "UPDATE session SET transcriptionDidSucceed = 1 WHERE id = x'cccc3333';"
+# cccc3333 is seeded diarized but not succeeded, so this is the only flip
+# needed to make it ready.
+sqlite3 "$WDB" "UPDATE session SET transcriptionDidSucceed = 1 WHERE id = x'cccc3333';"
 rm -f "$CALLS"
 
 rc=0

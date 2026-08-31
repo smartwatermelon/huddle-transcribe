@@ -1,0 +1,25 @@
+# shfmt reads its formatting options from here, and CI runs `shfmt -i 2 -ci`.
+# The two must agree: the global pre-commit shell hook applies its own
+# defaults (-i 2 -ci -bn) only when a repo has no .editorconfig, and -bn is
+# the opposite of CI's style for line continuations. Without this file the
+# hook rewrites `... &&` at end-of-line into a leading `&& ...`, which CI's
+# shfmt step then rejects -- an unwinnable commit/push loop.
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+
+[*.{sh,bash}]
+indent_style = space
+indent_size = 2
+switch_case_indent = true
+binary_next_line = false
+
+# huddle-transcribe and huddle-watch are extensionless bash scripts.
+[{huddle-transcribe,huddle-watch}]
+indent_style = space
+indent_size = 2
+switch_case_indent = true
+binary_next_line = false

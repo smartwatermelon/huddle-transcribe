@@ -813,8 +813,8 @@ LIMIT 10
     ready="no"
     dur_int="${dur%.*}"
     [[ "$dur_int" =~ ^[0-9]+$ ]] || dur_int=0
-    if [[ "$ok" == "1" && "$dia" == "1" && "$rtx" == "0" && "$tra" == "0" && "$del" == "0" ]] \
-      && ((dur_int > MIN_DURATION_SECONDS)); then
+    if [[ "$ok" == "1" && "$dia" == "1" && "$rtx" == "0" && "$tra" == "0" && "$del" == "0" ]] &&
+      ((dur_int > MIN_DURATION_SECONDS)); then
       ready="yes"
       state_is_done "$sid" && ready="seen"
     fi
