@@ -43,29 +43,114 @@ jobs:
           sudo install -m 0755 /tmp/shfmt /usr/local/bin/shfmt
           shfmt --version | grep -q "v3.14.0"
 
+      # Discover the shell scripts to check instead of listing them here.
+      # A hardcoded list silently omits any script added later: the new file
+      # ships unlinted, with an unchecked exec bit, and CI still reports
+      # green. Discovery is by shebang over git-tracked files, so a new
+      # script is covered the moment it is committed.
+      - name: Discover shell scripts
+        id: scripts
+        run: |
+          scripts=""
+          while IFS= read -r -d '' f; do
+            # Read only the first line, and only of regular files: a binary
+            # or a symlink to one would otherwise reach grep.
+            [ -f "$f" ] || continue
+            if head -n 1 "$f" | grep -qE '^#!.*[ /](ba)?sh([[:space:]]|$)'; then
+              # The list is carried as a space-separated string through
+              # GITHUB_OUTPUT, so a path containing whitespace would split
+              # into two bogus entries. Fail loudly instead of silently
+              # checking the wrong filenames.
+              case "$f" in
+                *[[:space:]]*)
+                  echo "::error file=$f::script paths must not contain whitespace" >&2
+                  exit 1
+                  ;;
+              esac
+              scripts="${scripts:+$scripts }$f"
+            fi
+          done < <(git ls-files -z)
+          if [ -z "$scripts" ]; then
+            echo "::error::no shell scripts discovered; the shebang filter is broken" >&2
+            exit 1
+          fi
+          echo "Discovered: $scripts"
+          echo "list=$scripts" >> "$GITHUB_OUTPUT"
+
+      # Every step below takes the discovered list through `env:` rather than
+      # a `${{ }}` expansion inside `run:`. Template expansion happens before
+      # the shell parses the script, so a crafted filename in an expanded
+      # list would be spliced in as code; via env it arrives as data.
+      # The list is read into an array and expanded quoted, so no step needs
+      # a `# shellcheck disable` for word splitting -- which matters, since
+      # one of these steps rejects exactly that directive.
+
       # -S info, not the default: the project standard is a clean run at
       # info severity with no `# shellcheck disable` directives anywhere.
       - name: ShellCheck
-        run: shellcheck -S info huddle-transcribe tests/run-tests.sh
+        env:
+          SCRIPTS: ${{ steps.scripts.outputs.list }}
+        run: |
+          read -r -a scripts <<<"$SCRIPTS"
+          shellcheck -S info "${scripts[@]}"
 
       # -i 2 -ci is the repo's format. Bare `shfmt` defaults to tabs and
       # would report the entire file as unformatted.
       - name: shfmt
-        run: shfmt -i 2 -ci -d huddle-transcribe tests/run-tests.sh
-
-      # The script is the deliverable and it is installed by symlink, so a
-      # lost exec bit breaks a fresh clone in a way nothing else here
-      # catches.
-      - name: Check executable bit
+        env:
+          SCRIPTS: ${{ steps.scripts.outputs.list }}
         run: |
-          if [ ! -x huddle-transcribe ]; then
-            echo "::error file=huddle-transcribe::huddle-transcribe must be executable (git update-index --chmod=+x huddle-transcribe)" >&2
+          read -r -a scripts <<<"$SCRIPTS"
+          shfmt -i 2 -ci -d "${scripts[@]}"
+
+      # Assert no `# shellcheck disable` directive has crept in. The project
+      # standard is to fix the finding, not silence it, and a directive is
+      # invisible to a green shellcheck run by construction.
+      - name: Check for shellcheck disable directives
+        env:
+          SCRIPTS: ${{ steps.scripts.outputs.list }}
+        run: |
+          read -r -a scripts <<<"$SCRIPTS"
+          if grep -rn 'shellcheck disable' "${scripts[@]}"; then
+            echo "::error::no '# shellcheck disable' directives are permitted; fix the finding instead" >&2
             exit 1
           fi
 
-      - name: Check --help runs
+      # The scripts are the deliverable and are installed by symlink, so a
+      # lost exec bit breaks a fresh clone in a way nothing else here
+      # catches. tests/ is excluded: the suite is invoked as ./run-tests.sh
+      # but a lost bit there fails the Behavioral tests step loudly anyway.
+      - name: Check executable bit
+        env:
+          SCRIPTS: ${{ steps.scripts.outputs.list }}
         run: |
-          ./huddle-transcribe --help >/dev/null
+          rc=0
+          read -r -a scripts <<<"$SCRIPTS"
+          for script in "${scripts[@]}"; do
+            case "$script" in tests/*) continue ;; esac
+            if [ ! -x "$script" ]; then
+              echo "::error file=$script::$script must be executable (git update-index --chmod=+x $script)" >&2
+              rc=1
+            fi
+          done
+          exit "$rc"
+
+      # --help must work for every top-level script: it is the one path a
+      # user hits before anything else, and it runs no privileged action.
+      - name: Check --help runs
+        env:
+          SCRIPTS: ${{ steps.scripts.outputs.list }}
+        run: |
+          rc=0
+          read -r -a scripts <<<"$SCRIPTS"
+          for script in "${scripts[@]}"; do
+            case "$script" in tests/*) continue ;; esac
+            if ! "./$script" --help >/dev/null; then
+              echo "::error file=$script::./$script --help exited non-zero" >&2
+              rc=1
+            fi
+          done
+          exit "$rc"
 
       # The behavioral suite is the only check that exercises what this
       # script actually does -- session selection, row parsing, and the
