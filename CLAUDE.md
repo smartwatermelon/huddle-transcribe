@@ -13,7 +13,7 @@ suite — the repo is the script, a README, a LICENSE, and the CI workflows.
 ## Commands
 
 ```bash
-./tests/run-tests.sh                                        # 51 behavioral tests
+./tests/run-tests.sh                                        # 183 behavioral tests
 shellcheck -S info huddle-transcribe tests/run-tests.sh     # must be clean
 shfmt -i 2 -ci -d huddle-transcribe tests/run-tests.sh      # show diff
 shfmt -i 2 -ci -w huddle-transcribe tests/run-tests.sh      # apply formatting

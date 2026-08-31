@@ -1,0 +1,1023 @@
+#!/usr/bin/env bash
+# huddle-watch: watch MacWhisper's database and transcribe a meeting the moment
+# it finishes recording AND transcribing, by invoking huddle-transcribe.
+set -euo pipefail
+
+DB="${HUDDLE_DB:-$HOME/Library/Application Support/MacWhisper/Database/main.sqlite}"
+STATE_FILE="${HUDDLE_STATE_FILE:-$HOME/.local/state/huddle-transcribe/watch-state}"
+LOG_FILE="${HUDDLE_LOG_FILE:-$HOME/Library/Logs/huddle-transcribe-watch.log}"
+# launchd's own stdout/stderr sink. Separate from $LOG_FILE because launchd
+# holds an open fd on whatever path it is given; see write_plist.
+LAUNCHD_LOG_FILE="${LOG_FILE}.launchd"
+# `-` rather than `:-`, so only an UNSET variable takes the default. With
+# `:-` an explicitly empty HUDDLE_MIN_DURATION silently became 300, which
+# hides a caller bug (typically an unset variable in a wrapper script)
+# behind a value the user never asked for. Empty is rejected below instead.
+MIN_DURATION_SECONDS="${HUDDLE_MIN_DURATION-300}"
+LABEL="com.smartwatermelon.huddle-transcribe.watch"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+
+# Cap the log at this size; when it is exceeded the current log becomes
+# <log>.1 and a fresh one starts. launchd fires this script on every database
+# commit, so an uncapped log grows without bound on a busy machine.
+LOG_MAX_BYTES=1048576
+# Give up on a session after this many failed huddle-transcribe runs. Without
+# a cap, a session that can never transcribe (missing audio, a corrupt file)
+# is retried on every single database commit, forever.
+MAX_ATTEMPTS=3
+# Lock retained across this many seconds without its owner is presumed stale
+# even if some unrelated process has since reused the pid.
+LOCK_MAX_AGE_SECONDS=7200
+
+# Resolve the sibling huddle-transcribe from this script's own location:
+# launchd hands the job a minimal PATH that does not include ~/.local/bin, so
+# `command -v huddle-transcribe` cannot be relied on here.
+SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+TRANSCRIBE_BIN="${HUDDLE_TRANSCRIBE_BIN:-$SELF_DIR/huddle-transcribe}"
+
+# MIN_DURATION_SECONDS is interpolated into SQL and also reaches a bash
+# arithmetic context, so it is validated before either can happen. Left
+# unvalidated it was exploitable twice over: `0 UNION SELECT ... --` injected
+# attacker-chosen session ids into the queue that drives huddle-transcribe,
+# and because (( )) recursively evaluates a bare NAME, a value like
+# `LOG_MAX_BYTES[$(touch /tmp/x)]` executed the command substitution. One
+# check closes both, so it must stay ahead of every use.
+if ! [[ "$MIN_DURATION_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "Error: HUDDLE_MIN_DURATION must be a whole number of seconds (got '$MIN_DURATION_SECONDS')." >&2
+  exit 1
+fi
+
+ONCE=0
+DRY_RUN=0
+LIST=0
+INSTALL=0
+UNINSTALL=0
+STATUS=0
+RETRY_SID=""
+
+usage() {
+  cat <<'EOF'
+Usage: huddle-watch [OPTIONS]
+
+Watches MacWhisper's SQLite database for a session that has finished both
+recording and transcription, then runs `huddle-transcribe <session-id> --yes`
+and posts a macOS notification.
+
+Options:
+  --once                Process any pending sessions and exit. Required for
+                        the processing mode; the watcher has no other mode,
+                        so this must be stated explicitly.
+  --dry-run             Report which sessions would be transcribed; runs
+                        nothing and writes no state
+  --list                Show recent sessions with their readiness flags
+  --retry SESSION_ID    Clear one session's attempt count so a session
+                        abandoned at the attempt cap is tried again
+  --install             Install and load the LaunchAgent
+  --uninstall           Unload and remove the LaunchAgent
+  --status              Report LaunchAgent, state file, and log status
+  -h, --help            Show this help
+
+Environment overrides (chiefly for testing):
+  HUDDLE_DB             MacWhisper database path
+  HUDDLE_TRANSCRIBE_BIN Path to huddle-transcribe
+  HUDDLE_STATE_FILE     Seen-session state file
+  HUDDLE_LOG_FILE       Log file
+  HUDDLE_MIN_DURATION   Minimum session duration in seconds (default 300)
+  HUDDLE_NO_NOTIFY      Set to any value to suppress macOS notifications
+  HUDDLE_NOTIFY_BIN     Use this instead of osascript for notifications
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --once)
+      ONCE=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --list)
+      LIST=1
+      shift
+      ;;
+    --install)
+      INSTALL=1
+      shift
+      ;;
+    --uninstall)
+      UNINSTALL=1
+      shift
+      ;;
+    --status)
+      STATUS=1
+      shift
+      ;;
+    --retry)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --retry requires a SESSION_ID argument" >&2
+        exit 1
+      fi
+      RETRY_SID="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      echo "Error: unexpected argument '$1' (huddle-watch takes options only)" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Rows are separated by a unit-separator (0x1F), not a tab, for the same
+# reason huddle-transcribe uses one: tab is IFS whitespace, so
+# `IFS=$'\t' read` collapses runs of consecutive tabs and shifts every later
+# field whenever a column is empty. 0x1F is not IFS whitespace, so empty
+# fields keep their position, and it cannot occur in a meeting title.
+SEP=$'\x1f'
+
+log() {
+  local ts
+  # printf's %(...)T is a bash builtin. date(1) is deliberately avoided
+  # throughout this repo: `date -j` is BSD-only and `date -d` is GNU-only.
+  printf -v ts '%(%Y-%m-%d %H:%M:%S)T' -1
+  printf '%s  %s\n' "$ts" "$*"
+}
+
+# Append to the log, rotating first if it has grown past LOG_MAX_BYTES. Never
+# fatal: a log that cannot be written must not stop a transcription.
+# The log holds meeting titles and huddle-transcribe's full output, so it is
+# created 0600 rather than left at whatever umask 022 gives (0644,
+# world-readable). Created explicitly before the first append, because `>>`
+# alone would apply the umask.
+log_open() {
+  local dir
+  dir=$(dirname -- "$LOG_FILE")
+  mkdir -p "$dir" 2>/dev/null || return 1
+  if [[ ! -e "$LOG_FILE" ]]; then
+    # A subshell so the tightened umask cannot leak to anything else this
+    # script creates afterwards.
+    (
+      umask 077
+      : >"$LOG_FILE"
+    ) 2>/dev/null || return 1
+  fi
+  return 0
+}
+
+# Rotate when the log is already at or past the cap, INCLUDING the bytes
+# about to be written. Checking only the pre-existing size let a single run
+# append huddle-transcribe's whole transcript blob past the cap and leave it
+# there until the next run noticed.
+log_rotate_if_needed() {
+  local incoming="${1:-0}" size
+  [[ -f "$LOG_FILE" ]] || return 0
+  size=$(wc -c <"$LOG_FILE" 2>/dev/null || echo 0)
+  size="${size//[[:space:]]/}"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+  if ((size + incoming > LOG_MAX_BYTES)); then
+    mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
+    log_open || return 0
+  fi
+  return 0
+}
+
+log_to_file() {
+  local line
+  line=$(log "$@")
+  log_open || return 0
+  log_rotate_if_needed "${#line}"
+  printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+# Notifications are cosmetic. osascript is absent in a Linux CI container and
+# fails in a headless macOS context, so every failure mode here is swallowed:
+# a missing notification must never turn a successful run into a failed one.
+#
+# Both overrides are checked BEFORE the `command -v` probe, because that probe
+# succeeds on any real Mac. Without them, anything that shells out to this
+# script on a Mac -- the test suite included -- posted real desktop alerts
+# with no way to suppress them.
+#
+#   HUDDLE_NO_NOTIFY=1   suppress notifications entirely
+#   HUDDLE_NOTIFY_BIN    use this instead of osascript (a stub, in tests)
+notify() {
+  local title="$1" message="$2"
+  [[ -z "${HUDDLE_NO_NOTIFY:-}" ]] || return 0
+  local notify_bin="${HUDDLE_NOTIFY_BIN:-osascript}"
+  command -v "$notify_bin" >/dev/null 2>&1 || return 0
+  # The message and title are interpolated into AppleScript, so escape
+  # backslashes first and then double quotes -- a meeting title containing
+  # either would otherwise break the script (or extend it).
+  local esc_msg="$message" esc_title="$title"
+  esc_msg="${esc_msg//\\/\\\\}"
+  esc_msg="${esc_msg//\"/\\\"}"
+  esc_title="${esc_title//\\/\\\\}"
+  esc_title="${esc_title//\"/\\\"}"
+  "$notify_bin" -e "display notification \"$esc_msg\" with title \"$esc_title\"" \
+    >/dev/null 2>&1 || true
+}
+
+# --- database access ---------------------------------------------------
+
+# Always read-only, in both belt and braces: -readonly plus a mode=ro URI.
+# huddle-transcribe only ever reads MacWhisper's database and this watcher
+# preserves that invariant -- nothing here may write to it. The database is in
+# WAL mode and MacWhisper holds it open, so "database is locked" is an
+# ordinary transient condition rather than an error: retry briefly, then let
+# the caller give up. launchd fires again on the next commit.
+# stdout and stderr are captured SEPARATELY and only ever merged on the error
+# path. Folding them together with 2>&1 meant that on a SUCCESSFUL query any
+# warning sqlite3 wrote to stderr was returned as query output and parsed as a
+# data row -- whose first field becomes a session id handed to
+# huddle-transcribe. stderr is diagnostics, never data.
+sql() {
+  local query="$1" attempt=0 out err rc=0 err_file
+  err_file=$(mktemp "${TMPDIR:-/tmp}/huddle-watch-sql.XXXXXX") || return 1
+  while ((attempt < 3)); do
+    rc=0
+    out=$(sqlite3 -readonly -separator "$SEP" "file:${DB}?mode=ro" "$query" 2>"$err_file") || rc=$?
+    if ((rc == 0)); then
+      rm -f "$err_file"
+      printf '%s' "$out"
+      [[ -z "$out" ]] || printf '\n'
+      return 0
+    fi
+    err=$(cat "$err_file" 2>/dev/null || true)
+    if [[ "$err" != *"locked"* && "$err" != *"busy"* ]]; then
+      break
+    fi
+    attempt=$((attempt + 1))
+    # `sleep` is POSIX; the fractional argument is a GNU/BSD extension both
+    # macOS and Linux accept.
+    sleep 0.5
+  done
+  err=$(cat "$err_file" 2>/dev/null || true)
+  rm -f "$err_file"
+  printf '%s\n' "$err" >&2
+  return 1
+}
+
+# The readiness predicate. A session is ready to transcribe when MacWhisper
+# has finished BOTH the recording and the diarized transcription:
+#
+#   transcriptionDidSucceed = 1   transcription completed successfully
+#   hasBeenDiarized = 1           speaker separation completed
+#   isBeingRetranscribed = 0      not mid-rerun; the row is still settling
+#   isTransient = 0               a real saved session, not a scratch row
+#   dateDeleted IS NULL           not deleted by the user
+#   duration > MIN_DURATION       same floor huddle-transcribe applies
+#
+# Duration is a COALESCE chain across recordedmeeting/systemaudiorecording
+# because MacWhisper populates a different table depending on how the
+# recording was captured.
+#
+# The chain must match SESSION_QUERY in huddle-transcribe EXACTLY --
+# `COALESCE(rm.duration, sar.duration, 0)`, with no s.playbackDuration term.
+# This watcher only ever hands a session id to huddle-transcribe, which
+# re-resolves it through its own WHERE clause. Any row this predicate admits
+# that the parent's does not is a session the parent cannot resolve: it exits
+# non-zero, the watcher retries to MAX_ATTEMPTS and then reports
+# "Transcription FAILED" for a recording that was never eligible. Adding a
+# duration source here without adding it there re-creates that.
+#
+# Columns, separated by $SEP (0x1F):
+#   session_id, dateCreated, duration, title
+READY_WHERE="
+  s.transcriptionDidSucceed = 1
+  AND s.hasBeenDiarized = 1
+  AND s.isBeingRetranscribed = 0
+  AND s.isTransient = 0
+  AND s.dateDeleted IS NULL
+  AND COALESCE(rm.duration, sar.duration, 0) > $MIN_DURATION_SECONDS
+"
+
+# The title is selected LAST and scrubbed of tab/CR/LF in SQL, matching
+# huddle-transcribe: it is the only free-text field, so putting it last means
+# a stray control character can only truncate the title rather than displace
+# the session id.
+READY_QUERY="
+SELECT
+  lower(hex(s.id)),
+  s.dateCreated,
+  COALESCE(rm.duration, sar.duration, 0),
+  replace(replace(replace(
+    COALESCE(s.userChosenTitle, s.aiTitle, rm.title, sar.title, 'Untitled'),
+    char(9), ' '), char(10), ' '), char(13), ' ')
+FROM session s
+LEFT JOIN recordedmeeting rm ON rm.id = s.recordedMeetingID
+LEFT JOIN systemaudiorecording sar ON sar.id = s.systemAudioRecordingID
+WHERE $READY_WHERE
+ORDER BY s.dateCreated DESC
+"
+
+# --- state file --------------------------------------------------------
+
+# One record per line: "<session_id> <status>", where <status> is either the
+# literal token `done` or a positive attempt count. A session id is bare hex
+# so it can never contain the separator.
+#
+# `done` is an explicit sentinel, NOT the number 0, and that distinction is
+# the whole point. When success was encoded as attempts=0 and an unparseable
+# field was ALSO coerced to 0, any malformed line -- a partial write, a
+# truncated file, a hand-edit -- read as "transcribed successfully" and the
+# session was never transcribed again, silently and permanently. Now the two
+# cases cannot collide: nothing but the token `done` means done, and a line
+# that parses as neither `done` nor a number is reported and treated as
+# attempts=0 (retryable), which fails toward doing the work rather than
+# toward losing it.
+#
+# Backward compatibility: a legacy `<id> 0` line still reads as done. Those
+# lines were written by earlier versions to mean exactly that, and rejecting
+# them would re-transcribe every already-completed session in an existing
+# state file. The files are rewritten to the `done` form as records are
+# touched; no migration pass is performed.
+STATE_DONE="done"
+
+# Read the record for one session. Emits the raw status token, or "" when the
+# session has no record. Also the single place a malformed line is reported,
+# so a corrupt state file is never silently terminal.
+state_status() {
+  local sid="$1" id status
+  [[ -f "$STATE_FILE" ]] || {
+    printf '%s\n' ""
+    return 0
+  }
+  # `|| [[ -n "$line" ]]` is not needed here because read populates $id and
+  # $status even on a final line with no trailing newline; the loop condition
+  # is what discards it, so the read result is checked explicitly below.
+  while read -r id status || [[ -n "$id" ]]; do
+    [[ "$id" == "$sid" ]] || continue
+    if [[ "$status" == "$STATE_DONE" ]] || [[ "$status" =~ ^[0-9]+$ ]]; then
+      printf '%s\n' "$status"
+    else
+      log_to_file "WARNING malformed state line for ${sid:0:8} (status '$status'); treating as 0 attempts"
+      printf '%s\n' ""
+    fi
+    return 0
+  done <"$STATE_FILE"
+  printf '%s\n' ""
+}
+
+state_attempts() {
+  local status
+  status=$(state_status "$1")
+  # `done` carries no attempt count; callers only ask this on the retry path.
+  if [[ "$status" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$status"
+  else
+    printf '%s\n' ""
+  fi
+}
+
+state_is_done() {
+  local status
+  status=$(state_status "$1")
+  # The sentinel, a legacy 0, or an exhausted attempt budget. Anything else
+  # -- including a malformed line, which state_status reduces to "" -- is not
+  # terminal, so the session gets another try.
+  [[ "$status" == "$STATE_DONE" ]] && return 0
+  [[ "$status" =~ ^[0-9]+$ ]] || return 1
+  ((status == 0 || status >= MAX_ATTEMPTS)) && return 0
+  return 1
+}
+
+# Write the state file through a temp file in the same directory and rename it
+# into place, so an interrupted write cannot truncate the record of what has
+# already been transcribed -- losing that file means re-transcribing the
+# backlog. mktemp beside the target, not in $TMPDIR, keeps the rename atomic.
+#
+# Returns non-zero instead of aborting when any step fails. Under
+# `set -euo pipefail` an unchecked mktemp failure (full disk, read-only home)
+# killed the script AFTER huddle-transcribe had already succeeded but BEFORE
+# the success was recorded: the next firing re-transcribed that session, and
+# every remaining queue entry was dropped. The caller logs the failure and
+# carries on with the rest of the queue.
+state_set() {
+  local sid="$1" status="$2" dir tmp
+  dir=$(dirname -- "$STATE_FILE")
+  mkdir -p "$dir" || return 1
+  tmp=$(mktemp "${STATE_FILE}.XXXXXX") || return 1
+  if [[ -f "$STATE_FILE" ]]; then
+    # Drop any prior record for this session, in either the legacy numeric
+    # form or the `done` sentinel form. grep exits 1 when it filters
+    # everything out, which is the normal single-record rewrite; only >1 is a
+    # real read error. Captured directly, because `!` would discard it.
+    local grep_rc=0
+    grep -v -x -E "^${sid}[[:space:]]+([0-9]+|${STATE_DONE})$" "$STATE_FILE" >"$tmp" || grep_rc=$?
+    if ((grep_rc > 1)); then
+      rm -f "$tmp"
+      return 1
+    fi
+  fi
+  if ! printf '%s %s\n' "$sid" "$status" >>"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! mv "$tmp" "$STATE_FILE"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
+}
+
+# --- locking -----------------------------------------------------------
+
+# mkdir is atomic, so it works as a mutex without a race between test and
+# create. Transcription takes minutes and launchd fires on every database
+# commit, so overlapping firings are the normal case, not the exception.
+LOCK_DIR="${STATE_FILE}.lock"
+LOCK_HELD=0
+
+release_lock() {
+  [[ $LOCK_HELD -eq 1 ]] || return 0
+  LOCK_HELD=0
+  trap - EXIT
+  rm -f "$LOCK_DIR/pid" "$LOCK_DIR/born" 2>/dev/null || true
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+# Claim the lock, then record the owning pid and a birth time.
+# $EPOCHSECONDS is a bash builtin, so this needs no date(1) call.
+#
+# `mkdir` is the atomic gate and the ONLY step that decides ownership: it
+# either creates the directory or fails because it already exists, with no
+# window between the two. The metadata is written immediately afterwards, and
+# a lock whose metadata has not landed yet is treated as HELD by acquire_lock
+# below -- see the fail-closed note there. That pairing is what closes the
+# race; the metadata write itself does not need to be atomic.
+#
+# Publishing a fully-populated staging directory with `mv` was considered and
+# rejected: `mv staging lock` does NOT fail when `lock` already exists, it
+# silently moves the staging directory INSIDE it and exits 0, so the loser of
+# a race would believe it had won and leave a stray `lock/staging/` behind.
+# `mv -T` avoids that but is GNU-only and BSD mv rejects the flag outright,
+# so it is unusable in a repo that must run on macOS and a Linux CI runner.
+claim_lock() {
+  mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  LOCK_HELD=1
+  trap 'release_lock' EXIT
+  printf '%s\n' "$$" >"$LOCK_DIR/pid" 2>/dev/null || true
+  printf '%s\n' "$EPOCHSECONDS" >"$LOCK_DIR/born" 2>/dev/null || true
+  return 0
+}
+
+acquire_lock() {
+  local dir owner born age
+  dir=$(dirname -- "$LOCK_DIR")
+  mkdir -p "$dir"
+  claim_lock && return 0
+  # The lock exists. Reclaim it only if its owner is demonstrably gone, or if
+  # it is old enough that a live pid must be an unrelated reuse of the number.
+  owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+  born=$(cat "$LOCK_DIR/born" 2>/dev/null || true)
+
+  # Fail closed on incomplete metadata. A lock directory with no readable pid
+  # is overwhelmingly a claim whose owner has not finished writing its
+  # metadata yet -- the window is microseconds, but launchd fires this script
+  # on every database commit, so runs genuinely do collide there. Reading
+  # owner="" used to skip the kill -0 guard entirely and reclaim a live
+  # owner's lock, and both runs then transcribed the same session. Declining
+  # costs one skipped firing; the next commit fires again.
+  if ! [[ "$owner" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  # Likewise for the birth time: an unreadable `born` must not read as 0,
+  # which made age ~1.79e9 and so ALWAYS exceeded LOCK_MAX_AGE_SECONDS,
+  # stealing the lock from a demonstrably live owner. Absent a trustworthy
+  # birth time the age test cannot be evaluated, so only liveness decides.
+  if [[ "$born" =~ ^[0-9]+$ ]]; then
+    age=$((EPOCHSECONDS - born))
+  else
+    age=-1
+  fi
+  if kill -0 "$owner" 2>/dev/null; then
+    ((age >= 0 && age > LOCK_MAX_AGE_SECONDS)) || return 1
+  fi
+  rm -f "$LOCK_DIR/pid" "$LOCK_DIR/born" 2>/dev/null || true
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+  claim_lock
+}
+
+# --- LaunchAgent -------------------------------------------------------
+
+# Built with plutil from a JSON document rather than a raw XML heredoc: a path
+# containing `&`, `<`, or a quote would corrupt hand-written XML, and plutil
+# escapes it correctly. jq builds the JSON so the same is true of the JSON
+# layer itself.
+#
+# StandardOutPath/StandardErrorPath deliberately point at a DIFFERENT file
+# from the one log_to_file writes and rotates. launchd opens its path once and
+# holds that file descriptor for the life of the job, so when both pointed at
+# $LOG_FILE, the `mv -f` in log_rotate_if_needed left launchd writing into the
+# rotated-aside inode (now <log>.1) while log_to_file wrote a fresh <log> --
+# splitting the output of a single run across two files, precisely when
+# reading it mattered. Giving launchd its own path keeps each writer's
+# rotation independent. Self-rotation is retained rather than handed to
+# launchd because launchd has no size-based rotation of its own.
+write_plist() {
+  local watch_main="$1" watch_wal="$2" json_tmp
+  mkdir -p "$(dirname -- "$PLIST")"
+  json_tmp=$(mktemp "${PLIST}.json.XXXXXX")
+  if ! jq -n \
+    --arg label "$LABEL" \
+    --arg prog "$SELF_DIR/huddle-watch" \
+    --arg main "$watch_main" \
+    --arg wal "$watch_wal" \
+    --arg log "$LAUNCHD_LOG_FILE" \
+    '{
+      Label: $label,
+      ProgramArguments: [$prog, "--once"],
+      WatchPaths: [$main, $wal],
+      RunAtLoad: false,
+      StandardOutPath: $log,
+      StandardErrorPath: $log
+    }' >"$json_tmp"; then
+    rm -f "$json_tmp"
+    echo "Error: failed to build LaunchAgent definition." >&2
+    return 1
+  fi
+  local plist_tmp
+  plist_tmp=$(mktemp "${PLIST}.XXXXXX")
+  if ! plutil -convert xml1 -o "$plist_tmp" "$json_tmp"; then
+    rm -f "$json_tmp" "$plist_tmp"
+    echo "Error: plutil failed to convert the LaunchAgent definition." >&2
+    return 1
+  fi
+  rm -f "$json_tmp"
+  mv "$plist_tmp" "$PLIST"
+}
+
+do_install() {
+  if [[ ! -x "$TRANSCRIBE_BIN" ]]; then
+    echo "Error: huddle-transcribe not found or not executable at $TRANSCRIBE_BIN" >&2
+    exit 1
+  fi
+  # WatchPaths must include the -wal file, not just main.sqlite. The database
+  # is in WAL mode, so a commit lands in main.sqlite-wal first and
+  # main.sqlite may not be touched for a long time afterwards -- watching
+  # only main.sqlite fires late or not at all.
+  #
+  # -shm is deliberately NOT watched. It is the WAL shared-memory index, and
+  # SQLite mutates it through an mmap rather than through write(2). FSEvents,
+  # which is what WatchPaths is built on, reports filesystem operations, so
+  # mmap stores to -shm are not a reliable trigger and may produce no event
+  # at all. It also carries no information -wal does not: every commit that
+  # touches -shm also appends to -wal, which does fire. Adding it would at
+  # best duplicate wakeups and at worst suggest a guarantee FSEvents does not
+  # make.
+  write_plist "$DB" "${DB}-wal" || exit 1
+  mkdir -p "$(dirname -- "$LOG_FILE")"
+  local uid
+  uid=$(id -u)
+  if launchctl bootstrap "gui/$uid" "$PLIST" 2>/dev/null; then
+    echo "Loaded LaunchAgent $LABEL"
+  elif launchctl load "$PLIST" 2>/dev/null; then
+    # bootstrap is the modern verb; load is retained only for macOS releases
+    # that lack it.
+    echo "Loaded LaunchAgent $LABEL (via legacy launchctl load)"
+  else
+    echo "Warning: wrote $PLIST but could not load it." >&2
+    echo "Load it manually: launchctl bootstrap gui/$uid \"$PLIST\"" >&2
+    exit 1
+  fi
+  echo "Watching:  $DB"
+  echo "           ${DB}-wal"
+  echo "Log:       $LOG_FILE"
+  echo "State:     $STATE_FILE"
+  echo
+  echo "First run seeds the state file with the sessions that are already"
+  echo "ready and transcribes none of them; only new sessions are picked up."
+  exit 0
+}
+
+do_uninstall() {
+  local uid
+  uid=$(id -u)
+  if launchctl bootout "gui/$uid/$LABEL" 2>/dev/null; then
+    echo "Unloaded LaunchAgent $LABEL"
+  elif [[ -f "$PLIST" ]] && launchctl unload "$PLIST" 2>/dev/null; then
+    echo "Unloaded LaunchAgent $LABEL (via legacy launchctl unload)"
+  else
+    echo "LaunchAgent $LABEL was not loaded."
+  fi
+  if [[ -f "$PLIST" ]]; then
+    rm -f "$PLIST"
+    echo "Removed $PLIST"
+  fi
+  echo "State file left in place: $STATE_FILE"
+  exit 0
+}
+
+do_status() {
+  local uid
+  uid=$(id -u)
+  if [[ -f "$PLIST" ]]; then
+    echo "Plist:     $PLIST"
+  else
+    echo "Plist:     (not installed)"
+  fi
+  if launchctl print "gui/$uid/$LABEL" >/dev/null 2>&1; then
+    echo "Loaded:    yes"
+  else
+    echo "Loaded:    no"
+  fi
+  echo "Database:  $DB"
+  if [[ -s "$STATE_FILE" ]]; then
+    # `wc -l` rather than `grep -c .`: grep -c prints 0 AND exits 1 on a file
+    # with no matching lines, so a `|| echo 0` fallback appended a SECOND
+    # zero and the count printed as "0\n0".
+    local seen gave_up
+    seen=$(wc -l <"$STATE_FILE" 2>/dev/null || printf '0')
+    seen="${seen//[[:space:]]/}"
+    [[ "$seen" =~ ^[0-9]+$ ]] || seen=0
+    echo "State:     $STATE_FILE ($seen session(s) recorded)"
+    # Sessions abandoned at the attempt cap are otherwise invisible: nothing
+    # reports them and they are never retried, so a real meeting could sit
+    # untranscribed indefinitely with no signal anywhere.
+    gave_up=$(awk -v cap="$MAX_ATTEMPTS" \
+      '$2 ~ /^[0-9]+$/ && $2 >= cap { print $1 }' "$STATE_FILE" 2>/dev/null || true)
+    if [[ -n "$gave_up" ]]; then
+      echo "Given up:  the following session(s) hit the ${MAX_ATTEMPTS}-attempt cap"
+      while read -r gid; do
+        [[ -n "$gid" ]] || continue
+        echo "           ${gid:0:8}  (retry with: huddle-watch --retry $gid)"
+      done <<<"$gave_up"
+    fi
+  elif [[ -f "$STATE_FILE" ]]; then
+    echo "State:     $STATE_FILE (empty; next run seeds it)"
+  else
+    echo "State:     $STATE_FILE (not yet created; next run seeds it)"
+  fi
+  if [[ -f "$LOG_FILE" ]]; then
+    echo "Log:       $LOG_FILE"
+  else
+    echo "Log:       $LOG_FILE (not yet created)"
+  fi
+  if [[ -f "$LAUNCHD_LOG_FILE" ]]; then
+    echo "launchd:   $LAUNCHD_LOG_FILE"
+  fi
+  if [[ -d "$LOCK_DIR" ]]; then
+    local lock_pid
+    lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null) || lock_pid="?"
+    [[ -n "$lock_pid" ]] || lock_pid="?"
+    echo "Lock:      held by pid $lock_pid"
+  else
+    echo "Lock:      free"
+  fi
+  exit 0
+}
+
+# LaunchAgent management runs before any dependency check on sqlite3/the
+# database, and is never a side effect of another flag.
+if [[ $UNINSTALL -eq 1 ]]; then
+  do_uninstall
+fi
+if [[ $STATUS -eq 1 ]]; then
+  do_status
+fi
+if [[ $INSTALL -eq 1 ]]; then
+  do_install
+fi
+
+# --- --retry -----------------------------------------------------------
+
+# The escape hatch for the attempt cap. Without it, three transient failures
+# -- MacWhisper busy, the laptop asleep mid-run -- abandoned a real meeting
+# permanently, recoverable only by hand-editing the state file. Clearing the
+# record makes the session pending again on the next firing.
+#
+# Only the state file is touched, so this deliberately runs before the
+# sqlite3/database checks: recovering from a given-up session must not require
+# a readable MacWhisper database.
+if [[ -n "$RETRY_SID" ]]; then
+  retry_sid="${RETRY_SID//-/}"
+  # Same normalization huddle-transcribe applies: ids are stored as bare
+  # lowercase hex, but a UUID copied from MacWhisper's UI is dashed.
+  retry_sid=$(printf '%s' "$retry_sid" | tr '[:upper:]' '[:lower:]')
+  if ! [[ "$retry_sid" =~ ^[0-9a-f]+$ ]]; then
+    echo "Error: '$RETRY_SID' is not a session id (expected hex)." >&2
+    exit 1
+  fi
+  if [[ ! -s "$STATE_FILE" ]]; then
+    echo "Error: no state file at $STATE_FILE; nothing to retry." >&2
+    exit 1
+  fi
+  retry_tmp=$(mktemp "${STATE_FILE}.XXXXXX") || {
+    echo "Error: could not create a temp file beside $STATE_FILE" >&2
+    exit 1
+  }
+  retry_rc=0
+  # Match on the id field only, so a prefix cannot silently clear the wrong
+  # record and any status form (numeric or `done`) is removed.
+  awk -v sid="$retry_sid" '$1 != sid' "$STATE_FILE" >"$retry_tmp" || retry_rc=$?
+  if ((retry_rc != 0)); then
+    rm -f "$retry_tmp"
+    echo "Error: failed to rewrite $STATE_FILE" >&2
+    exit 1
+  fi
+  retry_lines_after=$(wc -l <"$retry_tmp") || retry_lines_after=""
+  retry_lines_before=$(wc -l <"$STATE_FILE") || retry_lines_before=""
+  if [[ "$retry_lines_after" == "$retry_lines_before" ]]; then
+    rm -f "$retry_tmp"
+    echo "No record for session ${retry_sid:0:8} in $STATE_FILE; nothing to clear."
+    exit 0
+  fi
+  if ! mv "$retry_tmp" "$STATE_FILE"; then
+    rm -f "$retry_tmp"
+    echo "Error: failed to update $STATE_FILE" >&2
+    exit 1
+  fi
+  log_to_file "cleared state for ${retry_sid:0:8} via --retry"
+  echo "Cleared the attempt count for session ${retry_sid:0:8}."
+  echo "It will be picked up on the next run if it is still ready."
+  exit 0
+fi
+
+# --- dependency checks -------------------------------------------------
+
+for dep in sqlite3 jq; do
+  if ! command -v "$dep" >/dev/null 2>&1; then
+    echo "Error: required command '$dep' not found on PATH." >&2
+    exit 1
+  fi
+done
+
+# Checked explicitly so a missing MacWhisper install reports itself rather
+# than surfacing as `Error: in prepare, no such table: session`.
+if [[ ! -r "$DB" ]]; then
+  echo "Error: MacWhisper database not readable at $DB" >&2
+  echo "Is MacWhisper Pro installed and has it recorded at least one meeting?" >&2
+  exit 1
+fi
+
+fmt_duration() {
+  local secs="${1:-0}"
+  # Durations arrive from SQLite as either an integer or a float; strip any
+  # fractional part before arithmetic, since bash cannot do floating point.
+  secs="${secs%.*}"
+  [[ "$secs" =~ ^[0-9]+$ ]] || secs=0
+  printf "%dm%02ds" "$((secs / 60))" "$((secs % 60))"
+}
+
+# --- --list ------------------------------------------------------------
+
+if [[ $LIST -eq 1 ]]; then
+  # Read-only, and deliberately NOT filtered by the readiness predicate: the
+  # point of --list is to show why a session is or is not being picked up.
+  # The duration column matches the readiness predicate's COALESCE chain
+  # (rm/sar only, no s.playbackDuration) so the READY flag printed here is
+  # computed from the same number the predicate filters on. A session whose
+  # duration lives only in s.playbackDuration therefore shows 0m00s and
+  # READY=no, which is the truth: huddle-transcribe cannot resolve it either.
+  LIST_QUERY="
+SELECT
+  lower(hex(s.id)),
+  s.dateCreated,
+  COALESCE(rm.duration, sar.duration, 0),
+  COALESCE(s.transcriptionDidSucceed, 0),
+  s.hasBeenDiarized,
+  s.isBeingRetranscribed,
+  s.isTransient,
+  CASE WHEN s.dateDeleted IS NULL THEN 0 ELSE 1 END,
+  replace(replace(replace(
+    COALESCE(s.userChosenTitle, s.aiTitle, rm.title, sar.title, 'Untitled'),
+    char(9), ' '), char(10), ' '), char(13), ' ')
+FROM session s
+LEFT JOIN recordedmeeting rm ON rm.id = s.recordedMeetingID
+LEFT JOIN systemaudiorecording sar ON sar.id = s.systemAudioRecordingID
+ORDER BY s.dateCreated DESC
+LIMIT 10
+"
+  if ! rows=$(sql "$LIST_QUERY"); then
+    echo "Error: failed to query MacWhisper database at $DB" >&2
+    exit 1
+  fi
+  if [[ -z "$rows" ]]; then
+    echo "No sessions found in $DB." >&2
+    exit 1
+  fi
+  printf '%-8s  %-19s  %-8s  %-3s %-3s %-3s %-3s %-3s  %-5s  %s\n' \
+    "SESSION" "DATE" "DURATION" "OK" "DIA" "RTX" "TRA" "DEL" "READY" "TITLE"
+  while IFS="$SEP" read -r sid date dur ok dia rtx tra del title; do
+    ready="no"
+    dur_int="${dur%.*}"
+    [[ "$dur_int" =~ ^[0-9]+$ ]] || dur_int=0
+    if [[ "$ok" == "1" && "$dia" == "1" && "$rtx" == "0" && "$tra" == "0" && "$del" == "0" ]] \
+      && ((dur_int > MIN_DURATION_SECONDS)); then
+      ready="yes"
+      state_is_done "$sid" && ready="seen"
+    fi
+    pretty_dur=$(fmt_duration "$dur")
+    printf '%-8s  %-19s  %-8s  %-3s %-3s %-3s %-3s %-3s  %-5s  %s\n' \
+      "${sid:0:8}" "${date%.*}" "$pretty_dur" \
+      "$ok" "$dia" "$rtx" "$tra" "$del" "$ready" "$title"
+  done <<<"$rows"
+  echo
+  echo "OK=transcriptionDidSucceed  DIA=hasBeenDiarized  RTX=isBeingRetranscribed"
+  echo "TRA=isTransient  DEL=dateDeleted set  READY=matches the readiness predicate"
+  echo "(READY=seen means already transcribed or given up on, per $STATE_FILE)"
+  exit 0
+fi
+
+# --- mode check --------------------------------------------------------
+
+# --once is now REQUIRED to reach the processing path, rather than being
+# accepted and ignored. It previously ended the script as `[[ $ONCE -eq 1 ]]
+# || true` -- a literal no-op, so behavior was identical with or without it,
+# and a reader had to prove that to themselves. Requiring it means the flag
+# states something true: this run processes what is pending and exits.
+if [[ $ONCE -ne 1 && $DRY_RUN -ne 1 ]]; then
+  echo "Error: --once is required to process pending sessions." >&2
+  echo "Use --dry-run to see what would happen, or --list to inspect sessions." >&2
+  usage >&2
+  exit 1
+fi
+
+# --- collect ready sessions -------------------------------------------
+
+if ! READY_ROWS=$(sql "$READY_QUERY"); then
+  echo "Error: failed to query MacWhisper database at $DB" >&2
+  # Non-fatal from launchd's point of view: the next database commit fires
+  # this script again, and a transient WAL lock resolves itself.
+  exit 1
+fi
+
+# --- --dry-run ---------------------------------------------------------
+
+# Checked BEFORE the state file is created or touched, and before any lock is
+# taken. --dry-run is the flag a user reaches for when they are unsure what
+# will happen, so it must mutate nothing at all: no state file, no seeding, no
+# transcription. huddle-transcribe had a data-loss bug from exactly this
+# ordering being wrong; keep this block above everything that writes.
+if [[ $DRY_RUN -eq 1 ]]; then
+  # -s, matching the seeding gate below, so a zero-byte state file is
+  # reported as the first run it will actually be treated as.
+  if [[ ! -s "$STATE_FILE" ]]; then
+    echo "(dry run — no state file at $STATE_FILE)"
+    echo "A real first run would seed it with the sessions below and transcribe none."
+  fi
+  found=0
+  while IFS="$SEP" read -r sid date dur title; do
+    [[ -n "$sid" ]] || continue
+    if [[ -s "$STATE_FILE" ]] && state_is_done "$sid"; then
+      continue
+    fi
+    found=$((found + 1))
+    pretty_dur=$(fmt_duration "$dur")
+    printf 'would transcribe  %-8s  %-19s  %-8s  %s\n' \
+      "${sid:0:8}" "${date%.*}" "$pretty_dur" "$title"
+  done <<<"$READY_ROWS"
+  if [[ $found -eq 0 ]]; then
+    echo "(dry run — nothing pending)"
+  fi
+  echo "(dry run — nothing was transcribed and no state was written)"
+  exit 0
+fi
+
+# --- first-run seeding -------------------------------------------------
+
+# On the very first run there is no state file, so every session that is
+# already ready would look new. Record them all as seen and transcribe
+# NOTHING: otherwise switching the watcher on re-transcribes the entire
+# backlog, which is hours of work and a pile of duplicate transcripts.
+# Gated on -s, not -f: a zero-byte state file is an interrupted `mv` or a
+# `: > state`, not a populated one. Testing only for existence meant such a
+# file skipped seeding, every ready session then looked pending, and switching
+# the watcher on transcribed the entire backlog.
+if [[ ! -s "$STATE_FILE" ]]; then
+  mkdir -p "$(dirname -- "$STATE_FILE")"
+  seed_tmp=$(mktemp "${STATE_FILE}.XXXXXX")
+  seeded=0
+  while IFS="$SEP" read -r sid _date _dur _title; do
+    [[ -n "$sid" ]] || continue
+    printf '%s %s\n' "$sid" "$STATE_DONE" >>"$seed_tmp"
+    seeded=$((seeded + 1))
+  done <<<"$READY_ROWS"
+  mv "$seed_tmp" "$STATE_FILE"
+  log_to_file "seeded state with $seeded already-ready session(s); transcribed none"
+  echo "Seeded $STATE_FILE with $seeded already-ready session(s); transcribed none."
+  echo "New sessions from here on will be transcribed automatically."
+  exit 0
+fi
+
+# --- process pending sessions -----------------------------------------
+
+# Collect the pending ids before taking the lock: the transcribe loop below
+# is long-running, and reading the whole list up front keeps the database
+# handle short-lived.
+PENDING=()
+while IFS="$SEP" read -r sid _date _dur title; do
+  [[ -n "$sid" ]] || continue
+  state_is_done "$sid" && continue
+  PENDING+=("$sid$SEP$title")
+done <<<"$READY_ROWS"
+
+# The overwhelmingly common case: launchd fired because MacWhisper updated
+# something unrelated (its full-text index, a dictation row). Exit quietly.
+if [[ ${#PENDING[@]} -eq 0 ]]; then
+  exit 0
+fi
+
+if ! acquire_lock; then
+  log_to_file "another huddle-watch run holds the lock; skipping"
+  # Not an error: the run that holds the lock is doing the work, and launchd
+  # fires again on the next commit anyway.
+  exit 0
+fi
+
+if [[ ! -x "$TRANSCRIBE_BIN" ]]; then
+  log_to_file "ERROR huddle-transcribe not executable at $TRANSCRIBE_BIN"
+  echo "Error: huddle-transcribe not found or not executable at $TRANSCRIBE_BIN" >&2
+  notify "huddle-transcribe failed" "huddle-transcribe not found at $TRANSCRIBE_BIN"
+  exit 1
+fi
+
+overall_rc=0
+for entry in "${PENDING[@]}"; do
+  IFS="$SEP" read -r sid title <<<"$entry" || true
+  # Re-check under the lock. A concurrent run that finished between the
+  # collection above and the lock acquisition may already have handled this.
+  state_is_done "$sid" && continue
+
+  attempts=$(state_attempts "$sid")
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+
+  log_to_file "transcribing session ${sid:0:8} ($title) attempt $((attempts + 1))/$MAX_ATTEMPTS"
+
+  # The session id is passed EXPLICITLY, never `latest`. Two meetings that
+  # finish close together would otherwise race: whichever run gets there
+  # second re-transcribes the newer session and never touches the older one.
+  run_rc=0
+  run_out=$("$TRANSCRIBE_BIN" "$sid" --yes 2>&1) || run_rc=$?
+
+  # Log the child's combined output regardless of outcome; it is the only
+  # record of what happened inside a launchd-driven run.
+  if [[ -n "$run_out" ]]; then
+    log_to_file "huddle-transcribe output for ${sid:0:8}:"
+    # Rotate for the blob's own size before appending it. This is the write
+    # that could overshoot LOG_MAX_BYTES by an entire run's output, because
+    # huddle-transcribe's combined stdout/stderr is unbounded.
+    if log_open; then
+      log_rotate_if_needed "${#run_out}"
+      printf '%s\n' "$run_out" >>"$LOG_FILE" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ $run_rc -eq 0 ]]; then
+    # Exit status is the authoritative success signal. The transcript path is
+    # parsed from the success line only to name the file in the notification;
+    # a missing line degrades the message, not the outcome.
+    out_line=$(grep -m1 '^Transcript written: ' <<<"$run_out" || true)
+    out_path="${out_line#Transcript written: }"
+    if [[ -n "$out_path" && "$out_path" != "$out_line" ]]; then
+      base=$(basename -- "$out_path")
+    else
+      base="$title"
+    fi
+    # Mark seen ONLY after a successful run, so a transient failure retries.
+    # A failure to record it is loud but NOT fatal: the transcription already
+    # succeeded, and aborting here would drop every remaining queue entry and
+    # re-transcribe this session on the next firing.
+    if ! state_set "$sid" "$STATE_DONE"; then
+      log_to_file "ERROR could not record success for ${sid:0:8} in $STATE_FILE; it will be re-transcribed"
+      echo "Error: transcribed ${sid:0:8} but could not update $STATE_FILE; it will be re-transcribed." >&2
+      notify "huddle-transcribe state error" "Could not record ${sid:0:8}; it will be re-transcribed."
+      overall_rc=1
+    fi
+    log_to_file "OK ${sid:0:8} -> ${base}"
+    echo "Transcribed ${sid:0:8}: $base"
+    notify "Transcript ready" "$base"
+  else
+    attempts=$((attempts + 1))
+    if ! state_set "$sid" "$attempts"; then
+      log_to_file "ERROR could not record attempt $attempts for ${sid:0:8} in $STATE_FILE"
+      echo "Error: could not update $STATE_FILE for ${sid:0:8}." >&2
+    fi
+    overall_rc=1
+    if ((attempts >= MAX_ATTEMPTS)); then
+      log_to_file "GAVE UP on ${sid:0:8} after $attempts attempt(s) (exit $run_rc)"
+      echo "Error: gave up on session ${sid:0:8} after $attempts attempt(s). See $LOG_FILE" >&2
+      notify "Transcription FAILED" "Gave up on ${sid:0:8} after $attempts tries. Log: $LOG_FILE"
+    else
+      log_to_file "FAILED ${sid:0:8} (exit $run_rc), attempt $attempts/$MAX_ATTEMPTS; will retry"
+      echo "Error: session ${sid:0:8} failed (attempt $attempts/$MAX_ATTEMPTS). See $LOG_FILE" >&2
+    fi
+  fi
+done
+
+# Release on the normal path rather than leaving it to the EXIT trap alone, so
+# the lock is gone before this script's own exit status is computed.
+release_lock
+
+exit $overall_rc
