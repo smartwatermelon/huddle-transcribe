@@ -666,7 +666,9 @@ expect_watch_rc "first run exits 0" 0 --once
 exists "first run creates the state file" "$WSTATE"
 absent "first run transcribes nothing" "$CALLS"
 # Both ready sessions must be recorded as seen, and only those two.
-seeded=$(grep -c . "$WSTATE" || true)
+# Count session records only: the seeded file also carries a `#` header, which
+# is what keeps a zero-session seed from leaving a zero-byte file.
+seeded=$(grep -c -v -e '^#' -e '^$' "$WSTATE" || true)
 if [[ "$seeded" == "2" ]]; then
   pass "first run seeds exactly the ready sessions"
 else
@@ -683,6 +685,42 @@ if grep -q 'bbbb2222' "$WSTATE"; then
 else
   pass "seeding excludes non-ready sessions"
 fi
+
+# --- seeding with nothing ready still marks the first run as done ---
+
+# A first run on a database with no ready sessions (fresh MacWhisper, or
+# everything still transcribing) seeds zero ids. If that leaves a zero-byte
+# state file, the -s gate above is still true on the next run, so the first
+# real session gets seeded as `done` and is never transcribed -- silently,
+# with no error and no notification. The seeding pass must produce a
+# non-empty file even when it records no sessions.
+watch_reset
+build_watch_db
+# Make every session non-ready, so READY_ROWS comes back empty.
+sqlite3 "$WDB" "UPDATE session SET transcriptionDidSucceed = 0;"
+expect_watch_rc "first run with nothing ready exits 0" 0 --once
+exists "first run with nothing ready creates the state file" "$WSTATE"
+absent "first run with nothing ready transcribes nothing" "$CALLS"
+if [[ -s "$WSTATE" ]]; then
+  pass "seeding nothing still leaves a non-empty state file"
+else
+  fail "seeding nothing still leaves a non-empty state file" "state file is zero bytes"
+fi
+# The real test of the bug: a session becoming ready after an empty seed must
+# be transcribed, not re-seeded as already-done.
+sqlite3 "$WDB" "UPDATE session SET transcriptionDidSucceed = 1 WHERE id = x'aaaa1111';"
+expect_watch_rc "session ready after an empty seed exits 0" 0 --once
+if [[ -f "$CALLS" ]] && grep -q 'aaaa1111' "$CALLS"; then
+  pass "a session ready after an empty seed is transcribed"
+else
+  diag=$(dump "$CALLS")
+  fail "a session ready after an empty seed is transcribed" "$diag"
+fi
+
+# Restore the shared fixture for the tests that follow.
+build_watch_db
+watch_reset
+watch --once >/dev/null 2>&1 || true
 
 # --- already-seen sessions are skipped ---
 
@@ -1066,7 +1104,7 @@ watch_reset
 rm -f "$CALLS"
 watch --once >/dev/null 2>&1 || true
 absent "an empty state file transcribes nothing" "$CALLS"
-empty_seeded=$(grep -c . "$WSTATE" || true)
+empty_seeded=$(grep -c -v -e '^#' -e '^$' "$WSTATE" || true)
 if [[ "$empty_seeded" == "2" ]]; then
   pass "an empty state file is treated as first-run and seeded"
 else
@@ -1257,7 +1295,13 @@ watch --once >/dev/null 2>&1 || true
 sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
 watch --once >/dev/null 2>&1 || true
 if [[ -f "$WLOG" ]]; then
-  log_mode=$(stat -f '%Lp' "$WLOG" 2>/dev/null || stat -c '%a' "$WLOG" 2>/dev/null || echo "?")
+  # GNU stat must be tried first. Its -f means --file-system, so BSD's
+  # `stat -f '%Lp'` does not fail on Linux -- it succeeds and prints a
+  # filesystem report, which the 2>/dev/null cannot catch because there is
+  # no error. BSD stat rejects -c outright, so this order is unambiguous on
+  # both platforms. Anything that is not three octal digits is an error.
+  log_mode=$(stat -c '%a' "$WLOG" 2>/dev/null || stat -f '%Lp' "$WLOG" 2>/dev/null || echo "?")
+  [[ "$log_mode" =~ ^[0-7]{3}$ ]] || log_mode="unparseable: $log_mode"
   if [[ "$log_mode" == "600" ]]; then
     pass "the log file is created mode 0600"
   else
