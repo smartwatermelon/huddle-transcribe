@@ -135,6 +135,42 @@ overwriting each other — and, because `--mark-reviewed` finds its sidecar by
 that same basename, it is also what stops the delete path from acting on a
 different session's sidecar. Do not drop it.
 
+### huddle-watch requires bash 4.2+, and launchd must be told which bash
+
+The script uses `printf '%(...)T'` (bash 4.2+) in `log()`. macOS ships bash
+3.2.57 at `/bin/bash` and never updates it, so `#!/usr/bin/env bash` resolves
+to an inadequate interpreter anywhere `PATH` lacks a modern bash — which is
+exactly what launchd, cron, and GUI-spawned processes provide. The original
+symptom was `printf: \`(': invalid format character` then `ts: unbound
+variable`, aborting before a single log line was written: invisible to the
+user, invisible to CI (which runs bash 5), and reachable only through launchd.
+
+Three pieces keep that closed, and all three are load-bearing:
+
+- **`ProgramArguments[0]` is an absolute bash, not the script.** When argv[0]
+  is an interpreter the kernel never reads the shebang, so launchd's minimal
+  `PATH` cannot select the wrong bash. The path is resolved at install time
+  from `$BASH` by `resolve_interpreter` — correct on Apple Silicon, Intel, and
+  Linuxbrew alike, because `do_install` runs on the target machine and the
+  generated plist is untracked machine-local state. Do not hardcode
+  `/opt/homebrew/bin/bash`, and do not put an absolute path in the tracked
+  shebang; `#!/usr/bin/env bash` is what keeps interactive and CI use portable.
+- **The `BASH_VERSINFO` guard at the top** is the backstop for every other
+  invocation path. It converts a cryptic mid-run abort into one actionable
+  line. Keep it above the first `log()` call.
+- **`do_install` boots out before bootstrapping.** `launchctl bootstrap` fails
+  when the label is already loaded, and the legacy `load` fallback does not
+  replace a loaded job — so a reinstall printed "Loaded" while launchd kept
+  running the OLD argv. A plist corrected to name a modern bash therefore went
+  on failing. `--status` reports the interpreter the *installed plist* names
+  and flags a stale one, which is the check that catches this.
+
+`tests/run-tests.sh` asserts all of it against a real `/bin/bash` 3.2 where
+one exists (`skip` on Linux CI, counted separately so it is never mistaken for
+coverage that ran). The guard probe uses `--once` with an already-seeded state
+file: `--status` never calls `log()`, and a first `--once` returns down the
+seeding path before logging, so either would pass against the broken script.
+
 ### huddle-watch state
 
 The watcher's own state is one line per session in

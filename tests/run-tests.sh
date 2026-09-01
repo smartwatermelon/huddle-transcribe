@@ -27,9 +27,34 @@ WATCH="$REPO_ROOT/huddle-watch"
 
 PASS=0
 FAIL=0
+SKIP=0
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
+
+# True when <bash-path> satisfies the script's bash 4.2+ requirement.
+# The version test runs INSIDE the candidate, since that is the only way to
+# learn its version. `-c` receives the expression via a positional parameter
+# rather than an inlined literal so nothing here needs single-quote quoting
+# that shellcheck would read as a failed expansion.
+bash_is_modern() {
+  local candidate="$1"
+  [[ -x "$candidate" ]] || return 1
+  # Read the version from `bash --version` rather than by running shell code
+  # in the candidate. Any `-c` payload that reads a variable needs single
+  # quotes to defer expansion to the child, which shellcheck reports as
+  # SC2016; --version passes no code at all, so the check has nothing to flag
+  # and no directive is needed.
+  local ver major minor
+  ver=$("$candidate" --version 2>/dev/null | head -1) || return 1
+  ver="${ver#*version }"
+  ver="${ver%%[!0-9.]*}"
+  major="${ver%%.*}"
+  minor="${ver#*.}"
+  minor="${minor%%.*}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+  ((major > 4 || (major == 4 && minor >= 2)))
+}
 
 pass() {
   PASS=$((PASS + 1))
@@ -40,6 +65,14 @@ fail() {
   FAIL=$((FAIL + 1))
   printf '  FAIL  %s\n' "$1"
   [[ $# -lt 2 ]] || printf '        %s\n' "$2"
+}
+
+# A precondition the runner cannot supply -- counted separately so it can
+# never be mistaken for coverage that ran. Used for the bash-3.2 guard check,
+# which needs a real bash <4.2 and so is macOS-only.
+skip() {
+  SKIP=$((SKIP + 1))
+  printf '  skip  %s\n' "$1"
 }
 
 # --- fixture -----------------------------------------------------------
@@ -1352,11 +1385,86 @@ STUB
       fail "the plist points launchd at a log path derived from \$LOG_FILE" \
         "StandardOutPath=$std_out_path"
     fi
+    # ProgramArguments[0] must be an absolute bash, not the script. launchd
+    # hands the job a minimal PATH, so a plist naming the script relies on
+    # `#!/usr/bin/env bash` resolving there -- which finds macOS bash 3.2 and
+    # dies in log() on printf's 4.2-only `%(...)T`. Naming the interpreter
+    # explicitly means the shebang is never consulted.
+    pa0=$(plutil -extract ProgramArguments.0 raw -o - "$generated" 2>/dev/null || echo "?")
+    pa1=$(plutil -extract ProgramArguments.1 raw -o - "$generated" 2>/dev/null || echo "?")
+    if [[ "$pa0" == /*bash ]]; then
+      pass "the plist names an absolute bash as ProgramArguments[0]"
+    else
+      fail "the plist names an absolute bash as ProgramArguments[0]" \
+        "ProgramArguments[0]=$pa0"
+    fi
+    if [[ "$pa1" == *huddle-watch ]]; then
+      pass "the plist passes the script as ProgramArguments[1]"
+    else
+      fail "the plist passes the script as ProgramArguments[1]" \
+        "ProgramArguments[1]=$pa1"
+    fi
+    # The recorded interpreter must actually satisfy the 4.2 requirement --
+    # an absolute path that happens to be /bin/bash would still fail.
+    if [[ "$pa0" == /*bash ]] && bash_is_modern "$pa0"; then
+      pass "the interpreter recorded in the plist is bash 4.2 or newer"
+    else
+      fail "the interpreter recorded in the plist is bash 4.2 or newer" \
+        "ProgramArguments[0]=$pa0"
+    fi
   else
     fail "the plist does not point launchd at the self-rotated log" \
       "no plist generated: $probe_out"
   fi
   rm -rf "$WORK/fakehome"
+
+  # The version guard, exercised against a REAL bash 3.2. macOS keeps one at
+  # /bin/bash forever, so this is a true known-bad case rather than a
+  # simulation -- and it is the interpreter launchd actually picked. Skipped
+  # where no such bash exists (Linux CI), because there the guard has nothing
+  # inadequate to reject.
+  old_bash=""
+  for candidate in /bin/bash /usr/bin/bash; do
+    if [[ -x "$candidate" ]] && ! bash_is_modern "$candidate"; then
+      old_bash="$candidate"
+      break
+    fi
+  done
+  if [[ -n "$old_bash" ]]; then
+    # Probed via --once, and with a state file that is already seeded.
+    # --status never calls log(), and a FIRST --once run returns down the
+    # seeding path before logging -- so both would pass even against the
+    # pre-fix script. Only a seeded run reaches log(), which is where the
+    # 4.2-only printf lives and where launchd actually died.
+    watch_reset
+    printf '# huddle-watch state v1\n' >"$WSTATE"
+    guard_rc=0
+    guard_out=$(env HUDDLE_DB="$WDB" HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe" \
+      HUDDLE_STATE_FILE="$WSTATE" HUDDLE_LOG_FILE="$WLOG" \
+      "$old_bash" "$WATCH" --once 2>&1) || guard_rc=$?
+    if ((guard_rc != 0)); then
+      pass "an inadequate bash is rejected with a non-zero status"
+    else
+      fail "an inadequate bash is rejected with a non-zero status" \
+        "exit 0 under $old_bash"
+    fi
+    if [[ "$guard_out" == *"requires bash 4.2 or newer"* ]]; then
+      pass "the guard names the version requirement"
+    else
+      fail "the guard names the version requirement" "$guard_out"
+    fi
+    # The pre-fix symptom: printf's %(...)T is unsupported, so `ts` is never
+    # assigned and `set -u` aborts with `ts: unbound variable`. The guard must
+    # pre-empt that entirely, so neither string may reach the user.
+    if [[ "$guard_out" != *"unbound variable"* && "$guard_out" != *"invalid format character"* ]]; then
+      pass "the guard pre-empts the bash 3.2 printf failure"
+    else
+      fail "the guard pre-empts the bash 3.2 printf failure" "$guard_out"
+    fi
+    watch_reset
+  else
+    skip "the version guard rejects an inadequate bash (no bash <4.2 available)"
+  fi
 else
   # No plutil (Linux CI): assert the two paths are distinct values, which is
   # the property the plist inherits.
@@ -1681,5 +1789,9 @@ expect_watch_rc "--list works without --once" 0 --list
 # --- summary -----------------------------------------------------------
 
 echo
-printf '%d passed, %d failed\n' "$PASS" "$FAIL"
+if ((SKIP > 0)); then
+  printf '%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+else
+  printf '%d passed, %d failed\n' "$PASS" "$FAIL"
+fi
 [[ $FAIL -eq 0 ]]
