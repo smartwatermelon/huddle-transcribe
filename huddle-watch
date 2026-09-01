@@ -3,6 +3,27 @@
 # it finishes recording AND transcribing, by invoking huddle-transcribe.
 set -euo pipefail
 
+# This script uses bash 4.2+ features, notably printf's `%(...)T` time format
+# in log(). macOS ships bash 3.2.57 at /bin/bash and never updates it, so
+# `#!/usr/bin/env bash` resolves to an inadequate interpreter anywhere PATH
+# lacks a modern bash -- which is exactly what launchd, cron, and GUI-spawned
+# processes provide. Under 3.2 the failure was `printf: \`(': invalid format
+# character` followed by `ts: unbound variable`, aborting the run before it
+# wrote a single log line: silent to the user, invisible to CI (which runs
+# bash 5), and only reachable through launchd.
+#
+# The fix is layered. do_install records an absolute path to an adequate bash
+# as ProgramArguments[0], so launchd never consults this shebang; see
+# write_plist. This guard is the backstop for every other way the script can
+# be started, and turns a cryptic mid-run abort into one actionable line.
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2))); then
+  printf 'Error: %s requires bash 4.2 or newer; running under %s (%s).\n' \
+    "${BASH_SOURCE[0]##*/}" "${BASH_VERSION:-unknown}" "${BASH:-unknown}" >&2
+  printf 'macOS ships bash 3.2 at /bin/bash. Install a current bash (brew install bash)\n' >&2
+  printf 'and re-run; if this came from launchd, re-run --install to refresh the plist.\n' >&2
+  exit 1
+fi
+
 DB="${HUDDLE_DB:-$HOME/Library/Application Support/MacWhisper/Database/main.sqlite}"
 STATE_FILE="${HUDDLE_STATE_FILE:-$HOME/.local/state/huddle-transcribe/watch-state}"
 LOG_FILE="${HUDDLE_LOG_FILE:-$HOME/Library/Logs/huddle-transcribe-watch.log}"
@@ -528,19 +549,54 @@ acquire_lock() {
 # reading it mattered. Giving launchd its own path keeps each writer's
 # rotation independent. Self-rotation is retained rather than handed to
 # launchd because launchd has no size-based rotation of its own.
+# Absolute path to a bash that satisfies this script's 4.2+ requirement,
+# for the launcher to name explicitly.
+#
+# `$BASH` is the path of the interpreter currently executing this function.
+# Because the version guard at the top has already run, reaching here proves
+# that interpreter is adequate -- so it needs no probing, no version parsing,
+# and no PATH search. It is also the same bash the user's own shell resolved,
+# which is the one they intend.
+#
+# A hardcoded `/opt/homebrew/bin/bash` was rejected: the prefix differs across
+# Apple Silicon (/opt/homebrew), Intel (/usr/local), and Linuxbrew, so a
+# literal is wrong on some machine somewhere. Resolving at install time is
+# correct everywhere because do_install runs ON the target machine, and the
+# generated plist is untracked machine-local state -- the right home for a
+# machine-specific absolute path. The tracked shebang stays
+# `#!/usr/bin/env bash` so interactive and CI use remain portable.
+resolve_interpreter() {
+  if [[ -n "${BASH:-}" && -x "$BASH" ]]; then
+    printf '%s\n' "$BASH"
+    return 0
+  fi
+  # $BASH unset or not executable should be unreachable under bash, but a
+  # wrong interpreter in the plist would fail at 8am inside launchd's stderr
+  # sink, so this refuses to guess.
+  echo "Error: cannot determine the path of the running bash (\$BASH is unset)." >&2
+  echo "Refusing to write a LaunchAgent that might name the wrong interpreter." >&2
+  return 1
+}
+
 write_plist() {
-  local watch_main="$1" watch_wal="$2" json_tmp
+  local watch_main="$1" watch_wal="$2" json_tmp interp
+  interp=$(resolve_interpreter) || return 1
   mkdir -p "$(dirname -- "$PLIST")"
   json_tmp=$(mktemp "${PLIST}.json.XXXXXX")
+  # ProgramArguments[0] is the interpreter, NOT the script. When argv[0] is an
+  # interpreter the kernel never reads the script's shebang, so launchd's
+  # minimal PATH becomes irrelevant and the bash-3.2 failure is impossible by
+  # construction rather than guarded against after the fact.
   if ! jq -n \
     --arg label "$LABEL" \
+    --arg interp "$interp" \
     --arg prog "$SELF_DIR/huddle-watch" \
     --arg main "$watch_main" \
     --arg wal "$watch_wal" \
     --arg log "$LAUNCHD_LOG_FILE" \
     '{
       Label: $label,
-      ProgramArguments: [$prog, "--once"],
+      ProgramArguments: [$interp, $prog, "--once"],
       WatchPaths: [$main, $wal],
       RunAtLoad: false,
       StandardOutPath: $log,
@@ -583,6 +639,14 @@ do_install() {
   mkdir -p "$(dirname -- "$LOG_FILE")"
   local uid
   uid=$(id -u)
+  # Unload an existing job BEFORE loading, so --install is a true reinstall.
+  # `bootstrap` fails outright when the label is already loaded, and the
+  # legacy `load` fallback does not replace a loaded job either -- so a
+  # reinstall printed "Loaded" while launchd kept running the OLD definition.
+  # That is how a plist corrected to name a modern bash went on failing under
+  # the previous plist's argv. Errors are discarded: a not-loaded job is the
+  # normal first-install case, not a failure.
+  launchctl bootout "gui/$uid/$LABEL" 2>/dev/null || true
   if launchctl bootstrap "gui/$uid" "$PLIST" 2>/dev/null; then
     echo "Loaded LaunchAgent $LABEL"
   elif launchctl load "$PLIST" 2>/dev/null; then
@@ -596,6 +660,9 @@ do_install() {
   fi
   echo "Watching:  $DB"
   echo "           ${DB}-wal"
+  local install_interp
+  install_interp=$(resolve_interpreter) || exit 1
+  echo "Interp:    $install_interp (bash $BASH_VERSION)"
   echo "Log:       $LOG_FILE"
   echo "State:     $STATE_FILE"
   echo
@@ -636,6 +703,22 @@ do_status() {
     echo "Loaded:    no"
   fi
   echo "Database:  $DB"
+  # Report the interpreter the INSTALLED plist names, not the one running now.
+  # A plist generated before the interpreter fix names the script directly, so
+  # launchd resolves the shebang against its own minimal PATH and lands on
+  # bash 3.2. That plist looks healthy to `launchctl print` and fails only when
+  # it fires, so --status names it explicitly and says how to repair it.
+  if [[ -f "$PLIST" ]] && command -v plutil >/dev/null 2>&1; then
+    local plist_interp
+    plist_interp=$(plutil -extract ProgramArguments.0 raw -o - "$PLIST" 2>/dev/null || printf '')
+    if [[ "$plist_interp" == *bash ]]; then
+      echo "Interp:    $plist_interp"
+    elif [[ -n "$plist_interp" ]]; then
+      echo "Interp:    (none -- plist runs $plist_interp via its shebang)"
+      echo "           Stale plist: launchd may use macOS bash 3.2 and fail."
+      echo "           Repair: $0 --install"
+    fi
+  fi
   if [[ -s "$STATE_FILE" ]]; then
     # `wc -l` rather than `grep -c .`: grep -c prints 0 AND exits 1 on a file
     # with no matching lines, so a `|| echo 0` fallback appended a SECOND
