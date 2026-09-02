@@ -176,7 +176,7 @@ slugify() {
   slug=$(echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')
   # A title that is empty, or made entirely of punctuation or non-ASCII
   # characters, reduces to "". That would produce an output basename of
-  # "<date>_.txt" -- a hidden dotfile that the user is unlikely to find.
+  # "<date>_.md" -- a hidden dotfile that the user is unlikely to find.
   [[ -n "$slug" ]] || slug="untitled"
   echo "$slug"
 }
@@ -386,7 +386,15 @@ SLUG=$(slugify "$STITLE")
 # silently overwrote the first, and --mark-reviewed could then delete the
 # audio of a session whose transcript had already been replaced.
 OUT_BASENAME="${SESSION_DATE_ONLY}_${SLUG}_${SID:0:8}"
-OUT_TXT="$OUTPUT_DIR/${OUT_BASENAME}.txt"
+# Markdown, not plain text, because the transcripts are read in Google Drive's
+# web viewer, which previews .md inline but offers only a download prompt for
+# .txt. The content difference from `--format txt` is one thing -- mw wraps the
+# timestamp line in asterisks -- so the extension, not the markup, is the point.
+# Crucially the four-line block structure (label / timestamp / body / blank) is
+# byte-identical either way, which is what keeps the line-anchored rewrite in
+# docs/plans/speaker-name-attribution.md valid. `--format html` would not: mw
+# emits that as a single unbroken line for the entire transcript body.
+OUT_DOC="$OUTPUT_DIR/${OUT_BASENAME}.md"
 OUT_META="$OUTPUT_DIR/${OUT_BASENAME}.meta.json"
 
 echo "Session:  ${SID:0:8}"
@@ -395,7 +403,7 @@ SDUR_PRETTY=$(fmt_duration "$SDUR")
 echo "Duration: $SDUR_PRETTY"
 echo "Title:    $STITLE"
 echo "Source:   $SOURCE_PATH"
-echo "Output:   $OUT_TXT"
+echo "Output:   $OUT_DOC"
 
 if [[ $MARK_REVIEWED -ne 1 && ! -f "$SOURCE_PATH" ]]; then
   echo "Error: source audio file not found at $SOURCE_PATH" >&2
@@ -437,8 +445,8 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
   fi
   # Deletion is irreversible and the transcript is the only thing that
   # survives it, so require that the transcript exists and is non-empty.
-  if [[ ! -s "$OUT_TXT" ]]; then
-    echo "Error: transcript $OUT_TXT is missing or empty. Refusing to delete source audio." >&2
+  if [[ ! -s "$OUT_DOC" ]]; then
+    echo "Error: transcript $OUT_DOC is missing or empty. Refusing to delete source audio." >&2
     exit 1
   fi
   if [[ $ASSUME_YES -ne 1 ]]; then
@@ -522,18 +530,19 @@ if [[ $ASSUME_YES -ne 1 ]]; then
 fi
 
 # Transcribe to a temp path and move into place only once mw has succeeded
-# and produced a non-empty file. Writing straight to $OUT_TXT means an
+# and produced a non-empty file. Writing straight to $OUT_DOC means an
 # interrupted or failed run (Ctrl-C, crash, full disk) destroys a previously
 # good transcript, since mw is invoked with --overwrite.
-TXT_TMP=$(mktemp "${OUT_TXT}.partial.XXXXXX")
-trap 'rm -f "$TXT_TMP"' EXIT
+DOC_TMP=$(mktemp "${OUT_DOC}.partial.XXXXXX")
+trap 'rm -f "$DOC_TMP"' EXIT
 if ! "$MW_BIN" transcribe \
   --speakers \
   --speaker-names \
   --timestamps \
-  --format txt \
+  --end-timestamps \
+  --format md \
   --overwrite \
-  -o "$TXT_TMP" \
+  -o "$DOC_TMP" \
   "$SOURCE_PATH"; then
   echo "Error: mw transcribe failed for $SOURCE_PATH" >&2
   # No sidecar is written on failure. That is deliberate: --mark-reviewed
@@ -542,12 +551,12 @@ if ! "$MW_BIN" transcribe \
   exit 1
 fi
 
-if [[ ! -s "$TXT_TMP" ]]; then
-  echo "Error: mw reported success but produced no transcript at $OUT_TXT" >&2
+if [[ ! -s "$DOC_TMP" ]]; then
+  echo "Error: mw reported success but produced no transcript at $OUT_DOC" >&2
   exit 1
 fi
 
-if ! grep -q "^Speaker " "$TXT_TMP" 2>/dev/null; then
+if ! grep -q "^Speaker " "$DOC_TMP" 2>/dev/null; then
   echo "Warning: no 'Speaker' labels found in output. Check MacWhisper Settings > speaker detection." >&2
 fi
 
@@ -563,13 +572,13 @@ META_DURATION="$SDUR"
 # every fallible step first means the only thing left after them is two
 # same-directory renames.
 meta_tmp=$(mktemp "${OUT_META}.XXXXXX")
-trap 'rm -f "$TXT_TMP" "$meta_tmp"' EXIT
+trap 'rm -f "$DOC_TMP" "$meta_tmp"' EXIT
 if ! jq -n \
   --arg session_id "$SID" \
   --arg date "$SESSION_DATE_ONLY" \
   --argjson duration_seconds "$META_DURATION" \
   --arg source_file "$SOURCE_FILENAME" \
-  --arg output_file "$(basename "$OUT_TXT")" \
+  --arg output_file "$(basename "$OUT_DOC")" \
   '{
     session_id: $session_id,
     date: $date,
@@ -583,9 +592,9 @@ if ! jq -n \
   exit 1
 fi
 
-mv "$TXT_TMP" "$OUT_TXT"
+mv "$DOC_TMP" "$OUT_DOC"
 mv "$meta_tmp" "$OUT_META"
 trap - EXIT
 
-echo "Transcript written: $OUT_TXT"
+echo "Transcript written: $OUT_DOC"
 echo "Metadata written:   $OUT_META"

@@ -111,6 +111,15 @@ Speaker 1        <- ^Speaker [0-9]+$
                  <- blank
 ```
 
+**Update (2026-09-02):** output is now `--format md --end-timestamps`, so the
+timestamp line reads `*00:00-00:06*` instead of `00:06`. The block structure
+is unchanged — still label / timestamp / body / blank — and the **speaker
+label line is byte-identical**, so every anchor in §5 still holds as written.
+Only a tool that parses the *timestamp* line needs the wider pattern
+`^\*[0-9:]+(-[0-9:]+)?\*$`. This was checked against the real binary before
+the format was switched; `--format html` was rejected precisely because it
+collapses the body to one line and would have invalidated §5.1.
+
 Census: 40 LABEL / 40 TIME / 40 TEXT / 41 BLANK. Zero occurrences of the string
 `Speaker` inside body text across the corpus.
 

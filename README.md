@@ -102,7 +102,7 @@ database is better on three counts:
   finish within moments of each other cannot race — each is transcribed as
   itself.
 - **It cannot trigger itself.** `huddle-transcribe` only ever *reads*
-  MacWhisper's database, so its own `.txt` and `.meta.json` output is invisible
+  MacWhisper's database, so its own `.md` and `.meta.json` output is invisible
   to the watcher. A folder watcher has to exclude those files by name to avoid
   an infinite self-trigger loop.
 
@@ -264,7 +264,7 @@ and then microphone audio.
 For a session dated `2026-08-27` titled "SRE Daily Huddle", the script
 writes:
 
-- `2026-08-27_sre-daily-huddle_243d5daf.txt` — the diarized transcript
+- `2026-08-27_sre-daily-huddle_243d5daf.md` — the diarized transcript
 - `2026-08-27_sre-daily-huddle_243d5daf.meta.json` — a metadata sidecar:
 
 ```json
@@ -273,7 +273,7 @@ writes:
   "date": "2026-08-27",
   "duration_seconds": 1076,
   "source_file": "..._merged-audio_....m4a",
-  "output_file": "2026-08-27_sre-daily-huddle_243d5daf.txt",
+  "output_file": "2026-08-27_sre-daily-huddle_243d5daf.md",
   "reviewed": false,
   "deleted_source": false
 }
@@ -282,6 +282,31 @@ writes:
 The trailing session-id fragment keeps two same-day meetings apart when
 their titles reduce to the same slug (`SRE Daily Huddle` and
 `SRE/Daily Huddle` both slugify to `sre-daily-huddle`).
+
+### Why Markdown
+
+Transcripts are written as `.md` rather than `.txt` for one practical
+reason: transcripts end up in Google Drive, and its web viewer previews
+Markdown inline while offering only a download prompt for plain text.
+
+The choice is about the extension, not the markup. `mw --format md` differs
+from `--format txt` in exactly one respect — it wraps the timestamp line in
+asterisks — so the transcript body is otherwise byte-identical. The
+four-line block structure is the same either way:
+
+```
+Speaker 1
+*00:00-00:06*
+Good morning everyone, let's start the daily huddle.
+
+```
+
+`--end-timestamps` renders that timestamp as a `start-end` range rather
+than a bare start, which makes segment length visible at a glance.
+
+`mw` also offers `--format html`, which is *not* used: it emits the entire
+transcript body as a single unbroken line, which would defeat any
+line-oriented post-processing.
 
 ## Source file lifecycle
 
