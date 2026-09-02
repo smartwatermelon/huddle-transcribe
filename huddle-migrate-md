@@ -228,9 +228,17 @@ fi
 # docs/plans/speaker-name-attribution.md §5.4 prescribes for the speaker
 # rewrite -- and for the opposite reason. There the sidecar is the undo
 # record. Here the transcript rename is the operation and the sidecar merely
-# names it, so a sidecar still saying `.txt` after a completed transcript
-# rename is repaired by re-running this script, whereas a sidecar pointing at
-# a `.md` that does not exist yet strands the pair with no way back.
+# names it, so the two orderings fail differently:
+#
+#   transcript renamed, sidecar not -> the .md exists and holds the full
+#     transcript; only the sidecar's output_file is stale. Repairing it is a
+#     one-field edit against a file that is right there.
+#   sidecar renamed, transcript not -> the sidecar names a .md that does not
+#     exist, and the .txt it describes is no longer reachable through it.
+#
+# Note that re-running does NOT fix the first case: the survey globs *.txt,
+# so a pair whose transcript already moved is no longer a candidate. The
+# recovery is manual, which is why that failure prints the sidecar's path.
 #
 # mktemp beside the sidecar, not in $TMPDIR: rename is atomic only within one
 # filesystem, and OUTPUT_DIR is frequently on another volume -- Google Drive,
@@ -263,13 +271,19 @@ for i in "${!migrate_txt[@]}"; do
   fi
 
   if ! mv "$tmp" "$meta"; then
-    # The transcript moved but the sidecar did not. Re-running repairs this:
-    # the .txt is gone, so the pair is simply skipped as "no sidecar" until
-    # the sidecar is corrected. Report it loudly rather than counting it as a
-    # success.
+    # The transcript moved but the sidecar did not, so the sidecar's
+    # output_file still says `.txt` while the transcript is now `.md`.
+    #
+    # Re-running does NOT fix this. The survey globs *.txt, and this pair's
+    # .txt is gone, so it is no longer a candidate at all. The recovery is a
+    # manual one-field edit -- print the exact one, since the whole point of
+    # reaching this branch is that the automatic path just failed.
     rm -f "$tmp"
     echo "Error: renamed $base but could not update its sidecar." >&2
-    echo "       Re-run after fixing permissions on $meta." >&2
+    echo "       ${stem}.md is complete and correct; only the sidecar is stale." >&2
+    echo "       Re-running will NOT fix this. Set output_file by hand:" >&2
+    echo "         $meta" >&2
+    echo "         \"output_file\": \"${stem}.md\"" >&2
     failed=$((failed + 1))
     continue
   fi

@@ -19,7 +19,7 @@ a README, a LICENSE, and the CI workflows.
 ## Commands
 
 ```bash
-./tests/run-tests.sh                          # 234 behavioral tests
+./tests/run-tests.sh                          # 237 behavioral tests
 shellcheck -S info huddle-transcribe huddle-watch huddle-migrate-md tests/run-tests.sh
 shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-migrate-md tests/run-tests.sh
 shfmt -i 2 -ci -w huddle-transcribe huddle-watch huddle-migrate-md tests/run-tests.sh
@@ -298,9 +298,17 @@ Three properties are load-bearing:
   transcript-before-sidecar, the *opposite* of what
   `docs/plans/speaker-name-attribution.md` §5.4 prescribes — and for the
   opposite reason. There the sidecar is the undo record; here the rename is
-  the operation and the sidecar merely names it, so a sidecar still saying
-  `.txt` is repaired by re-running, while a sidecar naming a `.md` that does
-  not exist strands the pair.
+  the operation and the sidecar merely names it. A stale sidecar still saying
+  `.txt` leaves the full transcript sitting at the `.md`, needing a one-field
+  edit; a sidecar naming a `.md` that does not exist strands the pair with
+  the transcript no longer reachable through it.
+  **Re-running does not repair either state**, and the script must never
+  claim it does. The survey globs `*.txt`, so a pair whose transcript already
+  moved is not a candidate at all — a re-run prints "Nothing to migrate" and
+  exits 0 with the sidecar still stale. An earlier draft asserted the
+  opposite in both a code comment and the user-facing error; CI review caught
+  it, and `tests/run-tests.sh` now pins the honest message and the fact that
+  a re-run leaves the sidecar untouched.
 - **Four skip conditions, and a skip never aborts the run.** No sidecar; a
   `.md` already present; an unparseable sidecar; a sidecar naming a
   different file. Each is a case where guessing would lose data.

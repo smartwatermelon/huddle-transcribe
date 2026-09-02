@@ -341,8 +341,16 @@ confirm describes the whole job. A pair is skipped, never guessed at, when:
 | Sidecar names a different file | The pairing is already broken, and rewriting it destroys the evidence |
 
 Skipped pairs do not stop the run — good pairs in the same directory still
-migrate — and re-running is a no-op. It reads `OUTPUT_DIR` with the same
-precedence as `huddle-transcribe`, or takes `--output-dir`.
+migrate — and re-running over an already-migrated directory is a no-op. It
+reads `OUTPUT_DIR` with the same precedence as `huddle-transcribe`, or takes
+`--output-dir`.
+
+If a pair's sidecar cannot be written after its transcript is renamed, the
+script exits non-zero and prints the exact repair. **A re-run will not fix
+that one**: the scan looks at `*.txt`, and that pair's `.txt` is already
+gone, so it is no longer a candidate. The transcript itself is complete at
+its new `.md` name; only the sidecar's `output_file` needs correcting, by
+hand or by fixing the permissions and editing the field.
 
 ## Source file lifecycle
 

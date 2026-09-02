@@ -2010,6 +2010,44 @@ expect_rc "a migrated pair satisfies --mark-reviewed" 0 \
 absent "--mark-reviewed removes the audio after migration" "$MEDIA/A_merged.m4a"
 reset_media
 
+# A failed sidecar rename leaves the transcript renamed and the sidecar stale.
+# Re-running does NOT repair that -- the survey globs *.txt and this pair's
+# .txt is gone -- so the error message must not promise that it does. An
+# earlier version of the script claimed exactly that in both a comment and the
+# message; CI review caught it. Pin the real behavior.
+#
+# chflags is macOS-only. It is the way to make the rename ONTO the sidecar
+# fail while leaving mktemp in the same directory working: a read-only
+# directory fails earlier, at mktemp, which never reaches this branch.
+if command -v chflags >/dev/null 2>&1; then
+  mig_reset
+  mig_pair 2026-09-01_alpha_11110001
+  chflags uchg "$MIGDIR/2026-09-01_alpha_11110001.meta.json"
+  mig_out=$("$MIGRATE" --yes --output-dir "$MIGDIR" 2>&1 || true)
+  chflags nouchg "$MIGDIR/2026-09-01_alpha_11110001.meta.json"
+
+  exists "a failed sidecar rename still leaves the .md in place" \
+    "$MIGDIR/2026-09-01_alpha_11110001.md"
+  if [[ "$mig_out" == *"Re-running will NOT fix this"* ]]; then
+    pass "the failure message does not promise a re-run repairs it"
+  else
+    fail "the failure message does not promise a re-run repairs it" "$mig_out"
+  fi
+
+  # And the claim itself must be true: a re-run must leave the sidecar stale.
+  "$MIGRATE" --yes --output-dir "$MIGDIR" >/dev/null 2>&1 || true
+  stale=$(jq -r '.output_file' "$MIGDIR/2026-09-01_alpha_11110001.meta.json")
+  if [[ "$stale" == "2026-09-01_alpha_11110001.txt" ]]; then
+    pass "a re-run does not silently repair the stale sidecar"
+  else
+    fail "a re-run does not silently repair the stale sidecar" "output_file=$stale"
+  fi
+else
+  skip "a failed sidecar rename is reported honestly (chflags unavailable)"
+  skip "a re-run does not silently repair the stale sidecar (chflags unavailable)"
+  skip "the failure message does not promise a re-run repairs it (chflags unavailable)"
+fi
+
 # --- summary -----------------------------------------------------------
 
 echo
