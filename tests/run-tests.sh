@@ -2043,9 +2043,12 @@ if command -v chflags >/dev/null 2>&1; then
     fail "a re-run does not silently repair the stale sidecar" "output_file=$stale"
   fi
 else
-  skip "a failed sidecar rename is reported honestly (chflags unavailable)"
-  skip "a re-run does not silently repair the stale sidecar (chflags unavailable)"
+  # One skip per assertion in the if-branch, named identically, so a Linux run
+  # accounts for exactly what it did not execute. A skip whose name matches no
+  # real test hides a missing one.
+  skip "a failed sidecar rename still leaves the .md in place (chflags unavailable)"
   skip "the failure message does not promise a re-run repairs it (chflags unavailable)"
+  skip "a re-run does not silently repair the stale sidecar (chflags unavailable)"
 fi
 
 # --- summary -----------------------------------------------------------
