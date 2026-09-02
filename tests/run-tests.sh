@@ -82,9 +82,15 @@ DB="$WORK/db.sqlite"
 BIN="$WORK/bin"
 mkdir -p "$MEDIA" "$BIN"
 
-# Stub mw: writes a plausible diarized transcript to whatever -o names.
+# Stub mw: writes a plausible diarized transcript to whatever -o names, and
+# records its full argument list in $MW_CALLS so the flags the script passes
+# are assertable. The transcript body mirrors the real `mw --format md
+# --end-timestamps` shape -- label / italicized start-end timestamp / body /
+# blank -- because the speaker-label smoke test and the rewrite planned in
+# docs/plans/speaker-name-attribution.md both anchor on those line forms.
 cat >"$BIN/mw" <<'STUB'
 #!/usr/bin/env bash
+[[ -n "${MW_CALLS:-}" ]] && printf '%s\n' "$*" >>"$MW_CALLS"
 out=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -96,7 +102,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$out" ]] || exit 2
-printf 'Speaker 1: hello\nSpeaker 2: hi there\n' >"$out"
+printf 'Speaker 1\n*00:00-00:06*\nhello\n\nSpeaker 2\n*00:06-00:12*\nhi there\n\n' >"$out"
 STUB
 chmod +x "$BIN/mw"
 
@@ -291,7 +297,7 @@ rm -rf "$OUT"
 reset_media
 expect_rc "transcribe succeeds" 0 --yes --output-dir "$OUT" aaaa0001
 exists "transcript written with session-id suffix" \
-  "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.txt"
+  "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.md"
 exists "sidecar written with session-id suffix" \
   "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.meta.json"
 exists "source audio survives transcription" "$MEDIA/A_merged.m4a"
@@ -303,16 +309,52 @@ else
   fail "sidecar records the resolved session id"
 fi
 
+# The sidecar's output_file is what a reader uses to find the transcript, so
+# it must carry the real extension rather than a stale .txt.
+meta_out=$(jq -r '.output_file' "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.meta.json")
+if [[ "$meta_out" == "2026-08-27_sre-daily-huddle_aaaa0001.md" ]]; then
+  pass "sidecar output_file carries the .md extension"
+else
+  fail "sidecar output_file carries the .md extension" "got: $meta_out"
+fi
+
+# No .txt may be produced. Output lands in Google Drive, whose web viewer
+# previews .md inline but only offers a download prompt for .txt -- which is
+# the entire reason for the format. A regression here is silent otherwise,
+# since a .txt transcript is still perfectly valid content.
+if compgen -G "$OUT/*.txt" >/dev/null; then
+  fail "transcription produces no .txt files"
+else
+  pass "transcription produces no .txt files"
+fi
+
+# Assert the format flags actually reach mw. The extension is chosen by the
+# script but the markup is chosen by mw, and a mismatch between the two (a
+# .md file holding --format txt output) is invisible to every other check.
+rm -f "$WORK/mw-calls"
+MW_CALLS="$WORK/mw-calls" "$HT" --yes --output-dir "$OUT" aaaa0001 >/dev/null 2>&1 || true
+mw_flags=$(cat "$WORK/mw-calls" 2>/dev/null || true)
+if grep -qF -- "--format md" <<<"$mw_flags"; then
+  pass "mw is invoked with --format md"
+else
+  fail "mw is invoked with --format md" "flags: $mw_flags"
+fi
+if grep -qF -- "--end-timestamps" <<<"$mw_flags"; then
+  pass "mw is invoked with --end-timestamps"
+else
+  fail "mw is invoked with --end-timestamps" "flags: $mw_flags"
+fi
+
 # The colliding-slug session must not overwrite the first transcript.
 expect_rc "colliding-slug session transcribes" 0 --yes --output-dir "$OUT" bbbb0002
 exists "colliding slugs produce separate transcripts" \
-  "$OUT/2026-08-27_sre-daily-huddle_bbbb0002.txt"
+  "$OUT/2026-08-27_sre-daily-huddle_bbbb0002.md"
 
 # A failing mw must leave an existing good transcript untouched.
 HT=$(build "$BIN/mw-fail")
-before=$(cat "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.txt")
+before=$(cat "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.md")
 expect_rc "failing mw exits non-zero" 1 --yes --output-dir "$OUT" aaaa0001
-after=$(cat "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.txt")
+after=$(cat "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.md")
 if [[ "$after" == "$before" ]]; then
   pass "failing mw preserves the previous transcript"
 else
@@ -346,7 +388,7 @@ exists "mismatched sidecar keeps the audio" "$MEDIA/A_merged.m4a"
 jq '.session_id = "aaaa0001"' "$meta" >"$meta.tmp" && mv "$meta.tmp" "$meta"
 
 # Empty transcript: refuse.
-txt="$OUT/2026-08-27_sre-daily-huddle_aaaa0001.txt"
+txt="$OUT/2026-08-27_sre-daily-huddle_aaaa0001.md"
 saved=$(cat "$txt")
 : >"$txt"
 expect_rc "empty transcript refuses" 1 --mark-reviewed --yes --output-dir "$OUT" aaaa0001
@@ -402,7 +444,7 @@ if [[ -n "${FAIL_TRANSCRIBE:-}" ]]; then
   echo "stub: simulated failure" >&2
   exit 1
 fi
-echo "Transcript written: /tmp/out/${1:0:8}.txt"
+echo "Transcript written: /tmp/out/${1:0:8}.md"
 STUB
 chmod +x "$WBIN/huddle-transcribe"
 
@@ -1488,7 +1530,7 @@ cat >"$WBIN/huddle-transcribe-big" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$CALLS"
 head -c 1500000 /dev/zero | tr '\0' 'y'
-echo "Transcript written: /tmp/out/big.txt"
+echo "Transcript written: /tmp/out/big.md"
 STUB
 chmod +x "$WBIN/huddle-transcribe-big"
 env HUDDLE_DB="$WDB" HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe-big" \
@@ -1656,7 +1698,7 @@ else
   diag=$(dump "$NOTIFYLOG")
   fail "the success notification is titled 'Transcript ready'" "$diag"
 fi
-if grep -qF 'bbbb2222.txt' "$NOTIFYLOG" 2>/dev/null; then
+if grep -qF 'bbbb2222.md' "$NOTIFYLOG" 2>/dev/null; then
   pass "the success notification names the transcript basename"
 else
   diag=$(dump "$NOTIFYLOG")
