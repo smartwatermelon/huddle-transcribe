@@ -24,6 +24,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 SCRIPT="$REPO_ROOT/huddle-transcribe"
 WATCH="$REPO_ROOT/huddle-watch"
+MIGRATE="$REPO_ROOT/huddle-migrate-md"
 
 PASS=0
 FAIL=0
@@ -1827,6 +1828,187 @@ absent "a bare invocation transcribes nothing" "$CALLS"
 # --dry-run and --list still work without --once, since neither processes.
 expect_watch_rc "--dry-run works without --once" 0 --dry-run
 expect_watch_rc "--list works without --once" 0 --list
+
+# --- huddle-migrate-md -------------------------------------------------
+#
+# The migration adopts pre-Markdown .txt transcripts. Its whole risk surface
+# is that it renames files and rewrites the sidecar that points at them, so
+# the cases below are weighted toward what it must REFUSE to touch.
+
+echo "huddle-migrate-md"
+
+MIGDIR="$WORK/mig"
+
+# Write a transcript + sidecar pair whose output_file names the transcript,
+# which is the shape huddle-transcribe produced before the Markdown switch.
+mig_pair() {
+  local stem="$1"
+  printf 'Speaker 1\n00:00\nhello from %s\n\n' "$stem" >"$MIGDIR/$stem.txt"
+  jq -n --arg o "$stem.txt" \
+    '{session_id:"aaaa0001",date:"2026-08-27",duration_seconds:1076,
+      source_file:"x.m4a",output_file:$o,reviewed:false,deleted_source:false}' \
+    >"$MIGDIR/$stem.meta.json"
+}
+
+mig_reset() {
+  rm -rf "$MIGDIR"
+  mkdir -p "$MIGDIR"
+}
+
+# migrate <args...>
+migrate() {
+  "$MIGRATE" --output-dir "$MIGDIR" "$@"
+}
+
+# expect_mig_rc <name> <want-rc> <args...>
+expect_mig_rc() {
+  local name="$1" want="$2"
+  shift 2
+  local rc=0
+  migrate "$@" >/dev/null 2>&1 || rc=$?
+  if [[ $rc -eq $want ]]; then
+    pass "$name"
+  else
+    fail "$name" "exit $rc, wanted $want"
+  fi
+}
+
+mig_reset
+expect_mig_rc "--help exits 0" 0 --help
+expect_mig_rc "unknown flag rejected" 1 --bogus
+expect_mig_rc "--output-dir requires an argument" 1 --output-dir
+expect_mig_rc "an empty directory exits 0" 0 --yes
+expect_mig_rc "a missing directory exits 1" 1 --yes --output-dir "$WORK/no-such-dir"
+
+# The happy path: transcript renamed, sidecar repointed, bytes preserved.
+mig_reset
+mig_pair "2026-08-27_sre-daily-huddle_aaaa0001"
+mig_before=$(cat "$MIGDIR/2026-08-27_sre-daily-huddle_aaaa0001.txt")
+expect_mig_rc "a valid pair migrates" 0 --yes
+exists "the transcript becomes .md" "$MIGDIR/2026-08-27_sre-daily-huddle_aaaa0001.md"
+absent "the .txt is gone" "$MIGDIR/2026-08-27_sre-daily-huddle_aaaa0001.txt"
+mig_after=$(cat "$MIGDIR/2026-08-27_sre-daily-huddle_aaaa0001.md")
+if [[ "$mig_before" == "$mig_after" ]]; then
+  pass "transcript content is byte-identical after migration"
+else
+  fail "transcript content is byte-identical after migration"
+fi
+mig_out=$(jq -r '.output_file' "$MIGDIR/2026-08-27_sre-daily-huddle_aaaa0001.meta.json")
+if [[ "$mig_out" == "2026-08-27_sre-daily-huddle_aaaa0001.md" ]]; then
+  pass "the sidecar output_file is repointed at the .md"
+else
+  fail "the sidecar output_file is repointed at the .md" "got: $mig_out"
+fi
+# Every other sidecar field must survive the rewrite -- the migration edits
+# one key, and clobbering session_id would break --mark-reviewed's identity
+# fence, which is the guard that stops it deleting the wrong audio.
+mig_sid=$(jq -r '.session_id' "$MIGDIR/2026-08-27_sre-daily-huddle_aaaa0001.meta.json")
+if [[ "$mig_sid" == "aaaa0001" ]]; then
+  pass "the sidecar keeps its session_id"
+else
+  fail "the sidecar keeps its session_id" "got: $mig_sid"
+fi
+
+# Running again must be a no-op, not an error: the migration is something a
+# user may reasonably run twice, and on a directory that is already clean.
+expect_mig_rc "a second run is a no-op" 0 --yes
+
+# --dry-run must not touch the directory at all. This mirrors the ordering
+# rule huddle-transcribe enforces for --mark-reviewed.
+mig_reset
+mig_pair "2026-08-31_terraform_bbbb0002"
+expect_mig_rc "--dry-run exits 0" 0 --dry-run
+exists "--dry-run leaves the .txt in place" "$MIGDIR/2026-08-31_terraform_bbbb0002.txt"
+absent "--dry-run writes no .md" "$MIGDIR/2026-08-31_terraform_bbbb0002.md"
+dry_out=$(jq -r '.output_file' "$MIGDIR/2026-08-31_terraform_bbbb0002.meta.json")
+if [[ "$dry_out" == "2026-08-31_terraform_bbbb0002.txt" ]]; then
+  pass "--dry-run leaves the sidecar unchanged"
+else
+  fail "--dry-run leaves the sidecar unchanged" "got: $dry_out"
+fi
+
+# A .txt with no sidecar is not ours. huddle-transcribe writes the pair
+# together, so a lone .txt is someone else's file or failed-run debris --
+# renaming a stranger's file is worse than leaving a transcript stranded.
+mig_reset
+printf 'orphan\n' >"$MIGDIR/2026-09-01_orphan_cccc0003.txt"
+expect_mig_rc "a sidecar-less .txt does not block the run" 0 --yes
+exists "a sidecar-less .txt is left alone" "$MIGDIR/2026-09-01_orphan_cccc0003.txt"
+absent "a sidecar-less .txt produces no .md" "$MIGDIR/2026-09-01_orphan_cccc0003.md"
+
+# An existing .md is the collision that loses data: one of the two files was
+# written by something this script did not, and silently picking a winner is
+# the class of bug the session-id suffix exists to prevent.
+mig_reset
+mig_pair "2026-09-02_collide_dddd0004"
+printf 'pre-existing markdown\n' >"$MIGDIR/2026-09-02_collide_dddd0004.md"
+expect_mig_rc "an existing .md does not block the run" 0 --yes
+exists "an existing .md is not overwritten" "$MIGDIR/2026-09-02_collide_dddd0004.txt"
+collide=$(cat "$MIGDIR/2026-09-02_collide_dddd0004.md")
+if [[ "$collide" == "pre-existing markdown" ]]; then
+  pass "the pre-existing .md keeps its content"
+else
+  fail "the pre-existing .md keeps its content" "got: $collide"
+fi
+
+# A sidecar that will not parse must stop that pair, not the whole run, and
+# must not leave the transcript renamed past a sidecar it could not rewrite.
+mig_reset
+mig_pair "2026-09-03_badjson_eeee0005"
+printf 'not json at all' >"$MIGDIR/2026-09-03_badjson_eeee0005.meta.json"
+expect_mig_rc "an unparseable sidecar does not block the run" 0 --yes
+exists "an unparseable sidecar leaves its .txt alone" "$MIGDIR/2026-09-03_badjson_eeee0005.txt"
+absent "an unparseable sidecar produces no .md" "$MIGDIR/2026-09-03_badjson_eeee0005.md"
+
+# A sidecar pointing at a different filename means the pairing is already
+# broken. Rewriting output_file would destroy the evidence of how.
+mig_reset
+mig_pair "2026-09-04_mismatch_ffff0006"
+jq '.output_file = "some-other-file.txt"' \
+  "$MIGDIR/2026-09-04_mismatch_ffff0006.meta.json" >"$MIGDIR/tmp.json"
+mv "$MIGDIR/tmp.json" "$MIGDIR/2026-09-04_mismatch_ffff0006.meta.json"
+expect_mig_rc "a mismatched sidecar does not block the run" 0 --yes
+exists "a mismatched sidecar leaves its .txt alone" "$MIGDIR/2026-09-04_mismatch_ffff0006.txt"
+mismatch=$(jq -r '.output_file' "$MIGDIR/2026-09-04_mismatch_ffff0006.meta.json")
+if [[ "$mismatch" == "some-other-file.txt" ]]; then
+  pass "a mismatched sidecar is left unrewritten"
+else
+  fail "a mismatched sidecar is left unrewritten" "got: $mismatch"
+fi
+
+# A bad pair must not prevent a good one in the same directory from
+# migrating -- the survey classifies every candidate before anything moves.
+mig_reset
+mig_pair "2026-09-05_good_11110007"
+printf 'orphan\n' >"$MIGDIR/2026-09-05_bad_22220008.txt"
+expect_mig_rc "a mixed directory exits 0" 0 --yes
+exists "the good pair migrates alongside a bad one" "$MIGDIR/2026-09-05_good_11110007.md"
+exists "the bad one is still skipped" "$MIGDIR/2026-09-05_bad_22220008.txt"
+
+# The point of the whole migration: a migrated pair must satisfy every
+# --mark-reviewed fence, since being invisible to --mark-reviewed is the
+# problem it exists to fix.
+mig_reset
+reset_media
+rm -rf "$OUT"
+expect_rc "a session transcribes for the migration check" 0 --yes --output-dir "$OUT" aaaa0001
+# Walk it back to the pre-migration shape, then migrate it forward again.
+mv "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.md" \
+  "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.txt"
+jq '.output_file = "2026-08-27_sre-daily-huddle_aaaa0001.txt"' \
+  "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.meta.json" >"$OUT/tmp.json"
+mv "$OUT/tmp.json" "$OUT/2026-08-27_sre-daily-huddle_aaaa0001.meta.json"
+mig_rc=0
+"$MIGRATE" --yes --output-dir "$OUT" >/dev/null 2>&1 || mig_rc=$?
+if [[ $mig_rc -eq 0 ]]; then
+  pass "a real transcript pair migrates"
+else
+  fail "a real transcript pair migrates" "exit $mig_rc"
+fi
+expect_rc "a migrated pair satisfies --mark-reviewed" 0 \
+  --mark-reviewed --yes --output-dir "$OUT" aaaa0001
+absent "--mark-reviewed removes the audio after migration" "$MEDIA/A_merged.m4a"
+reset_media
 
 # --- summary -----------------------------------------------------------
 

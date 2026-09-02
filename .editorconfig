@@ -17,8 +17,12 @@ indent_size = 2
 switch_case_indent = true
 binary_next_line = false
 
-# huddle-transcribe and huddle-watch are extensionless bash scripts.
-[{huddle-transcribe,huddle-watch}]
+# The repo's bash scripts are extensionless, so they match neither of the
+# globs above. This list is load-bearing: a script missing from it gets
+# shfmt's tab default instead of the repo's two-space style, and the
+# pre-commit hook silently reformats the whole file on its first commit.
+# Add every new extensionless script here.
+[{huddle-transcribe,huddle-watch,huddle-migrate-md}]
 indent_style = space
 indent_size = 2
 switch_case_indent = true
