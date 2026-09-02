@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# huddle-migrate-md: rename pre-Markdown `.txt` transcripts to `.md` and point
+# each sidecar's output_file at the new name.
+#
+# Transcripts written before the Markdown switch are `<basename>.txt`, and
+# their sidecars record `"output_file": "<basename>.txt"`. huddle-transcribe
+# now resolves `<basename>.md`, so --mark-reviewed no longer finds those
+# transcripts. That fails CLOSED -- it refuses to delete the source audio
+# rather than acting on the wrong file -- so nothing is at risk; the old
+# transcripts are simply stranded. This adopts them.
+#
+# The content of a `.txt` transcript is left byte-identical. `mw --format md`
+# differs from `--format txt` only in wrapping the timestamp line in
+# asterisks, so an old transcript is already valid Markdown; rewriting the
+# body to add asterisks would be a lossy re-interpretation of text this
+# script never parsed. The extension and the sidecar pointer are the whole
+# migration.
+set -euo pipefail
+
+CONFIG_FILE="${HUDDLE_CONFIG_FILE:-$HOME/.config/huddle-transcribe/config}"
+DEFAULT_OUTPUT_DIR="$HOME/Documents/huddle-transcripts"
+
+DRY_RUN=0
+ASSUME_YES=0
+OUTPUT_DIR=""
+
+usage() {
+  cat <<'EOF'
+Usage: huddle-migrate-md [OPTIONS]
+
+Renames pre-Markdown `.txt` transcripts to `.md` and updates each sidecar's
+output_file field to match. Transcript content is not modified.
+
+Options:
+  --dry-run             Show what would be renamed; changes nothing
+  --yes                 Skip confirmation prompt
+  --output-dir PATH     Override the transcript directory
+  -h, --help            Show this help
+
+With no --output-dir, the directory is read from
+~/.config/huddle-transcribe/config (OUTPUT_DIR=), falling back to
+~/Documents/huddle-transcripts -- the same precedence huddle-transcribe uses.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --yes)
+      ASSUME_YES=1
+      shift
+      ;;
+    --output-dir)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --output-dir requires a PATH argument" >&2
+        exit 1
+      fi
+      OUTPUT_DIR="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: required command 'jq' not found on PATH." >&2
+  exit 1
+fi
+
+# Resolve OUTPUT_DIR exactly as huddle-transcribe does, including the
+# deliberate choice to PARSE the config file rather than source it: the
+# config must never be able to execute shell code. Keep these in agreement.
+if [[ -z "$OUTPUT_DIR" ]]; then
+  OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    config_output_dir=$(sed -n -E 's/^OUTPUT_DIR=["'"'"']?([^"'"'"']*)["'"'"']?[[:space:]]*$/\1/p' "$CONFIG_FILE" | tail -1)
+    tilde="~"
+    if [[ "$config_output_dir" == "$tilde" ]]; then
+      config_output_dir="$HOME"
+    elif [[ "$config_output_dir" == "$tilde/"* ]]; then
+      config_output_dir="$HOME/${config_output_dir:2}"
+    fi
+    [[ -n "$config_output_dir" ]] && OUTPUT_DIR="$config_output_dir"
+  fi
+fi
+
+if [[ ! -d "$OUTPUT_DIR" ]]; then
+  echo "Error: transcript directory not found at $OUTPUT_DIR" >&2
+  exit 1
+fi
+
+echo "Directory: $OUTPUT_DIR"
+
+# --- survey ---------------------------------------------------------------
+#
+# Every candidate is classified BEFORE anything is renamed, so the summary the
+# user confirms describes the whole job rather than however far it gets. A
+# migration that prompts once and then discovers a blocker halfway through has
+# already half-migrated the directory.
+
+migrate_txt=()
+migrate_meta=()
+skipped=()
+
+# A literal-match glob, so a directory with no .txt files yields nothing
+# rather than the unexpanded pattern.
+shopt -s nullglob
+candidates=("$OUTPUT_DIR"/*.txt)
+shopt -u nullglob
+
+for txt in "${candidates[@]}"; do
+  base="${txt##*/}"
+  stem="${base%.txt}"
+  meta="$OUTPUT_DIR/${stem}.meta.json"
+  md="$OUTPUT_DIR/${stem}.md"
+
+  # A .txt with no sidecar is not ours to touch. huddle-transcribe writes the
+  # pair together, so a lone .txt is either someone else's file or the debris
+  # of a failed run -- and renaming a stranger's file is worse than leaving a
+  # transcript stranded.
+  #
+  # This case is caught THREE times over: here, then by the jq read below
+  # (which fails on a nonexistent file), then by the mismatch check (an empty
+  # meta_out can never equal $base). That was verified by disabling each in
+  # turn. The redundancy is deliberate -- this is the guard whose failure
+  # renames a file the tool does not own -- so a future reader finding one of
+  # them "unreachable" should leave all three alone. It also means the
+  # sidecar-less tests in tests/run-tests.sh pin the OUTCOME, not this
+  # specific branch; removing only this check keeps them green.
+  if [[ ! -f "$meta" ]]; then
+    skipped+=("$base: no sidecar")
+    continue
+  fi
+
+  # Refuse to overwrite an existing .md. This is the collision that loses
+  # data: if both exist, one of them is a transcript this script did not
+  # write, and picking a winner silently is exactly the class of bug the
+  # session-id suffix in the output basename exists to prevent.
+  if [[ -e "$md" ]]; then
+    skipped+=("$base: ${stem}.md already exists")
+    continue
+  fi
+
+  # The sidecar must be readable JSON before its filename is committed to.
+  # jq failing AFTER the transcript rename would leave the pair pointing at
+  # different files, which is the one state this migration must not create.
+  if ! meta_out=$(jq -er '.output_file // empty' "$meta" 2>/dev/null); then
+    skipped+=("$base: sidecar unreadable or missing output_file")
+    continue
+  fi
+
+  # The sidecar must actually describe THIS transcript. A mismatch means the
+  # filename-to-sidecar mapping is already broken, and rewriting output_file
+  # would destroy the evidence of how.
+  if [[ "$meta_out" != "$base" ]]; then
+    skipped+=("$base: sidecar output_file is '$meta_out'")
+    continue
+  fi
+
+  migrate_txt+=("$txt")
+  migrate_meta+=("$meta")
+done
+
+total=${#candidates[@]}
+to_migrate=${#migrate_txt[@]}
+
+if [[ $total -eq 0 ]]; then
+  echo "No .txt transcripts found. Nothing to migrate."
+  exit 0
+fi
+
+echo "Found:     $total .txt file(s)"
+echo "Migrating: $to_migrate"
+
+if [[ ${#skipped[@]} -gt 0 ]]; then
+  echo "Skipping:  ${#skipped[@]}"
+  for s in "${skipped[@]}"; do
+    echo "  - $s"
+  done
+fi
+
+if [[ $to_migrate -eq 0 ]]; then
+  echo "Nothing to do."
+  exit 0
+fi
+
+for txt in "${migrate_txt[@]}"; do
+  base="${txt##*/}"
+  echo "  ${base} -> ${base%.txt}.md"
+done
+
+# --dry-run is checked before any write, matching huddle-transcribe's
+# ordering rule for its own destructive path.
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "(dry run -- nothing renamed)"
+  exit 0
+fi
+
+if [[ $ASSUME_YES -ne 1 ]]; then
+  read -r -p "Rename $to_migrate transcript(s) and update their sidecars? [y/N] " reply
+  [[ "$reply" =~ ^[Yy]$ ]] || {
+    echo "Aborted."
+    exit 1
+  }
+fi
+
+# --- migrate --------------------------------------------------------------
+#
+# Per pair, the order is: build the new sidecar in a temp file, rename the
+# transcript, then rename the sidecar into place.
+#
+# The sidecar edit is the fallible step (jq, ENOSPC, permissions) and it
+# touches nothing real, so it goes first. Then two same-directory renames,
+# which essentially cannot fail once the temp file exists.
+#
+# Transcript before sidecar, which is the opposite of what
+# docs/plans/speaker-name-attribution.md §5.4 prescribes for the speaker
+# rewrite -- and for the opposite reason. There the sidecar is the undo
+# record. Here the transcript rename is the operation and the sidecar merely
+# names it, so the two orderings fail differently:
+#
+#   transcript renamed, sidecar not -> the .md exists and holds the full
+#     transcript; only the sidecar's output_file is stale. Repairing it is a
+#     one-field edit against a file that is right there.
+#   sidecar renamed, transcript not -> the sidecar names a .md that does not
+#     exist, and the .txt it describes is no longer reachable through it.
+#
+# Note that re-running does NOT fix the first case: the survey globs *.txt,
+# so a pair whose transcript already moved is no longer a candidate. The
+# recovery is manual, which is why that failure prints the sidecar's path.
+#
+# mktemp beside the sidecar, not in $TMPDIR: rename is atomic only within one
+# filesystem, and OUTPUT_DIR is frequently on another volume -- Google Drive,
+# in the case this migration exists for.
+
+migrated=0
+failed=0
+
+for i in "${!migrate_txt[@]}"; do
+  txt="${migrate_txt[$i]}"
+  meta="${migrate_meta[$i]}"
+  base="${txt##*/}"
+  stem="${base%.txt}"
+  md="$OUTPUT_DIR/${stem}.md"
+
+  tmp=$(mktemp "${meta}.XXXXXX")
+
+  if ! jq --arg out "${stem}.md" '.output_file = $out' "$meta" >"$tmp" || [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    echo "Error: failed to prepare sidecar for $base; left unchanged." >&2
+    failed=$((failed + 1))
+    continue
+  fi
+
+  if ! mv "$txt" "$md"; then
+    rm -f "$tmp"
+    echo "Error: failed to rename $base; sidecar left unchanged." >&2
+    failed=$((failed + 1))
+    continue
+  fi
+
+  if ! mv "$tmp" "$meta"; then
+    # The transcript moved but the sidecar did not, so the sidecar's
+    # output_file still says `.txt` while the transcript is now `.md`.
+    #
+    # Re-running does NOT fix this. The survey globs *.txt, and this pair's
+    # .txt is gone, so it is no longer a candidate at all. The recovery is a
+    # manual one-field edit -- print the exact one, since the whole point of
+    # reaching this branch is that the automatic path just failed.
+    rm -f "$tmp"
+    echo "Error: renamed $base but could not update its sidecar." >&2
+    echo "       ${stem}.md is complete and correct; only the sidecar is stale." >&2
+    echo "       Re-running will NOT fix this. Set output_file by hand:" >&2
+    echo "         $meta" >&2
+    echo "         \"output_file\": \"${stem}.md\"" >&2
+    failed=$((failed + 1))
+    continue
+  fi
+
+  echo "Migrated: ${stem}.md"
+  migrated=$((migrated + 1))
+done
+
+echo
+echo "Migrated $migrated transcript(s)."
+if [[ $failed -gt 0 ]]; then
+  echo "Failed:   $failed" >&2
+  exit 1
+fi

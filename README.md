@@ -308,6 +308,50 @@ than a bare start, which makes segment length visible at a glance.
 transcript body as a single unbroken line, which would defeat any
 line-oriented post-processing.
 
+### Migrating pre-Markdown transcripts
+
+Transcripts written before the Markdown switch are `.txt`, and their
+sidecars record `"output_file": "<basename>.txt"`. `huddle-transcribe` now
+resolves `<basename>.md`, so `--mark-reviewed` no longer finds them. That
+**fails closed** — it refuses to delete the source audio rather than acting
+on the wrong file — so nothing is at risk; those transcripts are simply
+stranded.
+
+`huddle-migrate-md` adopts them:
+
+```bash
+huddle-migrate-md --dry-run     # show what would be renamed; changes nothing
+huddle-migrate-md               # rename, with a confirmation prompt
+```
+
+It renames each `.txt` to `.md` and repoints its sidecar's `output_file`.
+**Transcript content is not modified** — `mw --format md` differs from
+`--format txt` only in wrapping the timestamp line in asterisks, so an old
+transcript is already valid Markdown, and rewriting the body would be a
+lossy re-interpretation of text the script never parsed.
+
+Every candidate is classified before anything moves, so the summary you
+confirm describes the whole job. A pair is skipped, never guessed at, when:
+
+| Condition | Why |
+|---|---|
+| No sidecar | A lone `.txt` is someone else's file or failed-run debris |
+| `<basename>.md` already exists | One of the two was written by something else; picking a winner silently is data loss |
+| Sidecar is unparseable | The rename must not outrun a sidecar that cannot be rewritten |
+| Sidecar names a different file | The pairing is already broken, and rewriting it destroys the evidence |
+
+Skipped pairs do not stop the run — good pairs in the same directory still
+migrate — and re-running over an already-migrated directory is a no-op. It
+reads `OUTPUT_DIR` with the same precedence as `huddle-transcribe`, or takes
+`--output-dir`.
+
+If a pair's sidecar cannot be written after its transcript is renamed, the
+script exits non-zero and prints the exact repair. **A re-run will not fix
+that one**: the scan looks at `*.txt`, and that pair's `.txt` is already
+gone, so it is no longer a candidate. The transcript itself is complete at
+its new `.md` name; only the sidecar's `output_file` needs correcting, by
+hand or by fixing the permissions and editing the field.
+
 ## Source file lifecycle
 
 The script never removes source audio on transcription. Once a transcript

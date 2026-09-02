@@ -4,24 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Two Bash scripts. `huddle-transcribe` wraps MacWhisper Pro's `mw` CLI: it
+Three Bash scripts. `huddle-transcribe` wraps MacWhisper Pro's `mw` CLI: it
 picks a meeting recording out of MacWhisper's own SQLite database, transcribes
 it with speaker diarization, and writes a `.md` transcript plus a
 `.meta.json` sidecar. `huddle-watch` drives it from launchd, waking on a
 database change and transcribing each session that has newly become ready.
+`huddle-migrate-md` is a one-shot: it adopts `.txt` transcripts written
+before the Markdown switch by renaming them and repointing their sidecars.
 
 There is no build step and no package manager. The test suite is a single
-Bash script, `tests/run-tests.sh`; the rest of the repo is the two scripts, a
-README, a LICENSE, and the CI workflows.
+Bash script, `tests/run-tests.sh`; the rest of the repo is the three scripts,
+a README, a LICENSE, and the CI workflows.
 
 ## Commands
 
 ```bash
-./tests/run-tests.sh                                                     # 189 behavioral tests
-shellcheck -S info huddle-transcribe huddle-watch tests/run-tests.sh     # must be clean
-shfmt -i 2 -ci -d huddle-transcribe huddle-watch tests/run-tests.sh      # show diff
-shfmt -i 2 -ci -w huddle-transcribe huddle-watch tests/run-tests.sh      # apply formatting
+./tests/run-tests.sh                          # 237 behavioral tests (some skip off macOS)
+shellcheck -S info huddle-transcribe huddle-watch huddle-migrate-md tests/run-tests.sh
+shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-migrate-md tests/run-tests.sh
+shfmt -i 2 -ci -w huddle-transcribe huddle-watch huddle-migrate-md tests/run-tests.sh
 ```
+
+CI discovers scripts by shebang over git-tracked files, so a new script is
+linted automatically once it is committed with an exec bit.
 
 CI runs exactly these. Run the test suite before every commit — the linters
 pass on every data-loss bug this repo has had.
@@ -37,6 +42,17 @@ line, which is the opposite of what CI's `shfmt -i 2 -ci` accepts — so without
 this file the hook rewrites every `... &&` line ending into a leading `&&` and
 CI then rejects it, on a loop no amount of reformatting escapes. Do not delete
 it, and keep `binary_next_line = false` in agreement with CI's flags.
+
+**Every extensionless script must be named in `.editorconfig`'s last
+section.** The repo's scripts have no `.sh` suffix, so they match neither
+`[*]` nor `[*.{sh,bash}]` — only the literal
+`[{huddle-transcribe,huddle-watch,huddle-migrate-md}]` list. A script left
+out of it gets shfmt's *tab* default, and the failure is quiet in the worst
+way: the pre-commit hook reformats the whole file to tabs, reports "All
+checked files are clean", and aborts the commit. Nothing says the file was
+just rewritten against the repo's style. This is what happened on
+`huddle-migrate-md`'s first commit. Add the name here in the same change
+that adds the script.
 
 Exercising the script:
 
@@ -260,6 +276,48 @@ deleted the audio.
 
 The sidecar is written only after the audio is confirmed gone, so a failed
 removal cannot leave `deleted_source: true` behind.
+
+## huddle-migrate-md
+
+A one-shot that adopts `.txt` transcripts predating the Markdown switch.
+It renames each to `.md` and repoints its sidecar's `output_file`. It does
+**not** rewrite transcript content: the `txt`/`md` difference is asterisks
+around the timestamp line, so an old transcript is already valid Markdown,
+and editing the body would mean parsing text this tool has no reason to
+parse.
+
+Three properties are load-bearing:
+
+- **Survey before mutate.** Every candidate is classified before anything
+  is renamed, so the summary the user confirms describes the whole job. A
+  migration that prompts once and then hits a blocker halfway has already
+  half-migrated the directory.
+- **Per pair: build the sidecar temp file, rename the transcript, rename
+  the sidecar.** The `jq` step is the fallible one and touches nothing real,
+  so it goes first; what remains is two same-directory renames. Note this is
+  transcript-before-sidecar, the *opposite* of what
+  `docs/plans/speaker-name-attribution.md` §5.4 prescribes — and for the
+  opposite reason. There the sidecar is the undo record; here the rename is
+  the operation and the sidecar merely names it. A stale sidecar still saying
+  `.txt` leaves the full transcript sitting at the `.md`, needing a one-field
+  edit; a sidecar naming a `.md` that does not exist strands the pair with
+  the transcript no longer reachable through it.
+  **Re-running does not repair either state**, and the script must never
+  claim it does. The survey globs `*.txt`, so a pair whose transcript already
+  moved is not a candidate at all — a re-run prints "Nothing to migrate" and
+  exits 0 with the sidecar still stale. An earlier draft asserted the
+  opposite in both a code comment and the user-facing error; CI review caught
+  it, and `tests/run-tests.sh` now pins the honest message and the fact that
+  a re-run leaves the sidecar untouched.
+- **Four skip conditions, and a skip never aborts the run.** No sidecar; a
+  `.md` already present; an unparseable sidecar; a sidecar naming a
+  different file. Each is a case where guessing would lose data.
+
+The sidecar-less case is guarded three times over (the `-f` test, the `jq`
+read, and the mismatch comparison against an empty `meta_out`) — verified by
+disabling each in turn. That redundancy is deliberate, since this is the
+guard whose failure renames a file the tool does not own. It also means the
+sidecar-less tests pin the outcome rather than any one branch.
 
 ## Known state
 
