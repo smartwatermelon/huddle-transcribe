@@ -150,6 +150,7 @@ INSERT INTO mediafile VALUES (x'dddd0004', 'meetingMicAudio', 'D_mic.m4a');
 -- Under MIN_DURATION_SECONDS: must never appear.
 INSERT INTO recordedmeeting VALUES (x'55', 60.0, 'Too Short');
 INSERT INTO session VALUES (x'eeee0005', '2026-08-28 10:00:00.000', 'Short One', NULL, x'55', NULL);
+INSERT INTO mediafile VALUES (x'eeee0005', 'mergedMultitrack', 'E_merged.m4a');
 
 -- Non-numeric duration. Bash evaluates arithmetic on this value, and an
 -- array-subscript payload would execute if it reached $(( )) unvalidated.
@@ -161,7 +162,8 @@ SQL
 reset_media() {
   rm -f "$MEDIA"/*.m4a
   touch "$MEDIA/A_merged.m4a" "$MEDIA/B_app.m4a" \
-    "$MEDIA/C_merged.m4a" "$MEDIA/D_mic.m4a" "$MEDIA/F_merged.m4a"
+    "$MEDIA/C_merged.m4a" "$MEDIA/D_mic.m4a" "$MEDIA/E_merged.m4a" \
+    "$MEDIA/F_merged.m4a"
 }
 
 # Build a runnable copy with the five environment constants repointed at the
@@ -352,9 +354,32 @@ refute_out "date query does not reach a distant session" "January Session" \
 expect_out "missing date names the date" "no qualifying session on 2026-06-15" \
   --dry-run --output-dir "$OUT" 2026-06-15
 
-# Sessions below the duration floor are filtered out entirely.
+# Sessions below the duration floor are filtered from --list, `latest` and
+# date lookup, but an explicit session id bypasses the floor (#37).
 refute_out "short session filtered from --list" "Short One" --list
-expect_rc "short session not selectable" 1 --dry-run --output-dir "$OUT" eeee0005
+expect_rc "short session selectable by explicit id" 0 --dry-run --output-dir "$OUT" eeee0005
+expect_out "short session by id resolves to that session" "Short One" \
+  --dry-run --output-dir "$OUT" eeee0005
+expect_rc "short session selectable by dashed id" 0 --dry-run --output-dir "$OUT" eeee-0005
+expect_rc "short session not selectable by date" 1 --dry-run --output-dir "$OUT" 2026-08-28
+refute_out "latest does not pick the short session" "Short One" --dry-run --output-dir "$OUT"
+
+# HUDDLE_MIN_DURATION moves the floor and is validated, as in huddle-watch.
+lowered=$(HUDDLE_MIN_DURATION=30 "$HT" --list 2>&1 || true)
+if grep -qF "Short One" <<<"$lowered"; then
+  pass "HUDDLE_MIN_DURATION=30 lets --list show the 60s session"
+else
+  fail "HUDDLE_MIN_DURATION=30 lets --list show the 60s session" "not listed"
+fi
+for bad in "" "abc" "0 OR 1=1" "5;--"; do
+  rc=0
+  HUDDLE_MIN_DURATION="$bad" "$HT" --list >/dev/null 2>&1 || rc=$?
+  if [[ $rc -eq 1 ]]; then
+    pass "HUDDLE_MIN_DURATION='$bad' rejected"
+  else
+    fail "HUDDLE_MIN_DURATION='$bad' rejected" "exit $rc, wanted 1"
+  fi
+done
 
 # --- row parsing -------------------------------------------------------
 

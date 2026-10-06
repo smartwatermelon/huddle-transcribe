@@ -19,7 +19,15 @@ shopt -u nullglob
 if [[ ${#drive_dirs[@]} -eq 1 && -d "${drive_dirs[0]}/My Drive/knowledge-base" ]]; then
   DEFAULT_OUTPUT_DIR="${drive_dirs[0]}/My Drive/knowledge-base/transcripts"
 fi
-MIN_DURATION_SECONDS=300
+# Floor for `latest` and date lookups; an explicit session id ignores it.
+# Same variable and validation as huddle-watch. `-` rather than `:-`, so an
+# explicitly empty HUDDLE_MIN_DURATION is rejected instead of becoming 300.
+MIN_DURATION_SECONDS="${HUDDLE_MIN_DURATION-300}"
+# Interpolated into SQL below, so it must be a plain integer before then.
+if ! [[ "$MIN_DURATION_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "Error: HUDDLE_MIN_DURATION must be a whole number of seconds (got '$MIN_DURATION_SECONDS')." >&2
+  exit 1
+fi
 MW_BIN="/usr/local/bin/mw"
 
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
@@ -169,7 +177,7 @@ sql() {
 # Columns, separated by $SEP (0x1F):
 #   session_id, dateCreated, duration,
 #   merged_filename, app_audio_filename, mic_audio_filename, title
-SESSION_QUERY="
+SESSION_SELECT="
 SELECT
   lower(hex(s.id)),
   s.dateCreated,
@@ -183,7 +191,16 @@ SELECT
 FROM session s
 LEFT JOIN recordedmeeting rm ON rm.id = s.recordedMeetingID
 LEFT JOIN systemaudiorecording sar ON sar.id = s.systemAudioRecordingID
+"
+# Used by `latest`, date lookup and --list: the floor keeps accidental short
+# clips from being auto-selected.
+SESSION_QUERY="$SESSION_SELECT
 WHERE COALESCE(rm.duration, sar.duration, 0) > $MIN_DURATION_SECONDS
+ORDER BY s.dateCreated DESC
+"
+# Used by lookup by explicit session id: naming an id is unambiguous, so no
+# duration heuristic applies (a real 4m14s huddle was unreachable, #37).
+SESSION_QUERY_ANY="$SESSION_SELECT
 ORDER BY s.dateCreated DESC
 "
 
@@ -386,7 +403,7 @@ find_session_by_date() {
   done <<<"$all_rows"
 
   if [[ -z "$best_sid" ]]; then
-    echo "Error: no qualifying session on $target_date. Try --list." >&2
+    echo "Error: no qualifying session on $target_date (duration > ${MIN_DURATION_SECONDS}s; an explicit session id bypasses that). Try --list." >&2
     return 1
   fi
   if ((matches > 1)); then
@@ -416,7 +433,7 @@ find_session_by_id() {
   # pipeline masks sqlite3's exit status, so an unreadable or corrupt
   # database reported "no such session" instead of naming the real problem.
   local all_rows
-  if ! all_rows=$(sql "$SESSION_QUERY"); then
+  if ! all_rows=$(sql "$SESSION_QUERY_ANY"); then
     echo "Error: failed to query MacWhisper database at $DB" >&2
     exit 1
   fi

@@ -124,8 +124,11 @@ prefix-matching (a UUID copied from MacWhisper's UI is dashed and would
 otherwise never match) and rejects anything non-hex. Title and duration are `COALESCE` chains across
 `session`, `recordedmeeting`, and `systemaudiorecording`, because MacWhisper
 populates different tables depending on how a recording was captured. The
-`WHERE` clause filters on `MIN_DURATION_SECONDS` (300) to drop stray short
-recordings.
+`WHERE` clause of `SESSION_QUERY` filters on `MIN_DURATION_SECONDS` (default
+300, overridable with `HUDDLE_MIN_DURATION`, validated as an integer because
+it is interpolated into SQL) to drop stray short recordings from `latest`,
+date lookup and `--list`. `find_session_by_id` uses `SESSION_QUERY_ANY`, which
+has no duration filter: an explicit id is unambiguous (#37).
 
 **Audio source preference** is merged multitrack → app/system audio → mic
 audio, resolved from the three filename columns after selection.
