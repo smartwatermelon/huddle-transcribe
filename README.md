@@ -48,7 +48,13 @@ huddle-transcribe [OPTIONS] [SESSION_ID_OR_DATE]
     reported.
   - a MacWhisper session UUID, dashed or bare hex, or an unambiguous prefix
     of one. An ambiguous prefix is an error listing the matches, rather
-    than a guess.
+    than a guess. An explicit id is never filtered by duration, so a huddle
+    under 5 minutes can still be transcribed this way.
+
+`latest`, a date, and `--list` skip sessions of 5 minutes or less (default
+300 seconds), which keeps accidental short clips from being auto-selected.
+Set `HUDDLE_MIN_DURATION` (whole seconds; anything else is rejected, because
+it is interpolated into SQL) to move that floor.
 
 ### Options
 
@@ -129,7 +135,9 @@ A session is transcribed when all of the following hold:
 Duration is read from the recorded meeting or the system-audio recording,
 whichever MacWhisper populated for that capture method. That chain matches
 `huddle-transcribe`'s exactly, and deliberately so: the watcher only hands
-over a session id, and the transcriber re-resolves it through its own filter.
+over a session id, and the transcriber re-resolves it. The transcriber's
+duration floor no longer applies to an explicit id, so the watcher's own floor
+is the only one on this path.
 A session the watcher considered ready but the transcriber cannot resolve
 would fail three times and then report a failure for a perfectly good
 recording.
