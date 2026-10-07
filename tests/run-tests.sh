@@ -724,6 +724,20 @@ expect_rc "--all --list rejected" 1 --all --list --output-dir "$OUT_ALL"
 expect_rc "--all --mark-reviewed rejected" 1 --all --mark-reviewed --yes --output-dir "$OUT_ALL"
 exists "--all --mark-reviewed keeps the audio" "$MEDIA/A_merged.m4a"
 
+# With no answer on stdin, each prompt must say why it stopped, not exit
+# silently, and must act on nothing.
+for args in "--all" "bbbb0002" "--mark-reviewed aaaa0001"; do
+  read -r -a argv <<<"$args"
+  eof_out=$("$HT" "${argv[@]}" --output-dir "$OUT_ALL" </dev/null 2>&1) && rc=0 || rc=$?
+  if [[ $rc -eq 1 ]] && grep -qF -- "Re-run with --yes" <<<"$eof_out"; then
+    pass "'$args' with closed stdin explains and exits 1"
+  else
+    fail "'$args' with closed stdin explains and exits 1" "exit $rc: $eof_out"
+  fi
+done
+absent "closed stdin writes no sidecar" "$OUT_ALL/2026-08-27_sre-daily-huddle_bbbb0002.meta.json"
+exists "closed stdin keeps the audio" "$MEDIA/A_merged.m4a"
+
 rm -f "$WORK/mw-calls"
 all_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --all --dry-run --output-dir "$OUT_ALL" 2>&1) && rc=0 || rc=$?
 if [[ $rc -eq 0 ]]; then pass "--all --dry-run exits 0"; else fail "--all --dry-run exits 0" "exit $rc"; fi

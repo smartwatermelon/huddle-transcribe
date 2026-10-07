@@ -238,6 +238,23 @@ WHERE COALESCE(rm.duration, sar.duration, 0) > $MIN_DURATION_SECONDS
 ORDER BY s.dateCreated ASC
 "
 
+# Asks a y/N question and exits unless the answer is yes. A failed read means
+# stdin hit end-of-file -- no terminal, as under launchd or a `!` shell escape,
+# where bash also suppresses the -p prompt. Unguarded, `set -e` then ended the
+# script at the read with exit 1 and no message at all.
+confirm() {
+  local reply
+  if ! read -r -p "$1 [y/N] " reply; then
+    echo >&2
+    echo "Error: no answer to the confirmation prompt (stdin is closed or not a terminal). Re-run with --yes to skip it." >&2
+    exit 1
+  fi
+  [[ "$reply" =~ ^[Yy]$ ]] || {
+    echo "Aborted."
+    exit 1
+  }
+}
+
 slugify() {
   local slug
   slug=$(echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')
@@ -416,11 +433,7 @@ if [[ $ALL -eq 1 ]]; then
     exit 0
   fi
   if [[ $ASSUME_YES -ne 1 ]]; then
-    read -r -p "Transcribe these ${#pending[@]} session(s)? [y/N] " reply
-    [[ "$reply" =~ ^[Yy]$ ]] || {
-      echo "Aborted."
-      exit 1
-    }
+    confirm "Transcribe these ${#pending[@]} session(s)?"
   fi
   # One failure does not stop the batch: the remaining sessions are
   # independent, and the summary names every failure so none is lost.
@@ -727,11 +740,7 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
     else
       delete_verb="permanently delete"
     fi
-    read -r -p "Mark reviewed and $delete_verb source .m4a ($SOURCE_PATH)? [y/N] " reply
-    [[ "$reply" =~ ^[Yy]$ ]] || {
-      echo "Aborted."
-      exit 1
-    }
+    confirm "Mark reviewed and $delete_verb source .m4a ($SOURCE_PATH)?"
   fi
   # Order matters, and both obvious orderings are wrong:
   #
@@ -802,11 +811,7 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
 fi
 
 if [[ $ASSUME_YES -ne 1 ]]; then
-  read -r -p "Transcribe this session? [y/N] " reply
-  [[ "$reply" =~ ^[Yy]$ ]] || {
-    echo "Aborted."
-    exit 1
-  }
+  confirm "Transcribe this session?"
 fi
 
 # Transcribe to a temp path and move into place only once mw has succeeded
