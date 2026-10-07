@@ -274,9 +274,9 @@ events (`log show`) and alerts when all of these are true:
    ago and has not been taken again. Shorter drops are flaps, not endings.
 2. MacWhisper took the microphone during that huddle.
 3. MacWhisper is still running.
-4. MacWhisper's database has no recording that finished after MacWhisper
-   took the microphone. The finish time is `recordedmeeting.dateCreated`
-   (or `systemaudiorecording.dateCreated`), which is when capture stopped.
+4. MacWhisper's database has saved no meeting audio since MacWhisper took
+   the microphone. The save time is the audio row's `mediafile.dateCreated`,
+   written when MacWhisper finalizes the meeting.
 
 MacWhisper releasing the microphone is **not** used as "recording stopped".
 On 2026-09-24 MacWhisper's Bluetooth mic dropped 36 s after the huddle ended.

@@ -665,32 +665,38 @@ macwhisper_alive "$mw_pid" || quiet_exit "MacWhisper (pid $mw_pid) is no longer 
 
 # --- has MacWhisper saved a recording since? ---------------------------
 
-# recordedmeeting.dateCreated (and systemaudiorecording's, the other capture
-# path) is when MacWhisper FINISHED capturing, in UTC. Verified 2026-09-24:
-# the row's dateCreated was 15:41:16.343 UTC = 08:41:16 PDT, the moment the
-# recording actually stopped, and dateCreated minus its duration (2379.6 s)
-# lands at 08:01:37, just after the recording began. session.dateCreated is
-# NOT usable here: it lags by the transcription time (15:43:45 that day, and
-# up to ~4.5 min on others).
+# The proof that capture stopped is MacWhisper saving the meeting's audio: a
+# mediafile row of one of the three audio types huddle-transcribe and
+# huddle-watch use, created after MacWhisper's own mic `yes`. The row is
+# written when MacWhisper finalizes the meeting -- on every live-captured
+# session so far, about a second after the session's final dateUpdated.
+#
+# This used to read recordedmeeting.dateCreated (and systemaudiorecording's),
+# which until 2026-09-24 was the moment capture stopped. Since MacWhisper began
+# capturing meetings live that evening, it is the moment capture STARTED,
+# which can precede MacWhisper's mic `yes`. A saved meeting then never
+# counted, and every ended huddle alerted three times. Oct 5 and 7: the first
+# alert was right (still recording); the two after the save were false.
+# Reading the start time could also fail the other way -- a row written at the
+# start of a meeting and dated after the `yes` would silence the guard while
+# MacWhisper was still recording -- so recordedmeeting is not read at all.
 #
 # The comparison is against MacWhisper's `yes`, not Slack's release. Someone
 # who stops the recording and then leaves the huddle produces a row that
 # predates the release, and comparing against the release would alert on a
 # recording that had already stopped.
 #
-# dateDeleted is deliberately NOT filtered: a recording saved and then
+# Deleted sessions are deliberately NOT filtered: a recording saved and then
 # deleted still proves the capture stopped.
 #
 # The upper bound at NOW is a no-op in normal use (no row is written in the
 # future) and is what lets HUDDLE_GUARD_NOW replay a past day against a real
 # database that has since gained that day's row.
 FINISHED_QUERY="
-SELECT count(*) FROM (
-  SELECT CAST(strftime('%s', dateCreated) AS INTEGER) AS finished FROM recordedmeeting
-  UNION ALL
-  SELECT CAST(strftime('%s', dateCreated) AS INTEGER) AS finished FROM systemaudiorecording
-)
-WHERE finished >= $mw_yes AND finished <= $NOW
+SELECT count(*) FROM mediafile
+WHERE type IN ('mergedMultitrack', 'meetingAppAudio', 'meetingMicAudio')
+  AND CAST(strftime('%s', dateCreated) AS INTEGER) >= $mw_yes
+  AND CAST(strftime('%s', dateCreated) AS INTEGER) <= $NOW
 "
 
 # Read-only, both ways, with a short retry on WAL lock contention; see
