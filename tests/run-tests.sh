@@ -702,6 +702,123 @@ else
   fail "a sidecar missing title falls back to a de-slugified title"
 fi
 
+# --- --all -------------------------------------------------------------
+
+echo "--all"
+# --all skips sessions deleted in MacWhisper. The base fixture lacks the
+# real database's dateDeleted column, so add it here.
+sqlite3 "$DB" <<'SQL'
+ALTER TABLE session ADD COLUMN dateDeleted TEXT;
+INSERT INTO recordedmeeting VALUES (x'77', 1000.0, 'rmG');
+INSERT INTO session VALUES (x'abab0007', '2025-12-01 10:00:00.000', 'Deleted One', NULL, x'77', NULL, '2025-12-02 10:00:00.000');
+INSERT INTO mediafile VALUES (x'abab0007', 'mergedMultitrack', 'G_merged.m4a');
+SQL
+reset_media
+touch "$MEDIA/G_merged.m4a"
+OUT_ALL="$WORK/out-all"
+rm -rf "$OUT_ALL"
+"$HT" --yes --output-dir "$OUT_ALL" aaaa0001 >/dev/null 2>&1
+
+expect_rc "--all with a target rejected" 1 --all --output-dir "$OUT_ALL" bbbb0002
+expect_rc "--all --list rejected" 1 --all --list --output-dir "$OUT_ALL"
+expect_rc "--all --mark-reviewed rejected" 1 --all --mark-reviewed --yes --output-dir "$OUT_ALL"
+exists "--all --mark-reviewed keeps the audio" "$MEDIA/A_merged.m4a"
+
+# With no answer on stdin, each prompt must say why it stopped, not exit
+# silently, and must act on nothing.
+for args in "--all" "bbbb0002" "--mark-reviewed aaaa0001"; do
+  read -r -a argv <<<"$args"
+  eof_out=$("$HT" "${argv[@]}" --output-dir "$OUT_ALL" </dev/null 2>&1) && rc=0 || rc=$?
+  if [[ $rc -eq 1 ]] && grep -qF -- "Re-run with --yes" <<<"$eof_out"; then
+    pass "'$args' with closed stdin explains and exits 1"
+  else
+    fail "'$args' with closed stdin explains and exits 1" "exit $rc: $eof_out"
+  fi
+done
+absent "closed stdin writes no sidecar" "$OUT_ALL/2026-08-27_sre-daily-huddle_bbbb0002.meta.json"
+exists "closed stdin keeps the audio" "$MEDIA/A_merged.m4a"
+
+rm -f "$WORK/mw-calls"
+all_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --all --dry-run --output-dir "$OUT_ALL" 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]]; then pass "--all --dry-run exits 0"; else fail "--all --dry-run exits 0" "exit $rc"; fi
+absent "--all --dry-run never runs mw" "$WORK/mw-calls"
+for want in bbbb0002 cccc0003 dddd0004 ffff0006 "would transcribe 4"; do
+  if grep -qF "$want" <<<"$all_out"; then
+    pass "--all --dry-run lists $want"
+  else
+    fail "--all --dry-run lists $want" "$all_out"
+  fi
+done
+for unwanted in aaaa0001 "Short One" abab0007; do
+  if grep -qF "$unwanted" <<<"$all_out"; then
+    fail "--all --dry-run skips $unwanted" "$all_out"
+  else
+    pass "--all --dry-run skips $unwanted"
+  fi
+done
+
+all_out=$(echo n | "$HT" --all --output-dir "$OUT_ALL" 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] && grep -qF "Aborted." <<<"$all_out"; then
+  pass "--all declined at the prompt aborts"
+else
+  fail "--all declined at the prompt aborts" "exit $rc"
+fi
+absent "--all declined writes nothing" "$OUT_ALL/2026-08-27_sre-daily-huddle_bbbb0002.meta.json"
+
+all_out=$("$HT" --all --yes --output-dir "$OUT_ALL" 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]]; then pass "--all --yes exits 0"; else fail "--all --yes exits 0" "exit $rc"; fi
+for f in 2026-08-27_sre-daily-huddle_bbbb0002 2026-01-05_january-session_cccc0003 \
+  2026-08-20_tab-title-here_dddd0004 2026-08-19_hostile-duration_ffff0006; do
+  exists "--all writes $f.md" "$OUT_ALL/$f.md"
+  exists "--all writes $f.meta.json" "$OUT_ALL/$f.meta.json"
+done
+# Oldest first: January's session must be processed before August's.
+first=$(grep -n '^\[1/4\]' <<<"$all_out" | cut -d: -f1)
+jan=$(grep -n '^\[[0-9]/4\] cccc0003' <<<"$all_out" | cut -d: -f1)
+if [[ -n "$first" && "$first" == "$jan" ]]; then
+  pass "--all processes the oldest session first"
+else
+  fail "--all processes the oldest session first" "$all_out"
+fi
+absent "--all skips the session deleted in MacWhisper" \
+  "$OUT_ALL/2025-12-01_deleted-one_abab0007.meta.json"
+
+rm -f "$WORK/mw-calls"
+all_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --all --yes --output-dir "$OUT_ALL" 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Nothing to transcribe" <<<"$all_out"; then
+  pass "--all with nothing pending says so and exits 0"
+else
+  fail "--all with nothing pending says so and exits 0" "exit $rc: $all_out"
+fi
+absent "--all with nothing pending never runs mw" "$WORK/mw-calls"
+
+# One failure must not stop the batch. The stub fails the oldest session,
+# so every later session has to survive it.
+cat >"$BIN/mw-fail-c" <<'STUB'
+#!/usr/bin/env bash
+for last in "$@"; do :; done
+[[ "$last" == *C_merged.m4a ]] && exit 3
+exec "$(dirname -- "$0")/mw" "$@"
+STUB
+chmod +x "$BIN/mw-fail-c"
+HT=$(build "$BIN/mw-fail-c")
+rm -rf "$OUT_ALL"
+all_out=$("$HT" --all --yes --output-dir "$OUT_ALL" 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]]; then pass "--all exits 1 when a session fails"; else fail "--all exits 1 when a session fails" "exit $rc"; fi
+if grep -qF "Failed: cccc0003" <<<"$all_out"; then
+  pass "--all names the failed session"
+else
+  fail "--all names the failed session" "$all_out"
+fi
+exists "--all continues past a failure" "$OUT_ALL/2026-08-27_sre-daily-huddle_aaaa0001.meta.json"
+absent "--all writes no sidecar for the failed session" \
+  "$OUT_ALL/2026-01-05_january-session_cccc0003.meta.json"
+HT=$(build)
+
+sqlite3 "$DB" "DELETE FROM session WHERE id = x'abab0007'; DELETE FROM recordedmeeting WHERE id = x'77'; DELETE FROM mediafile WHERE sessionID = x'abab0007';"
+rm -f "$MEDIA/G_merged.m4a"
+rm -rf "$OUT_ALL"
+
 # --- huddle-watch ------------------------------------------------------
 #
 # The watcher is driven purely through its environment overrides. Its
