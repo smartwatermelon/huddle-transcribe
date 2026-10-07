@@ -22,7 +22,7 @@ a README, a LICENSE, and the CI workflows.
 ## Commands
 
 ```bash
-./tests/run-tests.sh                          # 365 behavioral tests (some skip off macOS)
+./tests/run-tests.sh                          # 382 behavioral tests (some skip off macOS)
 shellcheck -S info huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -w huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
@@ -246,12 +246,13 @@ watcher was never slow; it was not being woken.
 
 Two cautions for anyone re-investigating this:
 
-- **`dateCreated` is the END of the recording, not the start.** A session
-  row appears when MacWhisper finishes capturing. `dateUpdated` lands a few
-  seconds later and is when the readiness flags settle. Comparing a
-  transcription time against `dateCreated` therefore looks like the watcher
-  ran *before* the meeting, which is what makes the timeline confusing at
-  first read.
+- **What `dateCreated` means depends on how the meeting was captured.**
+  For the sessions in the table above it is the END of the recording: the
+  row appeared when MacWhisper finished capturing, and `dateUpdated` landed
+  a few seconds later. Comparing a transcription time against it therefore
+  looks like the watcher ran *before* the meeting. For live-captured
+  sessions (from 2026-09-24 evening, see below) it is the START, and
+  `dateUpdated` is the end. Read `dateUpdated` either way.
 - **Do not measure this by counting launchd fires.** `log show --predicate
   'process == "launchd"'` has bounded retention and does not preserve a
   reliable per-day fire count; it also logs "service inactive" at job
@@ -281,6 +282,39 @@ Two details are load-bearing in the code:
 into the plist as `StartInterval`. It is deliberately not injected into the
 plist's `EnvironmentVariables`, so a launchd-spawned `--once` never sees it;
 changing the interval means re-running `--install`.
+
+### The readiness gate is the saved audio, not diarization
+
+`READY_WHERE` once required `hasBeenDiarized = 1`. From the evening of
+2026-09-24 MacWhisper captures meetings live: the session row is created at
+the START of recording, `modelEngine` is empty, and `hasBeenDiarized` stays 0
+forever. No session matched after that, and the watcher transcribed nothing
+for two weeks while `--status` reported it healthy.
+
+The gate now is a `mediafile` row of one of the three audio types
+`huddle-transcribe` resolves a source from. On every live session so far that
+row was inserted about one second after the session's final `dateUpdated`,
+i.e. when MacWhisper finalizes the meeting, and it is the file `mw` needs.
+`isIncomingLiveStream = 0` is a second, independent gate for a meeting still
+being captured. Neither gate has yet been observed on a row mid-meeting:
+nothing was recording while this was written. `huddle-watch --list` shows
+both (`LIV`, `AUD`) and computes `READY` from `READY_WHERE` in SQL, so a
+`--list` taken during a meeting is the check.
+
+Finalization can lag the end of a call: `ad99fee3` (a 73-minute meeting
+created 18:01 UTC) was not updated until 01:32 the next day.
+
+The watcher runs `huddle-transcribe --skip-existing`, which exits 0 with
+`Already transcribed: <sidecar>` when the session's sidecar exists (same
+id-suffix glob and `session_id` check as `--mark-reviewed`, and checked before
+the source-audio test, since a reviewed session's audio is gone). The watcher
+logs that as `SKIP`, marks it done, and posts no notification. This is what
+keeps the state file and the sidecars from disagreeing: sessions done by hand
+or by `--all` would otherwise be re-run through `mw`, and those with trashed
+audio would fail to the attempt cap.
+
+`huddle-mic-guard` still reads `recordedmeeting.dateCreated` as the moment
+capture stopped. For live sessions that column is the start. Not fixed here.
 
 ### huddle-watch state
 

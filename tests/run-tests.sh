@@ -815,6 +815,39 @@ absent "--all writes no sidecar for the failed session" \
   "$OUT_ALL/2026-01-05_january-session_cccc0003.meta.json"
 HT=$(build)
 
+# --skip-existing: a sidecar means done, even with the audio gone, as it is
+# after --mark-reviewed.
+rm -rf "$OUT_ALL"
+reset_media
+"$HT" --yes --output-dir "$OUT_ALL" bbbb0002 >/dev/null 2>&1
+rm -f "$MEDIA/B_app.m4a" "$WORK/mw-calls"
+skip_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --skip-existing --yes --output-dir "$OUT_ALL" bbbb0002 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Already transcribed: " <<<"$skip_out"; then
+  pass "--skip-existing exits 0 for a transcribed session with its audio gone"
+else
+  fail "--skip-existing exits 0 for a transcribed session with its audio gone" "exit $rc: $skip_out"
+fi
+absent "--skip-existing never runs mw for a transcribed session" "$WORK/mw-calls"
+# A sidecar that only shares the 8-hex suffix is someone else's: transcribe.
+reset_media
+jq '.session_id = "aaaa0001ffff"' "$OUT_ALL/2026-08-27_sre-daily-huddle_bbbb0002.meta.json" \
+  >"$OUT_ALL/x.json" && mv "$OUT_ALL/x.json" "$OUT_ALL/2026-08-27_sre-daily-huddle_bbbb0002.meta.json"
+skip_out=$("$HT" --skip-existing --yes --output-dir "$OUT_ALL" bbbb0002 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Transcript written: " <<<"$skip_out"; then
+  pass "--skip-existing transcribes when the sidecar names another session"
+else
+  fail "--skip-existing transcribes when the sidecar names another session" "exit $rc: $skip_out"
+fi
+skip_out=$("$HT" --skip-existing --yes --output-dir "$OUT_ALL" cccc0003 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Transcript written: " <<<"$skip_out"; then
+  pass "--skip-existing transcribes a session with no sidecar"
+else
+  fail "--skip-existing transcribes a session with no sidecar" "exit $rc: $skip_out"
+fi
+expect_rc "--skip-existing --mark-reviewed rejected" 1 \
+  --skip-existing --mark-reviewed --yes --output-dir "$OUT_ALL" cccc0003
+exists "--skip-existing --mark-reviewed keeps the audio" "$MEDIA/C_merged.m4a"
+
 sqlite3 "$DB" "DELETE FROM session WHERE id = x'abab0007'; DELETE FROM recordedmeeting WHERE id = x'77'; DELETE FROM mediafile WHERE sessionID = x'abab0007';"
 rm -f "$MEDIA/G_merged.m4a"
 rm -rf "$OUT_ALL"
@@ -845,6 +878,10 @@ printf '%s\n' "$*" >>"$CALLS"
 if [[ -n "${FAIL_TRANSCRIBE:-}" ]]; then
   echo "stub: simulated failure" >&2
   exit 1
+fi
+if [[ -n "${ALREADY_TRANSCRIBED:-}" ]]; then
+  echo "Already transcribed: /tmp/out/${1:0:8}.meta.json"
+  exit 0
 fi
 echo "Transcript written: /tmp/out/${1:0:8}.md"
 STUB
@@ -909,15 +946,17 @@ CREATE TABLE session (
 );
 CREATE TABLE recordedmeeting (id BLOB PRIMARY KEY, duration REAL, title TEXT);
 CREATE TABLE systemaudiorecording (id BLOB PRIMARY KEY, duration REAL, title TEXT);
+CREATE TABLE mediafile (sessionID BLOB, type TEXT, filename TEXT);
 
 -- READY: every condition satisfied. This is the one the watcher must pick.
 INSERT INTO recordedmeeting VALUES (x'71', 803.25, 'rmReady');
 INSERT INTO session VALUES (x'aaaa1111', '2026-08-31 15:18:37.000', 'Ready Session',
   NULL, x'71', NULL, 1, 1, 0, 0, NULL, NULL);
 
--- Not diarized: MacWhisper has transcribed but not yet separated speakers.
-INSERT INTO recordedmeeting VALUES (x'72', 900.0, 'rmNoDia');
-INSERT INTO session VALUES (x'bbbb2222', '2026-08-30 10:00:00.000', 'Not Diarized',
+-- No audio row yet: MacWhisper has not finalized the meeting. It is the only
+-- session below without a mediafile row, so that row alone is what gates it.
+INSERT INTO recordedmeeting VALUES (x'72', 900.0, 'rmNoAudio');
+INSERT INTO session VALUES (x'bbbb2222', '2026-08-30 10:00:00.000', 'No Audio Yet',
   NULL, x'72', NULL, 1, 0, 0, 0, NULL, NULL);
 
 -- Transcription did not succeed.
@@ -981,6 +1020,15 @@ INSERT INTO session VALUES (x'dead1010', '2026-08-22 10:00:00.000', 'Truthy Two'
 INSERT INTO recordedmeeting VALUES (x'7a', 900.0, 'rmNullFlags');
 INSERT INTO session VALUES (x'dead2020', '2026-08-21 10:00:00.000', 'Null Flags',
   NULL, x'7a', NULL, NULL, 1, 0, 0, NULL, NULL);
+
+-- Added after the inserts above, which are positional. 0 for every row: none
+-- of them is a live meeting still in progress.
+ALTER TABLE session ADD COLUMN isIncomingLiveStream BOOLEAN NOT NULL DEFAULT 0;
+
+-- Every session except bbbb2222 has its audio saved, so each one is gated
+-- only by the condition its comment names.
+INSERT INTO mediafile SELECT id, 'mergedMultitrack', 'saved.m4a' FROM session
+  WHERE id != x'bbbb2222';
 SQL
 }
 
@@ -1078,7 +1126,7 @@ expect_watch_rc "watch --list exits 0" 0 --list
 watch_reset
 expect_watch_out "ready session is detected" "aaaa1111" --dry-run
 expect_watch_out "system-audio duration satisfies the floor" "bbbb8888" --dry-run
-refute_watch_out "not-diarized session is not selected" "bbbb2222" --dry-run
+refute_watch_out "session with no saved audio is not selected" "bbbb2222" --dry-run
 refute_watch_out "failed transcription is not selected" "cccc3333" --dry-run
 refute_watch_out "retranscribing session is not selected" "dddd4444" --dry-run
 refute_watch_out "transient session is not selected" "eeee5555" --dry-run
@@ -1125,6 +1173,28 @@ if grep -qF "aaaa7777" <<<"$short_out"; then
 else
   fail "lowering HUDDLE_MIN_DURATION admits the short session"
 fi
+
+# --- live-captured meetings (MacWhisper since 2026-09-24) ---
+#
+# These are never marked diarized. Saved audio and the live flag gate them.
+sqlite3 "$WDB" <<'SQL'
+INSERT INTO recordedmeeting VALUES (x'81', 1500.0, 'rmLiveDone');
+INSERT INTO session VALUES (x'abcd1313', '2026-09-24 20:01:11.000', 'Live Finalized',
+  NULL, x'81', NULL, 1, 0, 0, 0, NULL, NULL, 0);
+INSERT INTO mediafile VALUES (x'abcd1313', 'mergedMultitrack', 'live.m4a');
+INSERT INTO recordedmeeting VALUES (x'82', 1500.0, 'rmLiveNow');
+INSERT INTO session VALUES (x'abcd1414', '2026-09-24 21:00:00.000', 'Live In Progress',
+  NULL, x'82', NULL, 1, 0, 0, 0, NULL, NULL, 1);
+INSERT INTO recordedmeeting VALUES (x'83', 1500.0, 'rmLiveNowAudio');
+INSERT INTO session VALUES (x'abcd1515', '2026-09-24 22:00:00.000', 'Live With Audio',
+  NULL, x'83', NULL, 1, 0, 0, 0, NULL, NULL, 1);
+INSERT INTO mediafile VALUES (x'abcd1515', 'mergedMultitrack', 'live2.m4a');
+SQL
+expect_watch_out "finalized live meeting without diarization is selected" "abcd1313" --dry-run
+refute_watch_out "live meeting in progress is not selected" "abcd1414" --dry-run
+refute_watch_out "live flag alone excludes a session that has audio" "abcd1515" --dry-run
+expect_watch_out "--list shows the live and audio columns" "LIV AUD" --list
+build_watch_db
 
 # --- --dry-run mutates nothing ---
 
@@ -1207,9 +1277,9 @@ expect_watch_out "--list marks a seeded session as seen" "seen" --list
 
 # --- a newly-ready session is detected and transcribed ---
 
-# Flip the not-diarized session to ready: this is exactly what MacWhisper
-# does when diarization finishes, and it is the event the watcher exists for.
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
+# Give the no-audio session its audio row, as MacWhisper does when it
+# finalizes a meeting. This is the event the watcher exists for.
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
 expect_watch_rc "newly-ready session transcribes" 0 --once
 exists "newly-ready session invoked huddle-transcribe" "$CALLS"
 if [[ -f "$CALLS" ]] && grep -q 'bbbb2222' "$CALLS"; then
@@ -1245,6 +1315,43 @@ else
   fail "only the newly-ready session was transcribed" "$call_count calls"
 fi
 expect_watch_rc "run after success exits 0 with nothing pending" 0 --once
+if [[ -f "$CALLS" ]] && grep -q -- '--skip-existing' "$CALLS"; then
+  pass "--skip-existing is passed so finished sessions are not redone"
+else
+  fail "--skip-existing is passed so finished sessions are not redone"
+fi
+
+# --- a session that already has a transcript is recorded, not redone ---
+
+# Sessions done by hand or by --all are not in the state file. The watcher
+# must mark them done and post no notification.
+build_watch_db
+watch_reset
+watch --once >/dev/null 2>&1 || true
+notify_reset
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
+rc=0
+ALREADY_TRANSCRIBED=1 watch --once >/dev/null 2>&1 || rc=$?
+if [[ $rc -eq 0 ]]; then pass "already-transcribed session exits 0"; else fail "already-transcribed session exits 0" "exit $rc"; fi
+if grep -q '^bbbb2222 done$' "$WSTATE"; then
+  pass "already-transcribed session is marked done"
+else
+  diag=$(dump "$WSTATE")
+  fail "already-transcribed session is marked done" "$diag"
+fi
+if grep -qF 'SKIP bbbb2222' "$WLOG" 2>/dev/null; then
+  pass "already-transcribed session is logged as SKIP"
+else
+  diag=$(dump "$WLOG")
+  fail "already-transcribed session is logged as SKIP" "$diag"
+fi
+absent "already-transcribed session posts no notification" "$NOTIFYLOG"
+rm -f "$CALLS"
+expect_watch_rc "run after a skip exits 0" 0 --once
+absent "a skipped session is not queued again" "$CALLS"
+build_watch_db
+watch_reset
+watch --once >/dev/null 2>&1 || true
 
 # --- attempt cap ---
 
@@ -1302,7 +1409,7 @@ absent "a capped session invokes nothing further" "$CALLS"
 # failure does not permanently consume the session's budget.
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'dddd4444'; UPDATE session SET isBeingRetranscribed = 0 WHERE id = x'dddd4444';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'dddd4444', 'mergedMultitrack', 'saved.m4a'); UPDATE session SET isBeingRetranscribed = 0 WHERE id = x'dddd4444';"
 watch_failing --once >/dev/null 2>&1 || true
 if grep -q '^dddd4444 1$' "$WSTATE"; then
   pass "transient failure records an attempt"
@@ -1322,7 +1429,7 @@ fi
 
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'eeee5555'; UPDATE session SET isTransient = 0 WHERE id = x'eeee5555';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'eeee5555', 'mergedMultitrack', 'saved.m4a'); UPDATE session SET isTransient = 0 WHERE id = x'eeee5555';"
 rm -f "$CALLS"
 # Hold the lock as a live process would: a directory with our own pid, which
 # is alive by definition, so the watcher must decline rather than reclaim.
@@ -1343,7 +1450,7 @@ absent "the lock is released after the run" "$WSTATE.lock"
 
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'ffff6666'; UPDATE session SET dateDeleted = NULL WHERE id = x'ffff6666';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'ffff6666', 'mergedMultitrack', 'saved.m4a'); UPDATE session SET dateDeleted = NULL WHERE id = x'ffff6666';"
 watch --once >/dev/null 2>&1 || true
 exists "a run writes the log file" "$WLOG"
 if grep -qF "ffff6666" "$WLOG"; then
@@ -1357,7 +1464,7 @@ fi
 # than appended to forever.
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'aaaa7777';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'aaaa7777', 'mergedMultitrack', 'saved.m4a');"
 head -c 2000000 /dev/zero | tr '\0' 'x' >"$WLOG"
 env HUDDLE_DB="$WDB" HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe" \
   HUDDLE_STATE_FILE="$WSTATE" HUDDLE_LOG_FILE="$WLOG" HUDDLE_MIN_DURATION=30 \
@@ -1409,7 +1516,7 @@ fi
 build_watch_db
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
 nobin_rc=0
 env HUDDLE_DB="$WDB" HUDDLE_TRANSCRIBE_BIN="$WORK/no-such-bin" \
   HUDDLE_STATE_FILE="$WSTATE" HUDDLE_LOG_FILE="$WLOG" \
@@ -1524,7 +1631,7 @@ fi
 build_watch_db
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
 # Replace the record with a partial write: an id-only line with no status.
 printf 'bbbb2222\n' >"$WSTATE"
 rm -f "$CALLS"
@@ -1546,7 +1653,7 @@ fi
 # returns false on an unterminated line, which used to discard that record.
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
 printf 'bbbb2222 done' >"$WSTATE" # deliberately no trailing newline
 rm -f "$CALLS"
 watch --once >/dev/null 2>&1 || true
@@ -1561,7 +1668,7 @@ fi
 # not re-transcribe its whole backlog after the sentinel change.
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
 printf 'bbbb2222 0\n' >"$WSTATE"
 rm -f "$CALLS"
 watch --once >/dev/null 2>&1 || true
@@ -1682,7 +1789,7 @@ fi
 build_watch_db
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
 rm -f "$CALLS"
 rm -rf "$WSTATE.lock"
 mkdir -p "$WSTATE.lock" # no pid, no born: mid-claim
@@ -1735,7 +1842,7 @@ chmod +x "$SQLSHIM/sqlite3"
 REAL_SQLITE3=$(command -v sqlite3)
 export REAL_SQLITE3
 rm -f "$CALLS"
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
 : >"$WSTATE" # first-run seeding path, so the rows are only parsed
 stderr_probe_out=$(env PATH="$SQLSHIM:$PATH" HUDDLE_DB="$WDB" \
   HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe" \
@@ -1769,7 +1876,7 @@ unset REAL_SQLITE3
 build_watch_db
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
 watch --once >/dev/null 2>&1 || true
 if [[ -f "$WLOG" ]]; then
   # GNU stat must be tried first. Its -f means --file-system, so BSD's
@@ -1996,7 +2103,7 @@ fi
 # the pre-existing size let one run overshoot the cap by its whole output.
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'cccc3333'; UPDATE session SET transcriptionDidSucceed = 1 WHERE id = x'cccc3333';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'cccc3333', 'mergedMultitrack', 'saved.m4a'); UPDATE session SET transcriptionDidSucceed = 1 WHERE id = x'cccc3333';"
 # A stub whose output alone exceeds LOG_MAX_BYTES.
 cat >"$WBIN/huddle-transcribe-big" <<'STUB'
 #!/usr/bin/env bash
@@ -2087,7 +2194,7 @@ fi
 build_watch_db
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
 # Every OTHER ready session must be marked done as well, or it would be
 # transcribed here and create $CALLS for a reason unrelated to the cap.
 printf 'aaaa1111 done\nbbbb8888 done\nbbbb2222 3\n' >"$WSTATE"
@@ -2153,7 +2260,7 @@ fi
 build_watch_db
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
 notify_reset
 watch --once >/dev/null 2>&1 || true
 if [[ -f "$NOTIFYLOG" ]]; then
@@ -2180,7 +2287,7 @@ fi
 # HUDDLE_NO_NOTIFY suppresses entirely, checked before the command -v probe.
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'cccc3333'; UPDATE session SET transcriptionDidSucceed = 1 WHERE id = x'cccc3333';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'cccc3333', 'mergedMultitrack', 'saved.m4a'); UPDATE session SET transcriptionDidSucceed = 1 WHERE id = x'cccc3333';"
 notify_reset
 env HUDDLE_NO_NOTIFY=1 HUDDLE_DB="$WDB" \
   HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe" \
@@ -2193,7 +2300,7 @@ absent "HUDDLE_NO_NOTIFY suppresses notifications" "$NOTIFYLOG"
 build_watch_db
 watch_reset
 watch --once >/dev/null 2>&1 || true
-sqlite3 "$WDB" "UPDATE session SET hasBeenDiarized = 1 WHERE id = x'bbbb2222';"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
 notify_reset
 for _attempt in 1 2 3; do
   watch_failing --once >/dev/null 2>&1 || true
@@ -2229,7 +2336,8 @@ fi
 # that puts an untrusted title into the AppleScript.
 build_watch_db
 sqlite3 "$WDB" "INSERT INTO recordedmeeting VALUES (x'8f', 900.0, 'rmHostileTitle');"
-sqlite3 "$WDB" "INSERT INTO session VALUES (x'beef7777', '2026-08-17 10:00:00.000', 'x\" & (do shell script \"touch $WORK/APPLEPWNED\") & \"y back\\slash', NULL, x'8f', NULL, 1, 1, 0, 0, NULL, NULL);"
+sqlite3 "$WDB" "INSERT INTO session VALUES (x'beef7777', '2026-08-17 10:00:00.000', 'x\" & (do shell script \"touch $WORK/APPLEPWNED\") & \"y back\\slash', NULL, x'8f', NULL, 1, 1, 0, 0, NULL, NULL, 0);"
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'beef7777', 'mergedMultitrack', 'saved.m4a');"
 # A stub that succeeds but prints nothing, forcing the title-fallback path.
 cat >"$WBIN/huddle-transcribe-silent" <<'STUB'
 #!/usr/bin/env bash

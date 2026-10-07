@@ -72,6 +72,8 @@ be combined with `--mark-reviewed`, which stays one session at a time.
                          yet, oldest first, after one confirmation
 --mark-reviewed          Set reviewed=true and remove the source .m4a for the
                          selected session
+--skip-existing          Exit 0 without transcribing when the session already
+                         has a sidecar (huddle-watch passes this)
 --yes                    Skip confirmation prompt
 --output-dir PATH        Override the configured output directory
 -h, --help               Show usage
@@ -116,7 +118,7 @@ The trigger is MacWhisper's database, not the auto-export folder. Watching the
 database is better on three counts:
 
 - **It fires earlier.** The database records completion the moment
-  transcription and diarization finish; an export file appears later.
+  MacWhisper saves the meeting's audio; an export file appears later.
 - **It carries the session id.** The watcher passes that id to
   `huddle-transcribe` explicitly and never uses `latest`, so two meetings that
   finish within moments of each other cannot race — each is transcribed as
@@ -138,12 +140,19 @@ file open — is retried briefly and then left for the next event.
 A session is transcribed when all of the following hold:
 
 - MacWhisper reports the transcription succeeded;
-- speaker diarization has finished;
+- it is not a live meeting still being captured;
+- MacWhisper has saved its audio file (the row `mw` is handed);
 - the session is not being re-transcribed (the row is still settling);
 - it is not a transient scratch row;
 - it has not been deleted;
 - its duration is over 5 minutes, the same floor `huddle-transcribe` applies;
 - and its session id is not already recorded in the state file.
+
+The watcher no longer waits for speaker diarization. Since 2026-09-24
+MacWhisper transcribes meetings live and never marks them diarized, so that
+condition silently stopped every transcription. `huddle-transcribe` is run
+with `--skip-existing`, so a session that already has a transcript (made by
+hand or by `--all`) is recorded as done without running `mw` again.
 
 Duration is read from the recorded meeting or the system-audio recording,
 whichever MacWhisper populated for that capture method. That chain matches
@@ -234,7 +243,7 @@ huddle-watch --dry-run    # report what WOULD be transcribed; writes no state
                           # file and runs nothing
 ```
 
-`--list` prints one column per condition (`OK`, `DIA`, `RTX`, `TRA`, `DEL`),
+`--list` prints one column per condition (`OK`, `LIV`, `AUD`, `RTX`, `TRA`, `DEL`),
 so a session that is not being picked up shows exactly which condition it
 fails. `--dry-run` mutates nothing at all — not the state file, not even its
 parent directory.

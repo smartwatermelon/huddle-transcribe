@@ -335,14 +335,30 @@ sql() {
 }
 
 # The readiness predicate. A session is ready to transcribe when MacWhisper
-# has finished BOTH the recording and the diarized transcription:
+# has finished the recording and saved its audio:
 #
 #   transcriptionDidSucceed = 1   transcription completed successfully
-#   hasBeenDiarized = 1           speaker separation completed
+#   isIncomingLiveStream = 0      not a live meeting still in progress
+#   audio mediafile row exists    the file huddle-transcribe will hand to mw
 #   isBeingRetranscribed = 0      not mid-rerun; the row is still settling
 #   isTransient = 0               a real saved session, not a scratch row
 #   dateDeleted IS NULL           not deleted by the user
 #   duration > MIN_DURATION       same floor huddle-transcribe applies
+#
+# This used to require hasBeenDiarized = 1, and that silently stopped the
+# watcher on 2026-09-24. From that evening MacWhisper transcribes meetings
+# live: the session row is created when recording STARTS, modelEngine is
+# empty, and hasBeenDiarized stays 0 forever, so no session has matched since.
+# The audio row is the gate instead. On every live-captured session so far the
+# merged-audio mediafile row was inserted about a second after the session's
+# final dateUpdated -- it is written when MacWhisper finalizes the meeting --
+# and it is what mw needs anyway. isIncomingLiveStream is a second,
+# independent gate for a meeting still being captured; MacWhisper's own
+# spotlight trigger watches that column, so it does change during a session.
+#
+# The three audio types must match the ones huddle-transcribe resolves a
+# source from (merged multitrack, app audio, mic audio). A session admitted
+# here with none of those has no audio for the parent to transcribe.
 #
 # Duration is a COALESCE chain across recordedmeeting/systemaudiorecording
 # because MacWhisper populates a different table depending on how the
@@ -361,7 +377,9 @@ sql() {
 #   session_id, dateCreated, duration, title
 READY_WHERE="
   s.transcriptionDidSucceed = 1
-  AND s.hasBeenDiarized = 1
+  AND s.isIncomingLiveStream = 0
+  AND EXISTS (SELECT 1 FROM mediafile m WHERE m.sessionID = s.id
+    AND m.type IN ('mergedMultitrack', 'meetingAppAudio', 'meetingMicAudio'))
   AND s.isBeingRetranscribed = 0
   AND s.isTransient = 0
   AND s.dateDeleted IS NULL
@@ -941,16 +959,22 @@ if [[ $LIST -eq 1 ]]; then
   # computed from the same number the predicate filters on. A session whose
   # duration lives only in s.playbackDuration therefore shows 0m00s and
   # READY=no, which is the truth: huddle-transcribe cannot resolve it either.
+  # READY itself is READY_WHERE evaluated in SQL, so it cannot drift from the
+  # predicate the way a second copy of the logic in bash once could.
   LIST_QUERY="
 SELECT
   lower(hex(s.id)),
   s.dateCreated,
   COALESCE(rm.duration, sar.duration, 0),
   COALESCE(s.transcriptionDidSucceed, 0),
-  s.hasBeenDiarized,
+  s.isIncomingLiveStream,
+  CASE WHEN EXISTS (SELECT 1 FROM mediafile m WHERE m.sessionID = s.id
+    AND m.type IN ('mergedMultitrack', 'meetingAppAudio', 'meetingMicAudio'))
+    THEN 1 ELSE 0 END,
   s.isBeingRetranscribed,
   s.isTransient,
   CASE WHEN s.dateDeleted IS NULL THEN 0 ELSE 1 END,
+  CASE WHEN $READY_WHERE THEN 1 ELSE 0 END,
   replace(replace(replace(
     COALESCE(s.userChosenTitle, s.aiTitle, rm.title, sar.title, 'Untitled'),
     char(9), ' '), char(10), ' '), char(13), ' ')
@@ -968,25 +992,23 @@ LIMIT 10
     echo "No sessions found in $DB." >&2
     exit 1
   fi
-  printf '%-8s  %-19s  %-8s  %-3s %-3s %-3s %-3s %-3s  %-5s  %s\n' \
-    "SESSION" "DATE" "DURATION" "OK" "DIA" "RTX" "TRA" "DEL" "READY" "TITLE"
-  while IFS="$SEP" read -r sid date dur ok dia rtx tra del title; do
+  printf '%-8s  %-19s  %-8s  %-3s %-3s %-3s %-3s %-3s %-3s  %-5s  %s\n' \
+    "SESSION" "DATE" "DURATION" "OK" "LIV" "AUD" "RTX" "TRA" "DEL" "READY" "TITLE"
+  while IFS="$SEP" read -r sid date dur ok liv aud rtx tra del is_ready title; do
     ready="no"
-    dur_int="${dur%.*}"
-    [[ "$dur_int" =~ ^[0-9]+$ ]] || dur_int=0
-    if [[ "$ok" == "1" && "$dia" == "1" && "$rtx" == "0" && "$tra" == "0" && "$del" == "0" ]] &&
-      ((dur_int > MIN_DURATION_SECONDS)); then
+    if [[ "$is_ready" == "1" ]]; then
       ready="yes"
       state_is_done "$sid" && ready="seen"
     fi
     pretty_dur=$(fmt_duration "$dur")
-    printf '%-8s  %-19s  %-8s  %-3s %-3s %-3s %-3s %-3s  %-5s  %s\n' \
+    printf '%-8s  %-19s  %-8s  %-3s %-3s %-3s %-3s %-3s %-3s  %-5s  %s\n' \
       "${sid:0:8}" "${date%.*}" "$pretty_dur" \
-      "$ok" "$dia" "$rtx" "$tra" "$del" "$ready" "$title"
+      "$ok" "$liv" "$aud" "$rtx" "$tra" "$del" "$ready" "$title"
   done <<<"$rows"
   echo
-  echo "OK=transcriptionDidSucceed  DIA=hasBeenDiarized  RTX=isBeingRetranscribed"
-  echo "TRA=isTransient  DEL=dateDeleted set  READY=matches the readiness predicate"
+  echo "OK=transcriptionDidSucceed  LIV=isIncomingLiveStream (live meeting in progress)"
+  echo "AUD=audio file saved  RTX=isBeingRetranscribed  TRA=isTransient  DEL=dateDeleted set"
+  echo "READY=matches the readiness predicate"
   echo "(READY=seen means already transcribed or given up on, per $STATE_FILE)"
   exit 0
 fi
@@ -1127,8 +1149,15 @@ for entry in "${PENDING[@]}"; do
   # The session id is passed EXPLICITLY, never `latest`. Two meetings that
   # finish close together would otherwise race: whichever run gets there
   # second re-transcribes the newer session and never touches the older one.
+  #
+  # --skip-existing makes the child exit 0 without running mw when the session
+  # already has a sidecar. The state file and the sidecars are two records of
+  # the same fact, and they drift: sessions transcribed by hand or by --all
+  # never reach this file, and re-running them here would overwrite their
+  # transcripts and, where --mark-reviewed has removed the audio, fail to the
+  # attempt cap and report "Transcription FAILED" for finished work.
   run_rc=0
-  run_out=$("$TRANSCRIBE_BIN" "$sid" --yes 2>&1) || run_rc=$?
+  run_out=$("$TRANSCRIBE_BIN" "$sid" --yes --skip-existing 2>&1) || run_rc=$?
 
   # Log the child's combined output regardless of outcome; it is the only
   # record of what happened inside a launchd-driven run.
@@ -1143,7 +1172,17 @@ for entry in "${PENDING[@]}"; do
     fi
   fi
 
-  if [[ $run_rc -eq 0 ]]; then
+  if [[ $run_rc -eq 0 ]] && grep -q '^Already transcribed: ' <<<"$run_out"; then
+    # Finished work, not new work: record it so it is never queued again, and
+    # stay quiet -- a "Transcript ready" alert here would announce nothing new.
+    if ! state_set "$sid" "$STATE_DONE"; then
+      log_to_file "ERROR could not record ${sid:0:8} as done in $STATE_FILE"
+      echo "Error: could not update $STATE_FILE for ${sid:0:8}." >&2
+      overall_rc=1
+    fi
+    log_to_file "SKIP ${sid:0:8} already has a transcript"
+    echo "Skipped ${sid:0:8}: already transcribed"
+  elif [[ $run_rc -eq 0 ]]; then
     # Exit status is the authoritative success signal. The transcript path is
     # parsed from the success line only to name the file in the notification;
     # a missing line degrades the message, not the outcome.
