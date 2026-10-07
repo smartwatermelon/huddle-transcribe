@@ -56,11 +56,20 @@ huddle-transcribe [OPTIONS] [SESSION_ID_OR_DATE]
 Set `HUDDLE_MIN_DURATION` (whole seconds; anything else is rejected, because
 it is interpolated into SQL) to move that floor.
 
+`--all` takes no `SESSION_ID_OR_DATE`. It applies the same floor, skips
+sessions deleted inside MacWhisper, and treats a session as transcribed when
+its `.meta.json` sidecar exists in the output directory. Each session runs as
+its own `huddle-transcribe <session-id> --yes`; one failure does not stop the
+rest, and the run exits non-zero naming every session that failed. It cannot
+be combined with `--mark-reviewed`, which stays one session at a time.
+
 ### Options
 
 ```
 --dry-run                Show which session would be selected; changes nothing
 --list                   List recent qualifying MacWhisper sessions with metadata
+--all                    Transcribe every qualifying session with no transcript
+                         yet, oldest first, after one confirmation
 --mark-reviewed          Set reviewed=true and remove the source .m4a for the
                          selected session
 --yes                    Skip confirmation prompt
@@ -82,6 +91,10 @@ huddle-transcribe 2026-08-27
 
 # List recent sessions
 huddle-transcribe --list
+
+# See which sessions have no transcript yet, then transcribe them all
+huddle-transcribe --all --dry-run
+huddle-transcribe --all
 
 # Confirm what --mark-reviewed would act on, without touching anything
 huddle-transcribe --dry-run --mark-reviewed 2026-08-27

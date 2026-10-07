@@ -57,6 +57,7 @@ fi
 DRY_RUN=0
 LIST=0
 MARK_REVIEWED=0
+ALL=0
 ASSUME_YES=0
 TARGET=""
 
@@ -70,6 +71,9 @@ Arguments:
 Options:
   --dry-run             Show which session would be selected; changes nothing
   --list                List recent MacWhisper sessions (last 10) with metadata
+  --all                 Transcribe every qualifying session that has no
+                        sidecar in the output dir yet, oldest first, after
+                        one confirmation (or none with --yes)
   --mark-reviewed       Set reviewed=true and remove the source .m4a for
                         SESSION_ID_OR_DATE (moved to Trash where trash(1) is
                         available, otherwise deleted outright)
@@ -91,6 +95,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mark-reviewed)
       MARK_REVIEWED=1
+      shift
+      ;;
+    --all)
+      ALL=1
       shift
       ;;
     --yes)
@@ -132,6 +140,24 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ $ALL -eq 1 ]]; then
+  if [[ -n "$TARGET" ]]; then
+    echo "Error: --all selects its own sessions; drop '$TARGET' or drop --all." >&2
+    exit 1
+  fi
+  # The destructive path stays one session at a time: each of its guards
+  # exists to stop it acting on the wrong session, and a batch is exactly the
+  # setting where that mistake would repeat.
+  if [[ $MARK_REVIEWED -eq 1 ]]; then
+    echo "Error: --all cannot be combined with --mark-reviewed." >&2
+    exit 1
+  fi
+  if [[ $LIST -eq 1 ]]; then
+    echo "Error: --all cannot be combined with --list." >&2
+    exit 1
+  fi
+fi
 
 for dep in sqlite3 jq; do
   if ! command -v "$dep" >/dev/null 2>&1; then
@@ -202,6 +228,14 @@ ORDER BY s.dateCreated DESC
 # duration heuristic applies (a real 4m14s huddle was unreachable, #37).
 SESSION_QUERY_ANY="$SESSION_SELECT
 ORDER BY s.dateCreated DESC
+"
+# Used by --all: the same floor as `latest`, minus sessions deleted inside
+# MacWhisper (whose audio is usually gone too), oldest first so a batch
+# reads in the order the meetings happened.
+SESSION_QUERY_PENDING="$SESSION_SELECT
+WHERE COALESCE(rm.duration, sar.duration, 0) > $MIN_DURATION_SECONDS
+  AND s.dateDeleted IS NULL
+ORDER BY s.dateCreated ASC
 "
 
 slugify() {
@@ -343,6 +377,69 @@ if [[ $LIST -eq 1 ]]; then
     pretty_dur=$(fmt_duration "$dur")
     printf "%-8s  %-19s  %-8s  %s\n" "${sid:0:8}" "${date%.*}" "$pretty_dur" "$title"
   done <<<"$rows"
+  exit 0
+fi
+
+# --- --all ---
+# "Not yet transcribed" means no sidecar for the session in OUTPUT_DIR, found
+# by the same id-suffix glob --mark-reviewed uses -- the sidecar is the state,
+# and a title that changed since transcription must not make a session look
+# pending again. Each session is then transcribed by a child invocation of
+# this same script with an explicit id, so the batch reuses the single-session
+# path, guards and all, rather than duplicating it.
+if [[ $ALL -eq 1 ]]; then
+  if ! all_rows=$(sql "$SESSION_QUERY_PENDING"); then
+    echo "Error: failed to query MacWhisper database at $DB" >&2
+    exit 1
+  fi
+  pending=()
+  if [[ -n "$all_rows" ]]; then
+    while IFS="$SEP" read -r sid date dur _merged _app _mic title; do
+      shopt -s nullglob
+      id_matches=("$OUTPUT_DIR"/*_"${sid:0:8}".meta.json)
+      shopt -u nullglob
+      [[ ${#id_matches[@]} -eq 0 ]] || continue
+      if [[ ${#pending[@]} -eq 0 ]]; then
+        printf "%-8s  %-19s  %-8s  %s\n" "SESSION" "DATE" "DURATION" "TITLE"
+      fi
+      pending+=("$sid")
+      pretty_dur=$(fmt_duration "$dur")
+      printf "%-8s  %-19s  %-8s  %s\n" "${sid:0:8}" "${date%.*}" "$pretty_dur" "$title"
+    done <<<"$all_rows"
+  fi
+  if [[ ${#pending[@]} -eq 0 ]]; then
+    echo "Nothing to transcribe: every qualifying session (duration > ${MIN_DURATION_SECONDS}s) has a sidecar in $OUTPUT_DIR."
+    exit 0
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "(dry run — would transcribe ${#pending[@]} session(s))"
+    exit 0
+  fi
+  if [[ $ASSUME_YES -ne 1 ]]; then
+    read -r -p "Transcribe these ${#pending[@]} session(s)? [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || {
+      echo "Aborted."
+      exit 1
+    }
+  fi
+  # One failure does not stop the batch: the remaining sessions are
+  # independent, and the summary names every failure so none is lost.
+  failed=()
+  n=0
+  for sid in "${pending[@]}"; do
+    n=$((n + 1))
+    echo
+    echo "[$n/${#pending[@]}] ${sid:0:8}"
+    if ! "${BASH_SOURCE[0]}" --yes --output-dir "$OUTPUT_DIR" "$sid"; then
+      failed+=("${sid:0:8}")
+    fi
+  done
+  echo
+  echo "Transcribed $((${#pending[@]} - ${#failed[@]})) of ${#pending[@]} session(s)."
+  if [[ ${#failed[@]} -gt 0 ]]; then
+    echo "Failed: ${failed[*]}" >&2
+    exit 1
+  fi
   exit 0
 fi
 

@@ -22,7 +22,7 @@ a README, a LICENSE, and the CI workflows.
 ## Commands
 
 ```bash
-./tests/run-tests.sh                          # 318 behavioral tests (some skip off macOS)
+./tests/run-tests.sh                          # 360 behavioral tests (some skip off macOS)
 shellcheck -S info huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -w huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
@@ -102,8 +102,8 @@ SQLite → select one session → resolve its audio file → confirm → shell o
 **`SESSION_QUERY` is the spine.** One SQL string defines a fixed 7-column
 row: `session_id, dateCreated, duration, merged_filename,
 app_audio_filename, mic_audio_filename, title`. Every selection path
-(`--list`, latest, by-date, by-id) runs that same query, and all three
-consumers read it with `IFS="$SEP" read -r`. Changing the SELECT list means
+(`--list`, latest, by-date, by-id, `--all`) runs that same SELECT, and
+every consumer reads it with `IFS="$SEP" read -r`. Changing the SELECT list means
 updating every one of those readers.
 
 Two properties of that row are load-bearing and easy to undo by accident:
