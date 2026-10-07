@@ -22,7 +22,7 @@ a README, a LICENSE, and the CI workflows.
 ## Commands
 
 ```bash
-./tests/run-tests.sh                          # 382 behavioral tests (some skip off macOS)
+./tests/run-tests.sh                          # 386 behavioral tests (some skip off macOS)
 shellcheck -S info huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -w huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
@@ -313,8 +313,8 @@ keeps the state file and the sidecars from disagreeing: sessions done by hand
 or by `--all` would otherwise be re-run through `mw`, and those with trashed
 audio would fail to the attempt cap.
 
-`huddle-mic-guard` still reads `recordedmeeting.dateCreated` as the moment
-capture stopped. For live sessions that column is the start. Not fixed here.
+`huddle-mic-guard` takes its stop signal from the same audio row; see its
+section below.
 
 ### huddle-watch state
 
@@ -453,12 +453,16 @@ facts are load-bearing, each verified against the 2026-09-24 overrun:
 - **MacWhisper's own mic `no` is not "recording stopped".** That day its
   Bluetooth mic died at 08:15:50, it reported `running: no`, and it kept
   recording on a fallback mic until 08:41:16. Never use it as the stop signal.
-- **The stop signal is `recordedmeeting.dateCreated`** (and
-  `systemaudiorecording.dateCreated`): 15:41:16.343 UTC = 08:41:16 PDT, the
-  moment capture stopped. `session.dateCreated` lags it by the transcription
-  time (15:43:45 that day) and must not be used here. The guard compares
-  against MacWhisper's own `yes`, not Slack's release, so stopping MacWhisper
-  a moment before leaving the huddle does not alert.
+- **The stop signal is a saved audio `mediafile` row** (the three types
+  huddle-watch gates on) dated after MacWhisper's own `yes`. It used to be
+  `recordedmeeting.dateCreated`, which on 2026-09-24 was the stop time. Since
+  MacWhisper began capturing live that evening, it is the START time, which
+  can precede the `yes`: saved meetings stopped counting, and Oct 5 and 7
+  each got two false alerts after the save. The guard compares against
+  MacWhisper's `yes`, not Slack's release, so stopping MacWhisper a moment
+  before leaving the huddle does not alert. In the old capture mode the audio
+  row landed ~2.5 min after capture stopped, so a session captured that way
+  would alert during that gap.
 - **The session start is Slack's FIRST `yes`**, walking back to a `no` held
   for the settle time. Slack flaps for ~7 s at huddle start, past
   MacWhisper's own `yes`, so anchoring on the latest `yes` misses it.

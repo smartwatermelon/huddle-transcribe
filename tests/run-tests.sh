@@ -2463,11 +2463,12 @@ chmod +x "$WBIN/ps-stub"
 build_guard_db() {
   rm -f "$GDB"
   sqlite3 "$GDB" <<'SQL'
+CREATE TABLE session (id BLOB PRIMARY KEY, dateDeleted DOUBLE);
 CREATE TABLE recordedmeeting (id BLOB PRIMARY KEY, dateCreated TEXT NOT NULL, dateDeleted DOUBLE);
-CREATE TABLE systemaudiorecording (id BLOB PRIMARY KEY, dateCreated TEXT NOT NULL, dateDeleted DOUBLE);
--- Yesterday's recording: finished long before this huddle started, so it
--- must not count as this huddle's recording having stopped.
-INSERT INTO recordedmeeting VALUES (X'01', '2026-09-23 15:58:23.051', NULL);
+CREATE TABLE mediafile (sessionID BLOB, type TEXT NOT NULL, dateCreated TEXT NOT NULL);
+-- Yesterday's recording: saved long before this huddle started, so it must
+-- not count as this huddle's recording having stopped.
+INSERT INTO mediafile VALUES (X'01', 'mergedMultitrack', '2026-09-23 15:58:23.051');
 SQL
 }
 
@@ -2646,7 +2647,7 @@ expect_guard "no alert beyond MAX_ALERTS" quiet 976
 # --- the recording stopped normally ---
 
 guard_reset
-sqlite3 "$GDB" "INSERT INTO recordedmeeting VALUES (X'02', '2026-09-24 15:16:00.100', NULL);"
+sqlite3 "$GDB" "INSERT INTO mediafile VALUES (X'02', 'mergedMultitrack', '2026-09-24 15:16:00.100');"
 expect_guard "a recording saved 46 s after the huddle ended suppresses the alert" quiet 120
 absent "a suppressed huddle writes no state" "$GSTATE"
 
@@ -2654,18 +2655,41 @@ absent "a suppressed huddle writes no state" "$GSTATE"
 # BEFORE Slack's release. It is still after MacWhisper's own start, so it
 # still proves the recording stopped.
 guard_reset
-sqlite3 "$GDB" "INSERT INTO recordedmeeting VALUES (X'02', '2026-09-24 15:15:05.000', NULL);"
+sqlite3 "$GDB" "INSERT INTO mediafile VALUES (X'02', 'mergedMultitrack', '2026-09-24 15:15:05.000');"
 expect_guard "a recording saved just before Slack released the mic suppresses the alert" quiet 120
 
-# systemaudiorecording is MacWhisper's other capture path.
-guard_reset
-sqlite3 "$GDB" "INSERT INTO systemaudiorecording VALUES (X'03', '2026-09-24 15:16:00.100', NULL);"
-expect_guard "a systemaudiorecording row also suppresses the alert" quiet 120
+# App-only and mic-only audio are saves too.
+for mtype in meetingAppAudio meetingMicAudio; do
+  guard_reset
+  sqlite3 "$GDB" "INSERT INTO mediafile VALUES (X'03', '$mtype', '2026-09-24 15:16:00.100');"
+  expect_guard "a $mtype row also suppresses the alert" quiet 120
+done
 
-# A row that was saved and then deleted still proves capture stopped.
+# A recording saved and then deleted still proves capture stopped.
+# Deletion is soft: dateDeleted is set and the mediafile row stays.
 guard_reset
-sqlite3 "$GDB" "INSERT INTO recordedmeeting VALUES (X'02', '2026-09-24 15:16:00.100', 1790263000);"
+sqlite3 "$GDB" "INSERT INTO session VALUES (X'02', 1790263000);
+  INSERT INTO recordedmeeting VALUES (X'02', '2026-09-24 15:01:03.000', 1790263000);
+  INSERT INTO mediafile VALUES (X'02', 'mergedMultitrack', '2026-09-24 15:16:00.100');"
 expect_guard "a saved-then-deleted recording still suppresses the alert" quiet 120
+
+# A per-track file is not the finished meeting.
+guard_reset
+sqlite3 "$GDB" "INSERT INTO mediafile VALUES (X'03', 'multitrackItem', '2026-09-24 15:16:00.100');"
+expect_guard "a multitrackItem row does not suppress the alert" alert 120
+
+# Live capture dates the meeting row at its start, before MacWhisper's
+# `yes`. Only its saved audio row counts.
+guard_reset
+sqlite3 "$GDB" "INSERT INTO recordedmeeting VALUES (X'04', '2026-09-24 15:01:03.000', NULL);
+  INSERT INTO mediafile VALUES (X'04', 'mergedMultitrack', '2026-09-24 15:16:00.100');"
+expect_guard "a live-captured meeting saved after the huddle suppresses the alert" quiet 120
+
+# A meeting row dated after MacWhisper's `yes` but with no saved audio is a
+# meeting still being captured. It must not silence the alert.
+guard_reset
+sqlite3 "$GDB" "INSERT INTO recordedmeeting VALUES (X'05', '2026-09-24 15:01:25.000', NULL);"
+expect_guard "a meeting row with no saved audio does not suppress the alert" alert 120
 
 # --- the huddle has not ended ---
 
