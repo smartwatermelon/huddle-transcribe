@@ -57,6 +57,7 @@ fi
 DRY_RUN=0
 LIST=0
 MARK_REVIEWED=0
+SKIP_EXISTING=0
 ALL=0
 ASSUME_YES=0
 TARGET=""
@@ -77,6 +78,8 @@ Options:
   --mark-reviewed       Set reviewed=true and remove the source .m4a for
                         SESSION_ID_OR_DATE (moved to Trash where trash(1) is
                         available, otherwise deleted outright)
+  --skip-existing       Exit 0 without transcribing when the session
+                        already has a sidecar in the output dir
   --yes                 Skip confirmation prompt
   --output-dir PATH     Override default output dir
   -h, --help            Show this help
@@ -99,6 +102,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --all)
       ALL=1
+      shift
+      ;;
+    --skip-existing)
+      SKIP_EXISTING=1
       shift
       ;;
     --yes)
@@ -140,6 +147,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ $SKIP_EXISTING -eq 1 && $MARK_REVIEWED -eq 1 ]]; then
+  echo "Error: --skip-existing cannot be combined with --mark-reviewed." >&2
+  exit 1
+fi
 
 if [[ $ALL -eq 1 ]]; then
   if [[ -n "$TARGET" ]]; then
@@ -679,6 +691,24 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
       OUT_DOC="$OUTPUT_DIR/$meta_output_file"
     fi
   fi
+fi
+
+# --skip-existing: a session that already has its sidecar is done. Checked
+# before the source-audio test below, because a reviewed session's audio is
+# gone by design and must read as finished, not as an error. The same
+# id-suffix glob and session_id equality as --mark-reviewed, so a sidecar
+# that merely shares the 8-hex suffix does not count.
+if [[ $SKIP_EXISTING -eq 1 ]]; then
+  shopt -s nullglob
+  id_matches=("$OUTPUT_DIR"/*_"${SID:0:8}".meta.json)
+  shopt -u nullglob
+  for meta in "${id_matches[@]}"; do
+    meta_session_id=$(jq -r '.session_id // empty' "$meta" 2>/dev/null || true)
+    if [[ "$meta_session_id" == "$SID" ]]; then
+      echo "Already transcribed: $meta"
+      exit 0
+    fi
+  done
 fi
 
 echo "Session:  ${SID:0:8}"
