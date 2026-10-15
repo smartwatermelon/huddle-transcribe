@@ -43,6 +43,8 @@ DB="${HUDDLE_DB:-$HOME/Library/Application Support/MacWhisper/Database/main.sqli
 STATE_FILE="${HUDDLE_GUARD_STATE_FILE:-$HOME/.local/state/huddle-transcribe/mic-guard-state}"
 # Role cache for pids seen in coreaudiod's log; see resolve_role.
 PID_CACHE="${STATE_FILE}.pids"
+# The pid of the alert still on screen, if any; see raise_alert.
+ALERT_PID_FILE="${STATE_FILE}.alert.pid"
 LOG_FILE="${HUDDLE_GUARD_LOG_FILE:-$HOME/Library/Logs/huddle-transcribe-mic-guard.log}"
 # launchd's own stdout/stderr sink, kept apart from the self-rotated log for
 # the reason given in huddle-watch's write_plist.
@@ -242,13 +244,17 @@ log_to_file() {
 
 # --- the alert ---------------------------------------------------------
 
+# Escape for an AppleScript string literal: backslashes first, then quotes.
+as_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
 # A modal `display alert ... as critical`, not a notification: a banner can
-# be missed, which is the failure this script exists to cover. It is started
-# detached, in a double-forked subshell with its streams closed, so the run
-# does not block until someone dismisses it. Under launchd that alone is not
-# enough -- launchd kills the job's whole process group when the job exits --
-# so the plist sets AbandonProcessGroup; see write_plist.
-#
+# be missed, which is the failure this script exists to cover.
+
 # HUDDLE_NO_NOTIFY and HUDDLE_NOTIFY_BIN are the same switches huddle-watch
 # honors, so the test suite's global stub covers this script too.
 raise_alert() {
@@ -256,16 +262,39 @@ raise_alert() {
   [[ -z "${HUDDLE_NO_NOTIFY:-}" ]] || return 0
   local notify_bin="${HUDDLE_NOTIFY_BIN:-osascript}"
   command -v "$notify_bin" >/dev/null 2>&1 || return 0
-  # Escape for an AppleScript string literal: backslashes, then quotes.
-  local esc_msg="$message" esc_title="$title"
-  esc_msg="${esc_msg//\\/\\\\}"
-  esc_msg="${esc_msg//\"/\\\"}"
-  esc_title="${esc_title//\\/\\\\}"
-  esc_title="${esc_title//\"/\\\"}"
+  local esc_pid
+  esc_pid=$(as_escape "$ALERT_PID_FILE")
+
+  # A repeat replaces the alert still on screen rather than stacking on it,
+  # with the same pid check as huddle-watch's alert().
+
+  # The old pid is killed only if its command line names the notify bin and
+  # this pid file, so a reused pid is never killed.
+
+  # Plain ps, not PS_BIN: PS_BIN stands in for the comm= role lookup only.
+  local old_pid old_cmd
+  old_pid=$(cat "$ALERT_PID_FILE" 2>/dev/null || true)
+  if [[ "$old_pid" =~ ^[0-9]+$ ]] &&
+    old_cmd=$(ps -ww -o command= -p "$old_pid" 2>/dev/null) &&
+    [[ "$old_cmd" == *"$notify_bin"* && "$old_cmd" == *"$esc_pid"* ]]; then
+    kill "$old_pid" 2>/dev/null || true
+  fi
+
+  # Dismissal clears the pid file; a replaced alert is killed before it can.
+  local args=(-e "display alert \"$(as_escape "$title")\" message \"$(as_escape "$message")\" as critical")
+  args+=(-e "do shell script \"rm -f -- \" & quoted form of \"$esc_pid\"")
+
+  # Detached with streams closed, so the run never waits on it. set -m puts
+  # it in its own process group, which launchd spares at job exit.
+
+  # Benign race: an old alert's rm already running can delete the new pid
+  # file, so the next repeat stacks once instead of replacing.
   (
-    "$notify_bin" -e "display alert \"$esc_title\" message \"$esc_msg\" as critical" \
-      </dev/null >/dev/null 2>&1 &
-  )
+    set -m
+    "$notify_bin" "${args[@]}" </dev/null >/dev/null 2>&1 &
+    # A torn pid file reads as non-numeric, which only skips the replace.
+    printf '%s\n' "$!" >"$ALERT_PID_FILE"
+  ) 2>/dev/null || true
   return 0
 }
 
@@ -277,9 +306,6 @@ raise_alert() {
 #
 #   - No WatchPaths. The trigger is the passage of time after a huddle ends,
 #     not a database write, so the timer is the whole mechanism.
-#   - AbandonProcessGroup is true. launchd otherwise kills every process in
-#     the job's process group when the job exits, which would take the
-#     detached alert down with it the moment it appeared.
 #   - StartInterval defaults to 30 s. A run is one `log show` plus one
 #     SQLite query and exits in about a second, and every minute of delay is
 #     another minute of the room being recorded. launchd does not start a
@@ -312,7 +338,6 @@ write_plist() {
       ProgramArguments: [$interp, $prog, "--once"],
       StartInterval: $interval,
       RunAtLoad: true,
-      AbandonProcessGroup: true,
       StandardOutPath: $log,
       StandardErrorPath: $log
     }' >"$json_tmp"; then
@@ -389,7 +414,7 @@ do_status() {
   fi
   echo "Database:  $DB"
   if [[ -f "$PLIST" ]] && command -v plutil >/dev/null 2>&1; then
-    local plist_interp plist_interval plist_abandon
+    local plist_interp plist_interval
     plist_interp=$(plutil -extract ProgramArguments.0 raw -o - "$PLIST" 2>/dev/null || printf '')
     if [[ "$plist_interp" == *bash ]]; then
       echo "Interp:    $plist_interp"
@@ -403,11 +428,6 @@ do_status() {
     else
       echo "Poll:      (none -- the guard never runs on a timer)"
       echo "           Repair: $0 --install"
-    fi
-    plist_abandon=$(plutil -extract AbandonProcessGroup raw -o - "$PLIST" 2>/dev/null || printf '')
-    if [[ "$plist_abandon" != "true" ]]; then
-      echo "Alerts:    AbandonProcessGroup is not set; launchd may kill the alert"
-      echo "           as soon as it appears. Repair: $0 --install"
     fi
   fi
   if [[ -s "$STATE_FILE" ]]; then
@@ -665,38 +685,67 @@ macwhisper_alive "$mw_pid" || quiet_exit "MacWhisper (pid $mw_pid) is no longer 
 
 # --- has MacWhisper saved a recording since? ---------------------------
 
-# The proof that capture stopped is MacWhisper saving the meeting's audio: a
-# mediafile row of one of the three audio types huddle-transcribe and
-# huddle-watch use, created after MacWhisper's own mic `yes`. The row is
-# written when MacWhisper finalizes the meeting -- on every live-captured
-# session so far, about a second after the session's final dateUpdated.
-#
-# This used to read recordedmeeting.dateCreated (and systemaudiorecording's),
-# which until 2026-09-24 was the moment capture stopped. Since MacWhisper began
-# capturing meetings live that evening, it is the moment capture STARTED,
-# which can precede MacWhisper's mic `yes`. A saved meeting then never
-# counted, and every ended huddle alerted three times. Oct 5 and 7: the first
-# alert was right (still recording); the two after the save were false.
-# Reading the start time could also fail the other way -- a row written at the
-# start of a meeting and dated after the `yes` would silence the guard while
-# MacWhisper was still recording -- so recordedmeeting is not read at all.
-#
-# The comparison is against MacWhisper's `yes`, not Slack's release. Someone
-# who stops the recording and then leaves the huddle produces a row that
-# predates the release, and comparing against the release would alert on a
-# recording that had already stopped.
-#
-# Deleted sessions are deliberately NOT filtered: a recording saved and then
-# deleted still proves the capture stopped.
-#
-# The upper bound at NOW is a no-op in normal use (no row is written in the
-# future) and is what lets HUDDLE_GUARD_NOW replay a past day against a real
-# database that has since gained that day's row.
+# Capture has stopped once MacWhisper saves the meeting's audio: a
+# mediafile row of one of the three audio types huddle-watch gates on.
+
+# That row is written when MacWhisper finalizes the meeting: about 1 s after
+# the session's final dateUpdated, on every live session so far.
+
+# The save must belong to the recording begun at MacWhisper's last `yes`.
+# One huddle can be several recordings, so a save alone is not enough.
+
+# 2026-10-15: screen sharing split a huddle into 3 recordings. Piece 2 was
+# saved at 08:03:40, 1 s after piece 3 began with the 08:03:39 `yes`.
+
+# That save silenced the guard while piece 3 went on recording for ~6 min
+# after the huddle ended. No alert was raised.
+
+# So each save is tied to its recording: mediafile.recordedMeetingID for app
+# and mic audio, session.recordedMeetingID for the merged file.
+
+# That recording's recordedmeeting.date, when its capture started, must be
+# no earlier than the `yes` less START_TOLERANCE_SECONDS.
+
+# Before #49 the guard read recordedmeeting.dateCreated as the STOP time.
+# Since live capture began on 2026-09-24, that column is the START.
+
+# A start can precede the `yes`, so saved meetings stopped counting: Oct 5
+# and 7 each got two false alerts after the save.
+
+# A start dated after the `yes` would also have silenced the guard while it
+# was still recording. Here a start never counts by itself.
+
+# The start only says which recording a SAVE belongs to. A meeting row with
+# no saved audio still proves nothing.
+
+# A save linked to no recordedmeeting does not count. Every audio row in the
+# live database (2026-10-15) links to one.
+
+# That errs toward alerting: if MacWhisper ever stops linking rows, each
+# huddle alerts 3 times, which is noisy but not a silent miss.
+
+# The comparison is against MacWhisper's `yes`, not Slack's release.
+# Stopping MacWhisper and then leaving the huddle saves before the release.
+
+# Deleted sessions and meetings are deliberately NOT filtered: a recording
+# saved and then deleted still proves the capture stopped.
+
+# The upper bound at NOW is a no-op in normal use. It lets HUDDLE_GUARD_NOW
+# replay a past day against a database that has since saved it.
+
+# The tolerance: recordedmeeting.date trailed its `yes` by 0.26-0.34 s on
+# 2026-10-14 and 15, and both are cut to whole seconds.
+
+# It must stay below the gap from one piece's start to the next `yes`, 46 s
+# at the shortest on 2026-10-15. 10 s has margin both ways.
+START_TOLERANCE_SECONDS=10
 FINISHED_QUERY="
-SELECT count(*) FROM mediafile
-WHERE type IN ('mergedMultitrack', 'meetingAppAudio', 'meetingMicAudio')
-  AND CAST(strftime('%s', dateCreated) AS INTEGER) >= $mw_yes
-  AND CAST(strftime('%s', dateCreated) AS INTEGER) <= $NOW
+SELECT count(*) FROM mediafile mf
+LEFT JOIN session s ON s.id = mf.sessionID
+JOIN recordedmeeting rm ON rm.id = coalesce(mf.recordedMeetingID, s.recordedMeetingID)
+WHERE mf.type IN ('mergedMultitrack', 'meetingAppAudio', 'meetingMicAudio')
+  AND CAST(strftime('%s', rm.date) AS INTEGER) >= $((mw_yes - START_TOLERANCE_SECONDS))
+  AND CAST(strftime('%s', mf.dateCreated) AS INTEGER) <= $NOW
 "
 
 # Read-only, both ways, with a short retry on WAL lock contention; see
@@ -717,7 +766,7 @@ if ((rc != 0)) || ! [[ "$finished" =~ ^[0-9]+$ ]]; then
   echo "Error: failed to query MacWhisper database at $DB" >&2
   exit 1
 fi
-((finished == 0)) || quiet_exit "MacWhisper saved a recording after it started recording this huddle"
+((finished == 0)) || quiet_exit "MacWhisper saved the recording it started at its last mic start"
 
 # --- alert, once per huddle end (plus bounded repeats) -----------------
 
