@@ -1391,6 +1391,16 @@ restitch_seed() {
     source_file: "S1_merged.m4a", output_file: "2026-10-15_split-huddle_a1a10001.md", title: "Split Huddle",
     reviewed: false, deleted_source: false, doc_sha256: $h} + $extra' >"$RS_META"
 }
+# A cached part that cannot be read mid-join fails the run; nothing is replaced.
+restitch_seed '{"restitchable": true}'
+chmod 000 "$HUDDLE_PIECES_DIR/a1a10001.md"
+rs_out=$("$HT" --restitch --yes --output-dir "$RS" a1a10001 2>&1) && rc=0 || rc=$?
+chmod 600 "$HUDDLE_PIECES_DIR/a1a10001.md"
+if [[ $rc -ne 0 ]] && grep -qF "failed to join" <<<"$rs_out" && grep -qxF "one-part transcript" "$RS_DOC"; then
+  pass "an unreadable cached part fails the join and leaves the transcript alone"
+else
+  fail "an unreadable cached part fails the join and leaves the transcript alone" "exit $rc: $rs_out"
+fi
 restitch_seed '{"restitchable": true}'
 rm -f "$WORK/mw-calls"
 rs_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --restitch --yes --output-dir "$RS" a1a10001 2>&1) && rc=0 || rc=$?
@@ -1452,6 +1462,14 @@ done
 expect_rc "--mark-reviewed refuses while a stitched -2 and the original both name a piece" 1 \
   --mark-reviewed --yes --output-dir "$RS" a1a10001
 exists "--mark-reviewed with two sidecars keeps the audio" "$MEDIA/S2_merged.m4a"
+# Asked through a piece only the -2 names, it still sees the shared one.
+mr_out=$("$HT" --mark-reviewed --yes --output-dir "$RS" a1a10003 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] && grep -qF "other sidecars in $RS also name" <<<"$mr_out" &&
+  [[ -f "$MEDIA/S1_merged.m4a" && -f "$MEDIA/S3 it's merged.m4a" ]]; then
+  pass "--mark-reviewed through an unshared piece refuses while another sidecar holds a shared one"
+else
+  fail "--mark-reviewed through an unshared piece refuses while another sidecar holds a shared one" "exit $rc: $mr_out"
+fi
 
 # A retry that adds nothing (the only new piece fails again) leaves the
 # transcript alone and fails, so the watcher counts the attempt.
@@ -1565,6 +1583,24 @@ else
   fail "--dry-run --mark-reviewed lists every piece of a split meeting and its cached transcripts" "$mr_out"
 fi
 exists "--dry-run --mark-reviewed keeps the pieces" "$MEDIA/S1_merged.m4a"
+# A removal failing part-way names what is already gone. The stub trash
+# refuses the second piece; the full run below then finishes the job.
+TRASH_BIN="$WORK/trash-bin"
+mkdir -p "$TRASH_BIN" "$WORK/trashed"
+cat >"$TRASH_BIN/trash" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" != *S2_merged.m4a ]] || exit 1
+mv -- "$1" "$TRASHED_DIR/"
+STUB
+chmod +x "$TRASH_BIN/trash"
+mr_out=$(PATH="$TRASH_BIN:$PATH" TRASHED_DIR="$WORK/trashed" \
+  "$HT" --mark-reviewed --yes --output-dir "$OUT_ST" a1a10003 2>&1) && rc=0 || rc=$?
+if [[ $rc -ne 0 ]] && grep -qF "failed to trash $MEDIA/S2_merged.m4a" <<<"$mr_out" &&
+  grep -qF "Already removed: $MEDIA/S1_merged.m4a" <<<"$mr_out"; then
+  pass "a removal failing part-way names the files already removed"
+else
+  fail "a removal failing part-way names the files already removed" "exit $rc: $mr_out"
+fi
 expect_rc "--mark-reviewed through a later recording succeeds" 0 \
   --mark-reviewed --yes --output-dir "$OUT_ST" a1a10003
 for gone in S1_merged.m4a S2_merged.m4a "S3 it's merged.m4a"; do

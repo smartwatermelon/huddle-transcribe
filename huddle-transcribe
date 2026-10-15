@@ -1014,6 +1014,23 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
     fi
     exit 1
   fi
+  # The one sidecar found may hold pieces another sidecar also names; its
+  # release would take their audio too, so that refuses the same way.
+  if [[ $STITCH -eq 1 && ${#id_matches[@]} -eq 1 ]]; then
+    held_ids=$(jq -r '(.session_ids // [.session_id]) | join(" ")' "${id_matches[0]}" 2>/dev/null || true)
+    sharing=$(sidecar_index | awk -F"$SEP" -v m="${id_matches[0]}" -v ids="$held_ids" '
+      BEGIN { n = split(ids, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+      ($1 in want) && $2 != m { print $2 }' | sort -u)
+    if [[ -n "$sharing" ]]; then
+      echo "Error: $(basename "${id_matches[0]}") holds recordings that other sidecars in $OUTPUT_DIR also name:" >&2
+      while IFS= read -r meta; do
+        printf '  %s\n' "$(basename "$meta")" >&2
+      done <<<"$sharing"
+      echo "Refusing to delete source audio: it would release audio those still point at." >&2
+      echo "Keep the transcript you reviewed: move the other .md and .meta.json pair(s) out of $OUTPUT_DIR, then re-run." >&2
+      exit 1
+    fi
+  fi
   if [[ ${#id_matches[@]} -eq 1 ]]; then
     OUT_META="${id_matches[0]}"
     # The sidecar names its own transcript. Deriving it from the sidecar's
@@ -1310,28 +1327,29 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
   # This is the only irreversible step in the script, and the guards above
   # are the sole protection once the audio is really gone.
   sources_present=0
+  removed=()
+  # A failure part-way names what is already gone; a re-run skips those files.
+  removal_failed() {
+    echo "Error: $1 Sidecar left unchanged." >&2
+    ((${#removed[@]} == 0)) || printf '  Already removed: %s\n' ${removed[@]+"${removed[@]}"} >&2
+    exit 1
+  }
   # One path per recording the sidecar names; a re-run skips files already gone.
   for del_path in "${DEL_PATHS[@]}"; do
     if [[ ! -f "$del_path" ]]; then
       :
     elif command -v trash >/dev/null 2>&1; then
-      if ! trash "$del_path"; then
-        echo "Error: failed to trash $del_path. Sidecar left unchanged." >&2
-        exit 1
-      fi
+      trash "$del_path" || removal_failed "failed to trash $del_path."
       sources_present=$((sources_present + 1))
     elif ! rm -f "$del_path"; then
-      echo "Error: failed to delete $del_path. Sidecar left unchanged." >&2
-      exit 1
+      removal_failed "failed to delete $del_path."
     else
       sources_present=$((sources_present + 1))
     fi
     # Belt-and-braces for the trash(1) branch specifically: rm -f reports its
     # own failures, but trash can exit 0 without having moved the file.
-    if [[ -e "$del_path" ]]; then
-      echo "Error: $del_path still present after removal. Sidecar left unchanged." >&2
-      exit 1
-    fi
+    [[ ! -e "$del_path" ]] || removal_failed "$del_path still present after removal."
+    removed+=("$del_path")
   done
 
   mv "$tmp" "$OUT_META"
@@ -1456,9 +1474,11 @@ else
     [[ -z "$pend_list" ]] || pend_list+="; "
     pend_list+="part ${PEND_POS[i]} of $n_parts (starts at $(fmt_clock "${PEND_START[i]}"), session ${PEND_IDS[i]:0:8})"
   done
+  # set -e is off inside `if !`, so each read records its own failure.
+  join_ok=1
   if ! {
     if [[ $n_parts -eq 1 ]]; then
-      cat "$PIECES_DIR/${PART_IDS[0]}.md"
+      cat "$PIECES_DIR/${PART_IDS[0]}.md" || join_ok=0
     else
       if [[ -z "$pend_list" ]]; then
         printf '> **Note:** joined from %d recordings of one meeting.' "$n_parts"
@@ -1473,7 +1493,7 @@ else
         ((PART_POS[i] == 1)) || printf ', after a %d s gap' "${PART_GAP[i]}"
         printf '\n\n'
         if [[ "${PART_OK[i]}" -eq 1 ]]; then
-          offset_transcript "$PIECES_DIR/${PART_IDS[i]}.md" "${PART_START[i]}"
+          offset_transcript "$PIECES_DIR/${PART_IDS[i]}.md" "${PART_START[i]}" || join_ok=0
         else
           printf '> **Note:** this part (session %s) was not transcribed: %s.\n\n' "${PART_IDS[i]}" "${PART_WHY[i]}"
         fi
@@ -1489,7 +1509,7 @@ else
         fi
       fi
     fi
-  } >"$DOC_TMP"; then
+  } >"$DOC_TMP" || ((join_ok == 0)); then
     echo "Error: failed to join the transcripts of ${SID:0:8}." >&2
     exit 1
   fi
