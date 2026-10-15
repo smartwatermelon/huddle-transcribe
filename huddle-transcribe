@@ -2,6 +2,14 @@
 # huddle-transcribe: select, transcribe, and diarize MacWhisper meeting recordings via `mw`.
 set -euo pipefail
 
+# Under bash 3.2 an empty array under set -u aborts as "unbound variable".
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2))); then
+  printf 'Error: %s requires bash 4.2 or newer; running under %s (%s).\n' \
+    "${BASH_SOURCE[0]##*/}" "${BASH_VERSION:-unknown}" "${BASH:-unknown}" >&2
+  printf 'macOS ships bash 3.2 at /bin/bash. Install a current bash (brew install bash).\n' >&2
+  exit 1
+fi
+
 DB="$HOME/Library/Application Support/MacWhisper/Database/main.sqlite"
 MEDIA_DIR="$HOME/Library/Application Support/MacWhisper/Database/ExternalMedia"
 CONFIG_FILE="$HOME/.config/huddle-transcribe/config"

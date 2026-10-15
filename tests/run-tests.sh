@@ -1264,6 +1264,55 @@ else
   fail "a session ready after an empty seed is transcribed" "$diag"
 fi
 
+# --- the child runs under huddle-watch's bash, not its shebang's ---
+
+# launchd's `env bash` is /bin/bash 3.2. With 3.2 first on PATH, the child
+# must still report a modern bash.
+old_bash=""
+for candidate in /bin/bash /usr/bin/bash; do
+  if [[ -x "$candidate" ]] && ! bash_is_modern "$candidate"; then
+    old_bash="$candidate"
+    break
+  fi
+done
+if [[ -n "$old_bash" ]]; then
+  OLDBIN="$WORK/oldbash-bin"
+  mkdir -p "$OLDBIN"
+  ln -sf "$old_bash" "$OLDBIN/bash"
+  cat >"$WBIN/huddle-transcribe-ver" <<'STUB'
+#!/usr/bin/env bash
+printf 'bash-major=%s\n' "${BASH_VERSINFO[0]}" >>"$CALLS"
+echo "Transcript written: /tmp/out/${1:0:8}.md"
+STUB
+  chmod +x "$WBIN/huddle-transcribe-ver"
+  build_watch_db
+  watch_reset
+  watch --once >/dev/null 2>&1 || true
+  sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
+  env HUDDLE_DB="$WDB" HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe-ver" \
+    HUDDLE_STATE_FILE="$WSTATE" HUDDLE_LOG_FILE="$WLOG" CALLS="$CALLS" \
+    PATH="$OLDBIN:$PATH" "$BASH" "$WATCH" --once >/dev/null 2>&1 || true
+  child_major=$(sed -n 's/^bash-major=//p' "$CALLS" 2>/dev/null | tail -1)
+  if [[ -n "$child_major" ]] && ((child_major >= 4)); then
+    pass "huddle-transcribe runs under huddle-watch's bash, not PATH's"
+  else
+    diag=$(dump "$CALLS")
+    fail "huddle-transcribe runs under huddle-watch's bash, not PATH's" "$diag"
+  fi
+
+  # And run directly under 3.2, huddle-transcribe refuses with one clear line.
+  t_rc=0
+  t_out=$("$old_bash" "$SCRIPT" --list 2>&1) || t_rc=$?
+  if ((t_rc != 0)) && [[ "$t_out" == *"requires bash 4.2 or newer"* ]]; then
+    pass "huddle-transcribe rejects an inadequate bash"
+  else
+    fail "huddle-transcribe rejects an inadequate bash" "rc=$t_rc: $t_out"
+  fi
+else
+  skip "huddle-transcribe runs under huddle-watch's bash, not PATH's (no bash <4.2 available)"
+  skip "huddle-transcribe rejects an inadequate bash (no bash <4.2 available)"
+fi
+
 # Restore the shared fixture for the tests that follow.
 build_watch_db
 watch_reset
@@ -1288,6 +1337,7 @@ else
   diag=$(dump "$CALLS")
   fail "the explicit session id was passed" "$diag"
 fi
+
 # The id must be passed explicitly: `latest` races when two meetings finish
 # close together, and would transcribe the wrong one.
 if [[ -f "$CALLS" ]] && grep -q 'latest' "$CALLS"; then

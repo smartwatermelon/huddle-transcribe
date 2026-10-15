@@ -1156,8 +1156,10 @@ for entry in "${PENDING[@]}"; do
   # never reach this file, and re-running them here would overwrite their
   # transcripts and, where --mark-reviewed has removed the audio, fail to the
   # attempt cap and report "Transcription FAILED" for finished work.
+  #
+  # "$BASH", not the shebang: under launchd, `env bash` finds /bin/bash 3.2.
   run_rc=0
-  run_out=$("$TRANSCRIBE_BIN" "$sid" --yes --skip-existing 2>&1) || run_rc=$?
+  run_out=$("$BASH" "$TRANSCRIBE_BIN" "$sid" --yes --skip-existing 2>&1) || run_rc=$?
 
   # Log the child's combined output regardless of outcome; it is the only
   # record of what happened inside a launchd-driven run.
