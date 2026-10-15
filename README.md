@@ -58,10 +58,82 @@ it is interpolated into SQL) to move that floor.
 
 `--all` takes no `SESSION_ID_OR_DATE`. It applies the same floor, skips
 sessions deleted inside MacWhisper, and treats a session as transcribed when
-its `.meta.json` sidecar exists in the output directory. Each session runs as
+its `.meta.json` sidecar exists in the output directory (a split meeting:
+when sidecars name every one of its recordings, counting the ones a sidecar
+lists as missing or pending: retrying those is the watcher's job, so
+`--all` never writes a second transcript for them). Each session runs as
 its own `huddle-transcribe <session-id> --yes`; one failure does not stop the
 rest, and the run exits non-zero naming every session that failed. It cannot
 be combined with `--mark-reviewed`, which stays one session at a time.
+
+### Split meetings are stitched into one transcript
+
+MacWhisper sometimes saves one meeting as several back-to-back recordings
+(seen with Slack huddles: MacWhisper stops when a screen share starts). On
+2026-10-15 one huddle became pieces of 83 s, 42 s, and 1076 s, 6 s and 4 s
+apart; the 300 s floor dropped the first two without a word.
+
+Recordings from the same app whose gap is between
+0 and `HUDDLE_STITCH_GAP_SECONDS` (default 60; `0` turns stitching off) are
+one meeting. The gap is measured from the end of the previous piece
+(`date + duration`) to the start of the next, and chains, so three pieces
+form one group. Overlapping recordings are not joined: they are two
+captures running at once, not one split capture.
+
+**Back-to-back meetings can merge.** The real splits seen so far had gaps of
+4 to 26 s, and the threshold is 60 s. So two different meetings in the same
+app, one starting less than 60 s after the other ended, become one
+transcript. Each stitch is visible: the transcript has a part heading per
+recording, and `huddle-watch` logs every stitch with each part's start and
+gap. Set `HUDDLE_STITCH_GAP_SECONDS=0` to turn stitching off.
+
+"The same app" means the same `recordedmeeting.bundleIdentifier`, not the
+same `appName`: MacWhisper has recorded Chrome as both `Chrome` and
+`Google Chrome`, with one bundle id (`com.google.Chrome`). A recording
+without a bundle id is matched by `appName`, and only with other recordings
+that also lack one.
+
+- Naming any piece (or a date or `latest`) selects the whole meeting.
+  `--list`, `latest`, date lookup and `--all` show it once, under its first
+  recording, with its total duration, and the duration floor applies to
+  that total, not to each piece.
+- Each recording is transcribed by `mw` on its own, and the transcripts are
+  joined. (`mw` on the joined audio lost all capitalization and
+  punctuation; each piece alone keeps them.) Each piece's transcript is
+  cached in `~/.local/state/huddle-transcribe/pieces/<session id>.md`
+  (`HUDDLE_PIECES_DIR`), outside the knowledge base, so a re-stitch
+  transcribes only a new piece. `--mark-reviewed` removes the cached
+  transcripts of the pieces it releases, with their audio; nothing else
+  removes them.
+- The transcript is one document. Each piece is a part under a heading such
+  as `## Part 2 of 3 — starts at 01:29, after a 6 s gap`. Timestamps are
+  moved by the part's start, so they run from the start of the first piece
+  and the timeline is continuous. Speaker labels stay as `mw` wrote them,
+  and **speaker numbers restart in each part**: `Speaker 1` in part 2 is not
+  necessarily `Speaker 1` in part 1.
+- A piece that cannot be transcribed (an `mw` error, or no audio and no
+  cached transcript) does not block the meeting: the others are joined, and
+  its part holds a note naming it.
+- A recording that is not ready yet does not block the meeting either: no
+  saved audio, or named with `--pending` (which `huddle-watch` passes for a
+  piece that fails its readiness check). It is left out, and the transcript
+  ends with a note that it may be incomplete, naming each such part (its
+  number, start and short session id). Part numbers count every recording,
+  so the headings can skip one.
+- One `.md` and one `.meta.json` are written, named after the first
+  recording even when that one is not ready or failed, so a re-stitch keeps
+  the name. The sidecar's `session_id` and `source_file` are those of the
+  first piece it holds; `session_ids` and `source_files` list the pieces it
+  holds, `missing_session_ids` any it could not include,
+  `pending_session_ids` any not ready yet, and `duration_seconds` is the
+  total. `--mark-reviewed` removes the audio of the pieces in `session_ids`
+  only.
+- `--skip-existing` and `--all` treat a split meeting as transcribed when
+  sidecars name every one of its recordings. Per-piece transcripts written
+  before stitching existed count when together they name every piece. A
+  piece no sidecar names makes the meeting pending again; the new
+  transcript then opens with the duplicate note (see below).
+- A single recording is handled exactly as before, sidecar fields included.
 
 ### Options
 
@@ -72,8 +144,12 @@ be combined with `--mark-reviewed`, which stays one session at a time.
                          yet, oldest first, after one confirmation
 --mark-reviewed          Set reviewed=true and remove the source .m4a for the
                          selected session
---skip-existing          Exit 0 without transcribing when the session already
-                         has a sidecar (huddle-watch passes this)
+--skip-existing          Exit 0 without transcribing when sidecars already name
+                         the session (every recording of a split meeting)
+--restitch               What huddle-watch passes: --skip-existing, plus it may
+                         replace its own unreviewed transcript (see below)
+--pending SESSION_ID     A recording of the meeting that is not ready yet:
+                         left out and named at the end (repeatable)
 --yes                    Skip confirmation prompt
 --output-dir PATH        Override the configured output directory
 -h, --help               Show usage
@@ -156,13 +232,50 @@ A session is transcribed when all of the following hold:
 - the session is not being re-transcribed (the row is still settling);
 - it is not a transient scratch row;
 - it has not been deleted;
-- its duration is over 5 minutes, the same floor `huddle-transcribe` applies;
-- and its session id is not already recorded in the state file.
+- its duration is over 5 minutes, the same floor `huddle-transcribe` applies
+  (for a split meeting, the total of its pieces);
+- and it is not yet recorded in the state file as done or given up on.
+
+A piece of a split meeting never waits for a sibling. MacWhisper writes no
+database row for a recording until it ends, so the watcher cannot wait for
+the rest of a meeting; and a piece that is saved but not ready (for
+example its transcription has not succeeded) may stay that way. So the
+watcher transcribes the ready pieces as soon as they are ready, passes the
+others with `--pending`, and does it again when a later piece lands or a
+pending one becomes ready:
+
+- A piece is transcribed once and cached; a later run reuses the cache and
+  transcribes only the new piece.
+- The new transcript **replaces the watcher's own earlier one in place**
+  (same file name, sidecar updated; the "may be incomplete" note goes once
+  nothing is pending) and raises a new "ready" alert, marked "(updated with
+  a later recording)". The watcher marks what it writes
+  `"restitchable": true` and records the SHA-256 of the file
+  (`doc_sha256`). Only such a transcript is replaced, and only while it is
+  not reviewed and still matches that hash. The sidecar and the file are
+  checked again just before the new one is moved into place.
+- If that transcript was already reviewed (`reviewed` or `deleted_source`
+  in its sidecar), was edited by hand, or was written by hand, it is left
+  alone. The meeting goes to the next free `-2` name, with the duplicate
+  note. Pieces whose audio and cache `--mark-reviewed` removed are notes in
+  it, not transcripts: the reviewed transcript holds them. While both name
+  one recording, `--mark-reviewed` refuses it as ambiguous.
+- Each piece's state is its own. A piece that fails costs only its own
+  attempt (three, then it is given up on), and the meeting is written
+  without it, with a note. A pending piece costs nothing and is not
+  recorded until it is ready, so one that never becomes ready blocks
+  nothing and is logged once, with the stitch that left it out.
+- Each stitch is logged: the pieces, the ones not ready yet, and each one's
+  start and gap.
+
+The duration floor applies to the meeting so far: on 2026-10-15, pieces of
+83 s and 42 s waited until the 1076 s third piece made the meeting long
+enough, and were then transcribed together.
 
 The watcher no longer waits for speaker diarization. Since 2026-09-24
 MacWhisper transcribes meetings live and never marks them diarized, so that
 condition silently stopped every transcription. `huddle-transcribe` is run
-with `--skip-existing`, so a session that already has a transcript (made by
+with `--restitch`, so a session that already has a transcript (made by
 hand or by `--all`) is recorded as done without running `mw` again.
 
 Duration is read from the recorded meeting or the system-audio recording,
@@ -265,12 +378,12 @@ rather than a silent full run. `--dry-run` and `--list` need no mode flag.
 
 Environment overrides, mainly for testing: `HUDDLE_DB`,
 `HUDDLE_TRANSCRIBE_BIN`, `HUDDLE_STATE_FILE`, `HUDDLE_LOG_FILE`,
-`HUDDLE_MIN_DURATION`, `HUDDLE_NO_NOTIFY` (suppress alerts and
-notifications), and `HUDDLE_NOTIFY_BIN` (use something other than
-`osascript`).
-`HUDDLE_MIN_DURATION` must be a whole number of seconds: it is interpolated
-into SQL and also evaluated arithmetically, so anything else is rejected at
-startup rather than trusted.
+`HUDDLE_MIN_DURATION`, `HUDDLE_STITCH_GAP_SECONDS`, `HUDDLE_NO_NOTIFY`
+(suppress alerts and notifications), and `HUDDLE_NOTIFY_BIN` (use something
+other than `osascript`). `HUDDLE_PIECES_DIR` reaches `huddle-transcribe`
+through the environment. `HUDDLE_MIN_DURATION` and
+`HUDDLE_STITCH_GAP_SECONDS` must be whole numbers: they are interpolated
+into SQL, so anything else is rejected at startup rather than trusted.
 
 ## Recorder-still-running alert (`huddle-mic-guard`)
 
@@ -446,9 +559,36 @@ writes:
 }
 ```
 
+A stitched meeting's sidecar adds two arrays, oldest piece first:
+`"session_ids"` after `session_id`, and `"source_files"` after
+`source_file`, for the pieces the transcript holds; `"missing_session_ids"`
+lists any piece it could not include, and `"pending_session_ids"` any that
+was not ready yet. `session_id` and `source_file` are those of the first
+piece it holds (always in `session_ids`), so a reader that knows only them
+still works. A sidecar `huddle-watch` wrote ends with `"restitchable": true`
+and `"doc_sha256"`, the hash of the transcript as written.
+
 The trailing session-id fragment keeps two same-day meetings apart when
 their titles reduce to the same slug (`SRE Daily Huddle` and
 `SRE/Daily Huddle` both slugify to `sre-daily-huddle`).
+
+An existing transcript is never overwritten. When the name is taken (by a
+transcript or a sidecar), a new run writes the next free
+`<date>_<slug>-2_<id>.md`, `-3`, and so on. The counter goes before the id
+because every sidecar lookup matches `*_<id>.meta.json`. The new transcript
+starts with a quoted note that it may duplicate the existing one, named by
+its file name, and its sidecar adds `"may_duplicate"` with that name. The
+same note is written when the session's only other transcript is under an
+older title. While two sidecars name one session, `--mark-reviewed` refuses
+as ambiguous and names both; move the unwanted pair out of the folder first.
+
+This also happens when a meeting's pieces already have their own transcripts
+(written before stitching existed) and the meeting is then stitched by hand:
+each piece's sidecar and the stitched one both name it. The refusal says
+which sidecar is the per-recording one. To release every piece through the
+stitched transcript, move the per-recording pairs out (check that no KB
+note's `source:` names them); to release one piece through its own
+transcript, move the stitched pair out instead.
 
 ### Why Markdown
 
@@ -536,7 +676,13 @@ deleted outright.
 This is the only destructive operation in the script, so it is fenced:
 
 - it refuses to run unless a sidecar exists for the selected session, and
-  that sidecar's `session_id` matches the session actually resolved;
+  that sidecar's `session_id` matches the session actually resolved (or,
+  for a stitched meeting, its `session_ids` lists it);
+- for a stitched meeting it removes the audio of every piece the sidecar
+  lists, resolved by exact session id, and refuses before removing anything
+  if any piece cannot be resolved. A re-run after a partial failure skips
+  the pieces already gone. It also removes the released pieces' cached
+  transcripts (`HUDDLE_PIECES_DIR/<session id>.md`, exact paths);
 - it refuses to run if the transcript is missing or empty;
 - it prompts unless `--yes` is passed;
 - the sidecar is updated only *after* the audio is confirmed gone, so a

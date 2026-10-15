@@ -97,18 +97,28 @@ mkdir -p "$MEDIA" "$BIN"
 cat >"$BIN/mw" <<'STUB'
 #!/usr/bin/env bash
 [[ -n "${MW_CALLS:-}" ]] && printf '%s\n' "$*" >>"$MW_CALLS"
-out=""
+out="" in=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o)
       out="$2"
       shift 2
       ;;
-    *) shift ;;
+    *)
+      in="$1"
+      shift
+      ;;
   esac
 done
 [[ -n "$out" ]] || exit 2
-printf 'Speaker 1\n*00:00-00:06*\nhello\n\nSpeaker 2\n*00:06-00:12*\nhi there\n\n' >"$out"
+# MW_FAIL_MATCH fails one input; MW_LONG adds a block past the hour.
+[[ -z "${MW_FAIL_MATCH:-}" || "$in" != *"$MW_FAIL_MATCH"* ]] || exit 3
+printf 'Speaker 1\n*00:00-00:06*\nhello from %s\n\nSpeaker 2\n*00:06-00:12*\nhi there\n\n' "${in##*/}" >"$out"
+[[ -z "${MW_LONG:-}" ]] || printf 'Speaker 1\n*59:50-01:00:02*\nlate\n\n' >>"$out"
+# MW_MARK_REVIEWED: flip that sidecar to reviewed mid-run, as a racing --mark-reviewed would.
+if [[ -n "${MW_MARK_REVIEWED:-}" ]]; then
+  jq '.reviewed = true' "$MW_MARK_REVIEWED" >"$MW_MARK_REVIEWED.tmp" && mv "$MW_MARK_REVIEWED.tmp" "$MW_MARK_REVIEWED"
+fi
 STUB
 chmod +x "$BIN/mw"
 
@@ -157,6 +167,13 @@ INSERT INTO mediafile VALUES (x'eeee0005', 'mergedMultitrack', 'E_merged.m4a');
 INSERT INTO recordedmeeting VALUES (x'66', 'HOME[$(touch ' || char(34) || 'PWNMARKER' || char(34) || ')0]', 'Hostile');
 INSERT INTO session VALUES (x'ffff0006', '2026-08-19 09:00:00.000', 'Hostile Duration', NULL, x'66', NULL);
 INSERT INTO mediafile VALUES (x'ffff0006', 'mergedMultitrack', 'F_merged.m4a');
+
+-- Added after the positional inserts above. NULL date/appName keep those
+-- sessions out of split-meeting grouping.
+ALTER TABLE recordedmeeting ADD COLUMN date TEXT;
+ALTER TABLE recordedmeeting ADD COLUMN appName TEXT;
+ALTER TABLE recordedmeeting ADD COLUMN bundleIdentifier TEXT;
+ALTER TABLE session ADD COLUMN dateDeleted TEXT;
 SQL
 
 reset_media() {
@@ -183,14 +200,16 @@ reset_media() {
 # $HOME (harmless: it only stats a directory, never writes), but its
 # result can no longer matter.
 OUT="$WORK/out"
+# build [MW] [DEST] [DB] [OUTPUT_DIR]; the per-recording cache defaults into $WORK.
 build() {
-  local mw="${1:-$BIN/mw}" dest="$WORK/ht.sh"
-  sed -e "s|^DB=.*|DB=\"$DB\"|" \
+  local mw="${1:-$BIN/mw}" dest="${2:-$WORK/ht.sh}" db="${3:-$DB}" out="${4:-$OUT}"
+  sed -e "s|^DB=.*|DB=\"$db\"|" \
     -e "s|^MEDIA_DIR=.*|MEDIA_DIR=\"$MEDIA\"|" \
     -e "s|^MW_BIN=.*|MW_BIN=\"$mw\"|" \
     -e "s|^CONFIG_FILE=.*|CONFIG_FILE=\"$WORK/no-such-config\"|" \
-    -e "s|^DEFAULT_OUTPUT_DIR=.*|DEFAULT_OUTPUT_DIR=\"$OUT\"|" \
-    -e "s|^  DEFAULT_OUTPUT_DIR=.*|  DEFAULT_OUTPUT_DIR=\"$OUT\"|" \
+    -e "s|^DEFAULT_OUTPUT_DIR=.*|DEFAULT_OUTPUT_DIR=\"$out\"|" \
+    -e "s|^  DEFAULT_OUTPUT_DIR=.*|  DEFAULT_OUTPUT_DIR=\"$out\"|" \
+    -e "s|^PIECES_DIR=.*|PIECES_DIR=\"\${HUDDLE_PIECES_DIR:-$WORK/pieces}\"|" \
     "$SCRIPT" >"$dest"
   chmod +x "$dest"
   printf '%s\n' "$dest"
@@ -453,7 +472,9 @@ fi
 # script but the markup is chosen by mw, and a mismatch between the two (a
 # .md file holding --format txt output) is invisible to every other check.
 rm -f "$WORK/mw-calls"
-MW_CALLS="$WORK/mw-calls" "$HT" --yes --output-dir "$OUT" aaaa0001 >/dev/null 2>&1 || true
+# Its own output dir: a second run into $OUT would add a -2 transcript.
+MW_CALLS="$WORK/mw-calls" "$HT" --yes --output-dir "$WORK/out-flags" aaaa0001 >/dev/null 2>&1 || true
+rm -rf "$WORK/out-flags"
 mw_flags=$(cat "$WORK/mw-calls" 2>/dev/null || true)
 if grep -qF -- "--format md" <<<"$mw_flags"; then
   pass "mw is invoked with --format md"
@@ -487,6 +508,86 @@ else
   pass "failing mw leaves no partial file"
 fi
 HT=$(build)
+
+# --- an existing transcript is never overwritten ------------------------
+
+echo "no overwrite"
+OUT_DUP="$WORK/out-dup"
+DUP1="2026-01-05_january-session_cccc0003"
+rm -rf "$OUT_DUP"
+expect_rc "a first transcription succeeds" 0 --yes --output-dir "$OUT_DUP" cccc0003
+printf 'hand-edited\n' >>"$OUT_DUP/$DUP1.md"
+before=$(cat "$OUT_DUP/$DUP1.md")
+dup_out=$("$HT" --yes --output-dir "$OUT_DUP" cccc0003 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Transcript written: $OUT_DUP/2026-01-05_january-session-2_cccc0003.md" <<<"$dup_out"; then
+  pass "a second run writes the next free name, counter before the id"
+else
+  fail "a second run writes the next free name, counter before the id" "exit $rc: $dup_out"
+fi
+after=$(cat "$OUT_DUP/$DUP1.md")
+if [[ "$after" == "$before" ]]; then
+  pass "a second run leaves the existing transcript untouched"
+else
+  fail "a second run leaves the existing transcript untouched" "$after"
+fi
+dup_first=$(head -1 "$OUT_DUP/2026-01-05_january-session-2_cccc0003.md" 2>/dev/null || true)
+if [[ "$dup_first" == "> **Note:** this transcript may duplicate $DUP1.md, which already existed when it was written." ]]; then
+  pass "the second transcript opens with a note naming the first"
+else
+  fail "the second transcript opens with a note naming the first" "$dup_first"
+fi
+if grep -q '^Speaker 1$' "$OUT_DUP/2026-01-05_january-session-2_cccc0003.md" 2>/dev/null; then
+  pass "the note sits above the full transcript"
+else
+  fail "the note sits above the full transcript"
+fi
+dup_meta=$(jq -r '[.session_id, .output_file, .may_duplicate] | join(",")' \
+  "$OUT_DUP/2026-01-05_january-session-2_cccc0003.meta.json" 2>/dev/null || true)
+if [[ "$dup_meta" == "cccc0003,2026-01-05_january-session-2_cccc0003.md,$DUP1.md" ]]; then
+  pass "the second sidecar names its own transcript and may_duplicate"
+else
+  fail "the second sidecar names its own transcript and may_duplicate" "$dup_meta"
+fi
+if jq -e 'has("may_duplicate")' "$OUT_DUP/$DUP1.meta.json" >/dev/null 2>&1; then
+  fail "a first transcript's sidecar has no may_duplicate"
+else
+  pass "a first transcript's sidecar has no may_duplicate"
+fi
+expect_out "--dry-run names the next free transcript" \
+  "Output:   $OUT_DUP/2026-01-05_january-session-3_cccc0003.md" --dry-run --output-dir "$OUT_DUP" cccc0003
+expect_rc "a third run succeeds" 0 --yes --output-dir "$OUT_DUP" cccc0003
+exists "a third run takes -3" "$OUT_DUP/2026-01-05_january-session-3_cccc0003.md"
+# An orphan transcript with no sidecar also blocks its name.
+rm -f "$OUT_DUP/$DUP1.meta.json"
+expect_rc "a run beside an orphan transcript succeeds" 0 --yes --output-dir "$OUT_DUP" cccc0003
+exists "an orphan transcript is not overwritten either" "$OUT_DUP/2026-01-05_january-session-4_cccc0003.md"
+after=$(cat "$OUT_DUP/$DUP1.md")
+if [[ "$after" == "$before" ]]; then
+  pass "the orphan transcript keeps its content"
+else
+  fail "the orphan transcript keeps its content" "$after"
+fi
+expect_out "--skip-existing still counts a -N transcript as done" "Already transcribed: " \
+  --skip-existing --yes --output-dir "$OUT_DUP" cccc0003
+# Two sidecars for one session: --mark-reviewed refuses rather than guess.
+expect_rc "--mark-reviewed refuses while duplicates exist" 1 \
+  --mark-reviewed --yes --output-dir "$OUT_DUP" cccc0003
+exists "--mark-reviewed with duplicates keeps the audio" "$MEDIA/C_merged.m4a"
+rm -rf "$OUT_DUP"
+
+# A transcript of the session under an older title is named, not replaced.
+mkdir -p "$OUT_DUP"
+printf 'old body\n' >"$OUT_DUP/2026-01-05_old-title_cccc0003.md"
+printf '{"session_id": "cccc0003", "output_file": "2026-01-05_old-title_cccc0003.md"}\n' \
+  >"$OUT_DUP/2026-01-05_old-title_cccc0003.meta.json"
+expect_rc "a run after a retitle succeeds" 0 --yes --output-dir "$OUT_DUP" cccc0003
+dup_first=$(head -1 "$OUT_DUP/$DUP1.md" 2>/dev/null || true)
+if [[ "$dup_first" == *"may duplicate 2026-01-05_old-title_cccc0003.md,"* ]]; then
+  pass "a transcript under an older title is named in the note"
+else
+  fail "a transcript under an older title is named in the note" "$dup_first"
+fi
+rm -rf "$OUT_DUP"
 
 # --- --mark-reviewed guards --------------------------------------------
 
@@ -705,11 +806,9 @@ fi
 # --- --all -------------------------------------------------------------
 
 echo "--all"
-# --all skips sessions deleted in MacWhisper. The base fixture lacks the
-# real database's dateDeleted column, so add it here.
+# --all skips sessions deleted in MacWhisper (dateDeleted, added by the fixture).
 sqlite3 "$DB" <<'SQL'
-ALTER TABLE session ADD COLUMN dateDeleted TEXT;
-INSERT INTO recordedmeeting VALUES (x'77', 1000.0, 'rmG');
+INSERT INTO recordedmeeting (id, duration, title) VALUES (x'77', 1000.0, 'rmG');
 INSERT INTO session VALUES (x'abab0007', '2025-12-01 10:00:00.000', 'Deleted One', NULL, x'77', NULL, '2025-12-02 10:00:00.000');
 INSERT INTO mediafile VALUES (x'abab0007', 'mergedMultitrack', 'G_merged.m4a');
 SQL
@@ -852,6 +951,728 @@ sqlite3 "$DB" "DELETE FROM session WHERE id = x'abab0007'; DELETE FROM recordedm
 rm -f "$MEDIA/G_merged.m4a"
 rm -rf "$OUT_ALL"
 
+# --- split meetings are stitched ---------------------------------------
+
+# a1a1000[1-3] mirror 2026-10-15: one Slack call, three pieces. 4 is another app, 5 is 90 s late.
+echo "split meetings are stitched"
+sqlite3 "$DB" <<'SQL'
+INSERT INTO recordedmeeting VALUES (x'a1', 83.073625, NULL, '2026-10-15 15:01:23.955', 'Slack', 'com.tinyspeck.slackmacgap');
+INSERT INTO session VALUES (x'a1a10001', '2026-10-15 15:02:54.630', 'Split Huddle', NULL, x'a1', NULL, NULL);
+INSERT INTO mediafile VALUES (x'a1a10001', 'mergedMultitrack', 'S1_merged.m4a');
+INSERT INTO recordedmeeting VALUES (x'a2', 42.2019375, NULL, '2026-10-15 15:02:53.351', 'Slack', 'com.tinyspeck.slackmacgap');
+INSERT INTO session VALUES (x'a1a10002', '2026-10-15 15:03:40.742', NULL, 'Later Piece', x'a2', NULL, NULL);
+INSERT INTO mediafile VALUES (x'a1a10002', 'mergedMultitrack', 'S2_merged.m4a');
+INSERT INTO recordedmeeting VALUES (x'a3', 1075.9269375, NULL, '2026-10-15 15:03:39.467', 'Slack', 'com.tinyspeck.slackmacgap');
+INSERT INTO session VALUES (x'a1a10003', '2026-10-15 15:22:56.495', NULL, 'Last Piece', x'a3', NULL, NULL);
+INSERT INTO mediafile VALUES (x'a1a10003', 'mergedMultitrack', 'S3 it''s merged.m4a');
+INSERT INTO recordedmeeting VALUES (x'a4', 400.0, NULL, '2026-10-15 15:21:50.000', 'Chrome', 'com.google.Chrome');
+INSERT INTO session VALUES (x'a1a10004', '2026-10-15 15:28:30.000', 'Other App', NULL, x'a4', NULL, NULL);
+INSERT INTO mediafile VALUES (x'a1a10004', 'mergedMultitrack', 'S4_merged.m4a');
+INSERT INTO recordedmeeting VALUES (x'a5', 400.0, NULL, '2026-10-15 15:23:05.500', 'Slack', 'com.tinyspeck.slackmacgap');
+INSERT INTO session VALUES (x'a1a10005', '2026-10-15 15:29:45.500', 'Too Late', NULL, x'a5', NULL, NULL);
+INSERT INTO mediafile VALUES (x'a1a10005', 'mergedMultitrack', 'S5_merged.m4a');
+SQL
+reset_split_media() {
+  touch "$MEDIA/S1_merged.m4a" "$MEDIA/S2_merged.m4a" "$MEDIA/S3 it's merged.m4a" \
+    "$MEDIA/S4_merged.m4a" "$MEDIA/S5_merged.m4a"
+}
+reset_split_media
+OUT_ST="$WORK/out-stitch"
+ST_BASE="$OUT_ST/2026-10-15_split-huddle_a1a10001"
+rm -rf "$OUT_ST"
+# Each scenario gets its own per-recording cache.
+export HUDDLE_PIECES_DIR="$WORK/pieces-stitch"
+rm -rf "$HUDDLE_PIECES_DIR"
+
+# --list and --all show a split meeting once, under its first recording and total.
+list_out=$("$HT" --list 2>&1 || true)
+if grep -qE '^a1a10001 .* 20m01s +Split Huddle$' <<<"$list_out"; then
+  pass "--list shows a split meeting once, with its total duration"
+else
+  fail "--list shows a split meeting once, with its total duration" "$list_out"
+fi
+for unwanted in a1a10002 a1a10003; do
+  if grep -qF "$unwanted" <<<"$list_out"; then
+    fail "--list hides later recording $unwanted of a split meeting" "$list_out"
+  else
+    pass "--list hides later recording $unwanted of a split meeting"
+  fi
+done
+all_out=$("$HT" --all --dry-run --output-dir "$OUT_ST" 2>&1 || true)
+if grep -qF a1a10001 <<<"$all_out" && ! grep -qE 'a1a1000[23]' <<<"$all_out"; then
+  pass "--all queues a split meeting once"
+else
+  fail "--all queues a split meeting once" "$all_out"
+fi
+
+# Any recording selects the whole meeting; the dry run names each part's
+# start and gap (the watcher logs these lines).
+dry_out=$("$HT" --dry-run --output-dir "$OUT_ST" a1a10002 2>&1 || true)
+for want in "Session:  a1a10001" "Stitched: 3 recordings of one meeting (a1a10001 a1a10002 a1a10003)" \
+  "Duration: 20m01s" "Output:   $ST_BASE.md" "Part 1:   a1a10001 starts at 00:00: $MEDIA/S1_merged.m4a" \
+  "Part 2:   a1a10002 starts at 01:29, after a 6 s gap: $MEDIA/S2_merged.m4a" \
+  "Part 3:   a1a10003 starts at 02:16, after a 4 s gap: $MEDIA/S3 it's merged.m4a"; do
+  if grep -qF -- "$want" <<<"$dry_out"; then
+    pass "dry run of a later recording shows '$want'"
+  else
+    fail "dry run of a later recording shows '$want'" "$dry_out"
+  fi
+done
+absent "a dry run writes no cached piece" "$HUDDLE_PIECES_DIR"
+
+rm -f "$WORK/mw-calls"
+st_rc=0
+st_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --yes --output-dir "$OUT_ST" a1a10002 2>&1) || st_rc=$?
+if [[ $st_rc -eq 0 ]]; then
+  pass "a split meeting transcribes"
+else
+  fail "a split meeting transcribes" "exit $st_rc: $st_out"
+fi
+exists "a split meeting writes one transcript named after its first recording" "$ST_BASE.md"
+exists "a split meeting writes one sidecar named after its first recording" "$ST_BASE.meta.json"
+if compgen -G "$OUT_ST/*_a1a1000[23].*" >/dev/null; then
+  fail "later recordings of a split meeting get no transcript of their own"
+else
+  pass "later recordings of a split meeting get no transcript of their own"
+fi
+st_ids=$(jq -c '.session_ids' "$ST_BASE.meta.json" 2>/dev/null || true)
+if [[ "$st_ids" == '["a1a10001","a1a10002","a1a10003"]' ]]; then
+  pass "the sidecar lists every recording, oldest first"
+else
+  fail "the sidecar lists every recording, oldest first" "session_ids: $st_ids"
+fi
+st_sid=$(jq -r '.session_id' "$ST_BASE.meta.json" 2>/dev/null || true)
+st_dur=$(jq -r '.duration_seconds | floor' "$ST_BASE.meta.json" 2>/dev/null || true)
+st_title=$(jq -r '.title' "$ST_BASE.meta.json" 2>/dev/null || true)
+if [[ "$st_sid" == "a1a10001" && "$st_dur" == "1201" && "$st_title" == "Split Huddle" ]]; then
+  pass "the sidecar keeps session_id and title of the first recording, and the total duration"
+else
+  fail "the sidecar keeps session_id and title of the first recording, and the total duration" \
+    "session_id=$st_sid duration=$st_dur title=$st_title"
+fi
+st_keys=$(jq -c '[has("restitchable"), has("missing_session_ids")]' "$ST_BASE.meta.json" 2>/dev/null || true)
+if [[ "$st_keys" == "[false,false]" ]]; then
+  pass "a manual stitch is not marked replaceable and misses no part"
+else
+  fail "a manual stitch is not marked replaceable and misses no part" "$st_keys"
+fi
+# One mw run per piece, oldest first: joined audio lost all punctuation.
+mw_inputs=$(awk '{ print $NF }' "$WORK/mw-calls" 2>/dev/null | sed 's|.*/||' | tr '\n' ',' || true)
+if [[ "$mw_inputs" == "S1_merged.m4a,S2_merged.m4a,merged.m4a," ]] &&
+  grep -qF -- "$MEDIA/S3 it's merged.m4a" "$WORK/mw-calls"; then
+  pass "mw transcribes each recording on its own, oldest first"
+else
+  diag=$(cat "$WORK/mw-calls" 2>/dev/null || true)
+  fail "mw transcribes each recording on its own, oldest first" "$diag"
+fi
+for sid in a1a10001 a1a10002 a1a10003; do
+  exists "the transcript of $sid is cached outside the output dir" "$HUDDLE_PIECES_DIR/$sid.md"
+done
+if compgen -G "$HUDDLE_PIECES_DIR/*.partial.*" >/dev/null || compgen -G "$OUT_ST/*.partial.*" >/dev/null; then
+  fail "no temp file is left behind"
+else
+  pass "no temp file is left behind"
+fi
+# The join: a heading per part, timestamps continuous from the first piece,
+# everything else as mw wrote it.
+st_doc=$(cat "$ST_BASE.md" 2>/dev/null || true)
+st_heads=$(grep '^## ' <<<"$st_doc" || true)
+want_heads="## Part 1 of 3 — starts at 00:00
+## Part 2 of 3 — starts at 01:29, after a 6 s gap
+## Part 3 of 3 — starts at 02:16, after a 4 s gap"
+if [[ "$st_heads" == "$want_heads" ]]; then
+  pass "each part has a heading with its start and gap"
+else
+  fail "each part has a heading with its start and gap" "$st_heads"
+fi
+st_stamps=$(grep -E '^\*[0-9:-]+\*$' <<<"$st_doc" | tr '\n' ' ' || true)
+if [[ "$st_stamps" == "*00:00-00:06* *00:06-00:12* *01:29-01:35* *01:35-01:41* *02:16-02:22* *02:22-02:28* " ]]; then
+  pass "timestamps are offset by each part's start"
+else
+  fail "timestamps are offset by each part's start" "$st_stamps"
+fi
+for want in "hello from S1_merged.m4a" "hello from S2_merged.m4a" "hello from S3 it's merged.m4a"; do
+  if grep -qxF "$want" <<<"$st_doc"; then
+    pass "the joined transcript keeps '$want'"
+  else
+    fail "the joined transcript keeps '$want'" "$st_doc"
+  fi
+done
+labels=$(grep -c '^Speaker [0-9]$' <<<"$st_doc" || true)
+if [[ "$labels" == "6" ]] && ! grep -qE '^\*\*?(Part|Speaker)' <<<"$st_doc" &&
+  head -1 <<<"$st_doc" | grep -qF '> **Note:** joined from 3 recordings of one meeting.'; then
+  pass "speaker labels pass through unchanged and nothing added starts with *"
+else
+  fail "speaker labels pass through unchanged and nothing added starts with *" "$st_doc"
+fi
+
+# An hour or more prints as HH:MM:SS, as mw does past the hour.
+OUT_LONG="$WORK/out-long"
+rm -rf "$OUT_LONG"
+MW_LONG=1 "$HT" --yes --output-dir "$OUT_LONG" a1a10001 >/dev/null 2>&1 || true
+long_stamps=$(grep -hE '^\*59|^\*01:0' "$OUT_LONG"/*.md 2>/dev/null | tr '\n' ' ' || true)
+if [[ "$long_stamps" == "*59:50-01:00:02* *01:01:19-01:01:31* *01:02:06-01:02:18* " ]]; then
+  pass "an offset past the hour is written HH:MM:SS"
+else
+  fail "an offset past the hour is written HH:MM:SS" "$long_stamps"
+fi
+rm -rf "$OUT_LONG"
+
+# --skip-existing recognizes the meeting from any of its recordings.
+rm -f "$WORK/mw-calls"
+skip_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --skip-existing --yes --output-dir "$OUT_ST" a1a10003 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Already transcribed: $ST_BASE.meta.json" <<<"$skip_out"; then
+  pass "--skip-existing recognizes a later recording of a stitched meeting"
+else
+  fail "--skip-existing recognizes a later recording of a stitched meeting" "exit $rc: $skip_out"
+fi
+absent "--skip-existing runs no mw for a stitched meeting" "$WORK/mw-calls"
+all_out=$("$HT" --all --dry-run --output-dir "$OUT_ST" 2>&1 || true)
+if grep -qF a1a10001 <<<"$all_out"; then
+  fail "--all treats a stitched meeting as transcribed" "$all_out"
+else
+  pass "--all treats a stitched meeting as transcribed"
+fi
+
+# Per-piece transcripts from before stitching: done when they name every
+# piece; a piece none names is still pending.
+OUT_LEGACY="$WORK/out-legacy"
+rm -rf "$OUT_LEGACY"
+mkdir -p "$OUT_LEGACY"
+for piece in a1a10001 a1a10002 a1a10003; do
+  printf '{"session_id": "%s", "output_file": "2026-10-15_piece_%s.md"}\n' "$piece" "${piece:0:8}" \
+    >"$OUT_LEGACY/2026-10-15_piece_${piece:0:8}.meta.json"
+done
+rm -f "$WORK/mw-calls"
+skip_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --skip-existing --yes --output-dir "$OUT_LEGACY" a1a10001 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Already transcribed: " <<<"$skip_out"; then
+  pass "--skip-existing counts per-recording transcripts that name every piece"
+else
+  fail "--skip-existing counts per-recording transcripts that name every piece" "exit $rc: $skip_out"
+fi
+absent "per-recording transcripts of every piece prevent a duplicate stitch" "$WORK/mw-calls"
+rm -f "$OUT_LEGACY"/2026-10-15_piece_a1a1000[12].meta.json
+all_out=$("$HT" --all --dry-run --output-dir "$OUT_LEGACY" 2>&1 || true)
+if grep -qF a1a10001 <<<"$all_out"; then
+  pass "--all queues a meeting whose earlier pieces no sidecar names"
+else
+  fail "--all queues a meeting whose earlier pieces no sidecar names" "$all_out"
+fi
+skip_out=$("$HT" --skip-existing --yes --output-dir "$OUT_LEGACY" a1a10001 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Transcript written: $OUT_LEGACY/2026-10-15_split-huddle_a1a10001.md" <<<"$skip_out" &&
+  head -1 "$OUT_LEGACY/2026-10-15_split-huddle_a1a10001.md" | grep -qF "may duplicate 2026-10-15_piece_a1a10003.md"; then
+  pass "--skip-existing stitches the meeting when one piece has a transcript, noting it"
+else
+  fail "--skip-existing stitches the meeting when one piece has a transcript, noting it" "exit $rc: $skip_out"
+fi
+rm -rf "$OUT_LEGACY"
+
+# --all leaves a part the watcher recorded as missing to the watcher's retry.
+mkdir -p "$OUT_LEGACY"
+printf '{"session_id": "a1a10001", "session_ids": ["a1a10001", "a1a10003"], "missing_session_ids": ["a1a10002"], "output_file": "x_a1a10001.md"}\n' \
+  >"$OUT_LEGACY/2026-10-15_split-huddle_a1a10001.meta.json"
+all_out=$("$HT" --all --dry-run --output-dir "$OUT_LEGACY" 2>&1 || true)
+if grep -qF a1a10001 <<<"$all_out"; then
+  fail "--all does not write a duplicate for a meeting with a missing part" "$all_out"
+else
+  pass "--all does not write a duplicate for a meeting with a missing part"
+fi
+rm -f "$OUT_LEGACY/2026-10-15_split-huddle_a1a10001.meta.json"
+rmdir "$OUT_LEGACY"
+
+# A lone recording that a stitched sidecar lists, under another id, is done too.
+mkdir -p "$OUT_LEGACY"
+printf '{"session_id": "a1a10001", "session_ids": ["a1a10001", "a1a10005"], "output_file": "x_a1a10001.md"}\n' \
+  >"$OUT_LEGACY/2026-10-15_split-huddle_a1a10001.meta.json"
+rm -f "$WORK/mw-calls"
+skip_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --skip-existing --yes --output-dir "$OUT_LEGACY" a1a10005 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Already transcribed: $OUT_LEGACY/2026-10-15_split-huddle_a1a10001.meta.json" <<<"$skip_out"; then
+  pass "--skip-existing counts a lone recording a stitched sidecar lists"
+else
+  fail "--skip-existing counts a lone recording a stitched sidecar lists" "exit $rc: $skip_out"
+fi
+absent "a lone recording a stitched sidecar lists is not transcribed again" "$WORK/mw-calls"
+rm -rf "$OUT_LEGACY"
+
+# Another app or a gap past 60 s does not join; a lone recording keeps the old path.
+for lone in a1a10004 a1a10005; do
+  rm -f "$WORK/mw-calls"
+  lone_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --yes --output-dir "$OUT_ST" "$lone" 2>&1) && rc=0 || rc=$?
+  if [[ $rc -eq 0 ]] && ! grep -qF "Stitched:" <<<"$lone_out" && grep -qF "_${lone}.md" <<<"$lone_out"; then
+    pass "$lone is transcribed on its own"
+  else
+    fail "$lone is transcribed on its own" "exit $rc: $lone_out"
+  fi
+  lone_calls=$(grep -c . "$WORK/mw-calls" 2>/dev/null || true)
+  if [[ "$lone_calls" == "1" ]] && ! grep -q '^## Part' "$OUT_ST"/*_"$lone".md; then
+    pass "$lone runs mw once and gets no part heading"
+  else
+    fail "$lone runs mw once and gets no part heading" "calls: $lone_calls"
+  fi
+  absent "$lone is not cached" "$HUDDLE_PIECES_DIR/$lone.md"
+done
+lone_keys=$(jq -c 'keys_unsorted' "$OUT_ST"/2026-10-15_too-late_a1a10005.meta.json 2>/dev/null || true)
+if [[ "$lone_keys" == '["session_id","date","duration_seconds","source_file","output_file","title","reviewed","deleted_source"]' ]]; then
+  pass "a single recording's sidecar is unchanged"
+else
+  fail "a single recording's sidecar is unchanged" "keys: $lone_keys"
+fi
+
+# HUDDLE_STITCH_GAP_SECONDS moves the threshold, 0 disables it, and it is validated.
+gap_out=$(HUDDLE_STITCH_GAP_SECONDS=100 "$HT" --dry-run --output-dir "$OUT_ST" a1a10005 2>&1 || true)
+if grep -qF "Stitched: 4 recordings" <<<"$gap_out"; then
+  pass "a wider HUDDLE_STITCH_GAP_SECONDS joins the later recording"
+else
+  fail "a wider HUDDLE_STITCH_GAP_SECONDS joins the later recording" "$gap_out"
+fi
+gap_out=$(HUDDLE_STITCH_GAP_SECONDS=0 "$HT" --dry-run --output-dir "$OUT_ST" a1a10002 2>&1 || true)
+if grep -qF "Session:  a1a10002" <<<"$gap_out" && ! grep -qF "Stitched:" <<<"$gap_out"; then
+  pass "HUDDLE_STITCH_GAP_SECONDS=0 disables stitching"
+else
+  fail "HUDDLE_STITCH_GAP_SECONDS=0 disables stitching" "$gap_out"
+fi
+for bad in "" "abc" "60;--" "-1"; do
+  rc=0
+  HUDDLE_STITCH_GAP_SECONDS="$bad" "$HT" --list >/dev/null 2>&1 || rc=$?
+  if [[ $rc -eq 1 ]]; then
+    pass "HUDDLE_STITCH_GAP_SECONDS='$bad' rejected"
+  else
+    fail "HUDDLE_STITCH_GAP_SECONDS='$bad' rejected" "exit $rc, wanted 1"
+  fi
+done
+
+# Group by bundle id ("Chrome" and "Google Chrome" are one app). With none,
+# appName decides, and never joins a bundle-id piece.
+sqlite3 "$DB" <<'SQL'
+INSERT INTO recordedmeeting VALUES (x'b1', 200.0, NULL, '2026-10-16 10:00:00.000', 'Chrome', 'com.google.Chrome');
+INSERT INTO session VALUES (x'b1b10001', '2026-10-16 10:03:20.000', 'Chrome Call', NULL, x'b1', NULL, NULL);
+INSERT INTO mediafile VALUES (x'b1b10001', 'mergedMultitrack', 'B1.m4a');
+INSERT INTO recordedmeeting VALUES (x'b2', 200.0, NULL, '2026-10-16 10:03:30.000', 'Google Chrome', 'com.google.Chrome');
+INSERT INTO session VALUES (x'b1b10002', '2026-10-16 10:06:50.000', 'Chrome Call 2', NULL, x'b2', NULL, NULL);
+INSERT INTO mediafile VALUES (x'b1b10002', 'mergedMultitrack', 'B2.m4a');
+INSERT INTO recordedmeeting VALUES (x'b3', 200.0, NULL, '2026-10-16 12:00:00.000', 'Zoom', NULL);
+INSERT INTO session VALUES (x'b1b10003', '2026-10-16 12:03:20.000', 'Zoom Call', NULL, x'b3', NULL, NULL);
+INSERT INTO mediafile VALUES (x'b1b10003', 'mergedMultitrack', 'B3.m4a');
+INSERT INTO recordedmeeting VALUES (x'b4', 200.0, NULL, '2026-10-16 12:03:25.000', 'Zoom', NULL);
+INSERT INTO session VALUES (x'b1b10004', '2026-10-16 12:06:45.000', 'Zoom Call 2', NULL, x'b4', NULL, NULL);
+INSERT INTO mediafile VALUES (x'b1b10004', 'mergedMultitrack', 'B4.m4a');
+INSERT INTO recordedmeeting VALUES (x'b5', 200.0, NULL, '2026-10-16 12:06:50.000', 'Zoom', 'us.zoom.xos');
+INSERT INTO session VALUES (x'b1b10005', '2026-10-16 12:10:10.000', 'Zoom Call 3', NULL, x'b5', NULL, NULL);
+INSERT INTO mediafile VALUES (x'b1b10005', 'mergedMultitrack', 'B5.m4a');
+SQL
+bundle_out=$("$HT" --dry-run --output-dir "$OUT_ST" b1b10002 2>&1 || true)
+if grep -qF "Stitched: 2 recordings of one meeting (b1b10001 b1b10002)" <<<"$bundle_out"; then
+  pass "'Chrome' and 'Google Chrome' with one bundle id are one meeting"
+else
+  fail "'Chrome' and 'Google Chrome' with one bundle id are one meeting" "$bundle_out"
+fi
+bundle_out=$("$HT" --dry-run --output-dir "$OUT_ST" b1b10004 2>&1 || true)
+if grep -qF "Stitched: 2 recordings of one meeting (b1b10003 b1b10004)" <<<"$bundle_out"; then
+  pass "pieces without a bundle id group by appName"
+else
+  fail "pieces without a bundle id group by appName" "$bundle_out"
+fi
+bundle_out=$("$HT" --dry-run --output-dir "$OUT_ST" b1b10005 2>&1 || true)
+if grep -qF "Session:  b1b10005" <<<"$bundle_out" && ! grep -qF "Stitched:" <<<"$bundle_out"; then
+  pass "a piece with a bundle id does not join pieces without one"
+else
+  fail "a piece with a bundle id does not join pieces without one" "$bundle_out"
+fi
+sqlite3 "$DB" "DELETE FROM session WHERE hex(id) LIKE 'B1B1000%'; DELETE FROM recordedmeeting WHERE id IN (x'b1', x'b2', x'b3', x'b4', x'b5'); DELETE FROM mediafile WHERE hex(sessionID) LIKE 'B1B1000%';"
+
+# huddle-watch keeps its own copy of GROUP_CTE; minus its readiness column
+# (rec.ok), the two must group identically.
+cte_of() {
+  sed -n '/^GROUP_CTE="$/,/^)"$/p' "$1" | grep -v 'AS ok$' | sed -e 's/AS dur,$/AS dur/'
+}
+cte_t=$(cte_of "$SCRIPT")
+cte_w=$(cte_of "$WATCH")
+if [[ -n "$cte_t" && "$cte_t" == "$cte_w" ]] && grep -qF bundleIdentifier <<<"$cte_t"; then
+  pass "huddle-transcribe and huddle-watch group split meetings identically"
+else
+  fail "huddle-transcribe and huddle-watch group split meetings identically" "$(diff <(echo "$cte_t") <(echo "$cte_w") || true)"
+fi
+
+# One bad piece does not block the meeting: the rest is joined with a note,
+# and --mark-reviewed spares the bad piece's audio.
+OUT_PART="$WORK/out-partial"
+rm -rf "$OUT_PART"
+part_out=$(MW_FAIL_MATCH="S2_merged" "$HT" --yes --output-dir "$OUT_PART" a1a10001 2>&1) && rc=0 || rc=$?
+part_doc=$(cat "$OUT_PART/2026-10-15_split-huddle_a1a10001.md" 2>/dev/null || true)
+if [[ $rc -eq 0 ]] && grep -qF "Part failed: a1a10002 (mw transcribe failed for $MEDIA/S2_merged.m4a)" <<<"$part_out" &&
+  grep -qxF "> **Note:** this part (session a1a10002) was not transcribed: mw transcribe failed for $MEDIA/S2_merged.m4a." <<<"$part_doc" &&
+  grep -qF "## Part 3 of 3" <<<"$part_doc" && grep -qxF "hello from S3 it's merged.m4a" <<<"$part_doc"; then
+  pass "a piece mw fails on is noted and the rest is joined"
+else
+  fail "a piece mw fails on is noted and the rest is joined" "exit $rc: $part_out / $part_doc"
+fi
+part_ids=$(jq -c '[.session_ids, .missing_session_ids, .source_files]' "$OUT_PART/2026-10-15_split-huddle_a1a10001.meta.json" 2>/dev/null || true)
+if [[ "$part_ids" == "[[\"a1a10001\",\"a1a10003\"],[\"a1a10002\"],[\"S1_merged.m4a\",\"S3 it's merged.m4a\"]]" ]]; then
+  pass "the sidecar lists the missing part apart from the ones it holds"
+else
+  fail "the sidecar lists the missing part apart from the ones it holds" "$part_ids"
+fi
+mr_out=$("$HT" --dry-run --mark-reviewed --yes --output-dir "$OUT_PART" a1a10001 2>&1 | sed -n '/would mark/,$p' || true)
+if grep -qF "would mark reviewed and delete 2 files" <<<"$mr_out" && ! grep -qF S2_merged <<<"$mr_out"; then
+  pass "--mark-reviewed would not delete a missing part's audio"
+else
+  fail "--mark-reviewed would not delete a missing part's audio" "$mr_out"
+fi
+expect_rc "--mark-reviewed refuses for the missing part itself" 1 \
+  --mark-reviewed --yes --output-dir "$OUT_PART" a1a10002
+exists "the missing part's audio is kept" "$MEDIA/S2_merged.m4a"
+rm -rf "$OUT_PART"
+part_out=$(MW_FAIL_MATCH="merged" "$HT" --yes --output-dir "$OUT_PART" a1a10001 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] && grep -qF "no part of the meeting a1a10001 could be transcribed" <<<"$part_out" &&
+  ! compgen -G "$OUT_PART/*.m*" >/dev/null; then
+  pass "a meeting with no part transcribed fails and writes nothing"
+else
+  fail "a meeting with no part transcribed fails and writes nothing" "exit $rc: $part_out"
+fi
+# The first piece failing: session_id is still a piece the sidecar holds.
+MW_FAIL_MATCH="S1_merged" "$HT" --yes --output-dir "$OUT_PART" a1a10001 >/dev/null 2>&1 || true
+part_ids=$(jq -c '[.session_id, .session_ids, .missing_session_ids, .source_file]' "$OUT_PART/2026-10-15_split-huddle_a1a10001.meta.json" 2>/dev/null || true)
+if [[ "$part_ids" == '["a1a10002",["a1a10002","a1a10003"],["a1a10001"],"S2_merged.m4a"]' ]]; then
+  pass "when the first piece fails, session_id is the first piece the transcript holds; the name stays"
+else
+  fail "when the first piece fails, session_id is the first piece the transcript holds; the name stays" "$part_ids"
+fi
+rm -rf "$OUT_PART"
+
+# Audio gone: the cached transcript stands in. No saved audio row at all:
+# MacWhisper has not finished the piece, so it is left out, not noted.
+rm -f "$MEDIA/S2_merged.m4a"
+part_out=$("$HT" --yes --output-dir "$OUT_PART" a1a10001 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Part cached: a1a10002" <<<"$part_out" &&
+  grep -qxF "hello from S2_merged.m4a" "$OUT_PART/2026-10-15_split-huddle_a1a10001.md"; then
+  pass "a piece whose audio is gone joins from its cached transcript"
+else
+  fail "a piece whose audio is gone joins from its cached transcript" "exit $rc: $part_out"
+fi
+rm -rf "$OUT_PART" "$HUDDLE_PIECES_DIR/a1a10002.md"
+part_out=$("$HT" --yes --output-dir "$OUT_PART" a1a10001 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Part failed: a1a10002 (audio file not found at $MEDIA/S2_merged.m4a)" <<<"$part_out"; then
+  pass "a piece with neither audio nor a cached transcript is noted as missing"
+else
+  fail "a piece with neither audio nor a cached transcript is noted as missing" "exit $rc: $part_out"
+fi
+rm -rf "$OUT_PART"
+reset_split_media
+sqlite3 "$DB" "DELETE FROM mediafile WHERE sessionID = x'a1a10003';"
+rm -f "$HUDDLE_PIECES_DIR/a1a10003.md"
+part_out=$("$HT" --yes --output-dir "$OUT_PART" a1a10001 2>&1) && rc=0 || rc=$?
+part_ids=$(jq -c '[.session_ids, has("missing_session_ids"), .pending_session_ids]' "$OUT_PART/2026-10-15_split-huddle_a1a10001.meta.json" 2>/dev/null || true)
+part_tail=$(tail -1 "$OUT_PART/2026-10-15_split-huddle_a1a10001.md" 2>/dev/null || true)
+if [[ $rc -eq 0 ]] && grep -qF "a1a10003, recording 3 of 3 of this meeting, is not ready yet; it is left out." <<<"$part_out" &&
+  [[ "$part_ids" == '[["a1a10001","a1a10002"],false,["a1a10003"]]' ]] &&
+  grep -qF "## Part 2 of 3" "$OUT_PART/2026-10-15_split-huddle_a1a10001.md" &&
+  [[ "$part_tail" == "> **Note:** this transcript may be incomplete. MacWhisper had not finished saving part 3 of 3 (starts at 02:16, session a1a10003) when it was written. Transcribe the meeting again when that part finishes." ]]; then
+  pass "a piece with no saved audio yet is left out, recorded as pending, and named at the end"
+else
+  fail "a piece with no saved audio yet is left out, recorded as pending, and named at the end" "exit $rc: $part_out $part_ids $part_tail"
+fi
+sqlite3 "$DB" "INSERT INTO mediafile VALUES (x'a1a10003', 'mergedMultitrack', 'S3 it''s merged.m4a');"
+rm -rf "$OUT_PART"
+
+# --restitch replaces only its own unreviewed transcript. Each case starts
+# from the one-part transcript the watcher writes first.
+RS="$WORK/out-restitch"
+RS_DOC="$RS/2026-10-15_split-huddle_a1a10001.md"
+RS_META="$RS/2026-10-15_split-huddle_a1a10001.meta.json"
+restitch_seed() {
+  rm -rf "$RS" "$HUDDLE_PIECES_DIR"
+  mkdir -p "$RS" "$HUDDLE_PIECES_DIR"
+  printf 'Speaker 1\n*00:00-00:05*\ncached piece one\n\n' >"$HUDDLE_PIECES_DIR/a1a10001.md"
+  printf 'one-part transcript\n' >"$RS_DOC"
+  # The hash of the doc as the watcher wrote it, so it is replaceable.
+  local rs_hash
+  rs_hash=$(shasum -a 256 <"$RS_DOC")
+  jq -n --argjson extra "$1" --arg h "${rs_hash%% *}" '{session_id: "a1a10001", date: "2026-10-15", duration_seconds: 83,
+    source_file: "S1_merged.m4a", output_file: "2026-10-15_split-huddle_a1a10001.md", title: "Split Huddle",
+    reviewed: false, deleted_source: false, doc_sha256: $h} + $extra' >"$RS_META"
+}
+# A cached part that cannot be read mid-join fails the run; nothing is replaced.
+restitch_seed '{"restitchable": true}'
+chmod 000 "$HUDDLE_PIECES_DIR/a1a10001.md"
+rs_out=$("$HT" --restitch --yes --output-dir "$RS" a1a10001 2>&1) && rc=0 || rc=$?
+chmod 600 "$HUDDLE_PIECES_DIR/a1a10001.md"
+if [[ $rc -ne 0 ]] && grep -qF "failed to join" <<<"$rs_out" && grep -qxF "one-part transcript" "$RS_DOC"; then
+  pass "an unreadable cached part fails the join and leaves the transcript alone"
+else
+  fail "an unreadable cached part fails the join and leaves the transcript alone" "exit $rc: $rs_out"
+fi
+restitch_seed '{"restitchable": true}'
+rm -f "$WORK/mw-calls"
+rs_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --restitch --yes --output-dir "$RS" a1a10001 2>&1) && rc=0 || rc=$?
+rs_calls=$(awk '{ print $NF }' "$WORK/mw-calls" 2>/dev/null | sed 's|.*/||' | tr '\n' ',' || true)
+if [[ $rc -eq 0 ]] && grep -qF "Replaced: $RS_DOC" <<<"$rs_out" && grep -qF "Transcript written: $RS_DOC" <<<"$rs_out"; then
+  pass "--restitch replaces its own unreviewed transcript in place"
+else
+  fail "--restitch replaces its own unreviewed transcript in place" "exit $rc: $rs_out"
+fi
+if [[ "$rs_calls" == "S2_merged.m4a,merged.m4a," ]] && grep -qxF "cached piece one" "$RS_DOC" &&
+  grep -qF "## Part 3 of 3" "$RS_DOC" && ! grep -qF "one-part transcript" "$RS_DOC"; then
+  pass "--restitch transcribes only the new pieces and reuses the cached one"
+else
+  fail "--restitch transcribes only the new pieces and reuses the cached one" "mw: $rs_calls"
+fi
+rs_files=$(find "$RS" -name '*.md' ! -name '_index.md' | wc -l | tr -d ' ')
+rs_meta=$(jq -c '[.session_ids, .restitchable, .reviewed]' "$RS_META" 2>/dev/null || true)
+if [[ "$rs_files" == "1" && "$rs_meta" == '[["a1a10001","a1a10002","a1a10003"],true,false]' ]]; then
+  pass "the replaced sidecar names all three pieces and stays replaceable"
+else
+  fail "the replaced sidecar names all three pieces and stays replaceable" "files=$rs_files meta=$rs_meta"
+fi
+rm -f "$WORK/mw-calls"
+rs_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --restitch --yes --output-dir "$RS" a1a10003 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Already transcribed: $RS_META" <<<"$rs_out"; then
+  pass "--restitch of a meeting whose sidecar names every piece does nothing"
+else
+  fail "--restitch of a meeting whose sidecar names every piece does nothing" "exit $rc: $rs_out"
+fi
+absent "--restitch with nothing new runs no mw" "$WORK/mw-calls"
+
+# Not replaced: a manual transcript, a reviewed one, or any transcript when
+# the run is manual (decision d). Each gets -2.
+for rs_case in manual reviewed deleted by-hand; do
+  case "$rs_case" in
+    manual) restitch_seed '{}' ;;
+    reviewed) restitch_seed '{"restitchable": true, "reviewed": true}' ;;
+    deleted) restitch_seed '{"restitchable": true, "reviewed": true, "deleted_source": true}' ;;
+    *) restitch_seed '{"restitchable": true}' ;;
+  esac
+  rs_flag="--restitch" rs_part1="cached piece one"
+  # A manual run transcribes afresh any piece whose audio is still there.
+  [[ "$rs_case" != "by-hand" ]] || rs_flag="--skip-existing" rs_part1="hello from S1_merged.m4a"
+  # A reviewed piece's audio is gone; its cached transcript still joins.
+  [[ "$rs_case" != "deleted" ]] || rm -f "$MEDIA/S1_merged.m4a"
+  rs_out=$("$HT" "$rs_flag" --yes --output-dir "$RS" a1a10001 2>&1) && rc=0 || rc=$?
+  rs_two="$RS/2026-10-15_split-huddle-2_a1a10001.md"
+  rs_first=$(cat "$RS_DOC" 2>/dev/null || true)
+  if [[ $rc -eq 0 && "$rs_first" == "one-part transcript" ]] && ! grep -qF "Replaced:" <<<"$rs_out" &&
+    head -1 "$rs_two" 2>/dev/null | grep -qF "may duplicate 2026-10-15_split-huddle_a1a10001.md" &&
+    grep -qxF "$rs_part1" "$rs_two" && grep -qF "## Part 3 of 3" "$rs_two"; then
+    pass "$rs_case: the earlier transcript is kept and the whole meeting goes to -2"
+  else
+    fail "$rs_case: the earlier transcript is kept and the whole meeting goes to -2" "exit $rc: $rs_out"
+  fi
+  reset_split_media
+done
+# Two sidecars now name a1a10001: --mark-reviewed still refuses to guess.
+expect_rc "--mark-reviewed refuses while a stitched -2 and the original both name a piece" 1 \
+  --mark-reviewed --yes --output-dir "$RS" a1a10001
+exists "--mark-reviewed with two sidecars keeps the audio" "$MEDIA/S2_merged.m4a"
+# Asked through a piece only the -2 names, it still sees the shared one.
+mr_out=$("$HT" --mark-reviewed --yes --output-dir "$RS" a1a10003 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] && grep -qF "other sidecars in $RS also name" <<<"$mr_out" &&
+  [[ -f "$MEDIA/S1_merged.m4a" && -f "$MEDIA/S3 it's merged.m4a" ]]; then
+  pass "--mark-reviewed through an unshared piece refuses while another sidecar holds a shared one"
+else
+  fail "--mark-reviewed through an unshared piece refuses while another sidecar holds a shared one" "exit $rc: $mr_out"
+fi
+# A non-string entry in the -2's ids does not switch the shared-piece guard off.
+rs_two_meta="${rs_two%.md}.meta.json"
+cp "$rs_two_meta" "$WORK/rs-two.orig"
+jq '.session_ids += [{}]' "$WORK/rs-two.orig" >"$rs_two_meta"
+mr_out=$("$HT" --mark-reviewed --yes --output-dir "$RS" a1a10003 2>&1) && rc=0 || rc=$?
+mv "$WORK/rs-two.orig" "$rs_two_meta"
+if [[ $rc -eq 1 ]] && grep -qF "other sidecars in $RS also name" <<<"$mr_out" &&
+  [[ -f "$MEDIA/S1_merged.m4a" && -f "$MEDIA/S3 it's merged.m4a" ]]; then
+  pass "--mark-reviewed refuses a shared piece when the sidecar also holds a non-string id"
+else
+  fail "--mark-reviewed refuses a shared piece when the sidecar also holds a non-string id" "exit $rc: $mr_out"
+fi
+
+# A retry that adds nothing (the only new piece fails again) leaves the
+# transcript alone and fails, so the watcher counts the attempt.
+restitch_seed '{"restitchable": true, "session_ids": ["a1a10001", "a1a10003"], "missing_session_ids": ["a1a10002"]}'
+printf 'Speaker 1\n*00:00-00:05*\ncached piece three\n\n' >"$HUDDLE_PIECES_DIR/a1a10003.md"
+rs_out=$(MW_FAIL_MATCH="S2_merged" "$HT" --restitch --yes --output-dir "$RS" a1a10001 2>&1) && rc=0 || rc=$?
+rs_first=$(cat "$RS_DOC" 2>/dev/null || true)
+if [[ $rc -eq 1 && "$rs_first" == "one-part transcript" ]] && grep -qF "Part failed: a1a10002" <<<"$rs_out" &&
+  grep -qF "no new part of the meeting a1a10001 could be transcribed" <<<"$rs_out"; then
+  pass "--restitch that only fails again rewrites nothing and exits 1"
+else
+  fail "--restitch that only fails again rewrites nothing and exits 1" "exit $rc: $rs_out"
+fi
+rs_out=$("$HT" --restitch --yes --output-dir "$RS" a1a10001 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Replaced: $RS_DOC" <<<"$rs_out" && grep -qxF "cached piece three" "$RS_DOC" &&
+  grep -qxF "hello from S2_merged.m4a" "$RS_DOC"; then
+  pass "a missing part that succeeds later fills its place in the same transcript"
+else
+  fail "a missing part that succeeds later fills its place in the same transcript" "exit $rc: $rs_out"
+fi
+
+# A hand-edited transcript is kept: the doc no longer matches the hash its
+# sidecar recorded, so the meeting goes to -2.
+restitch_seed '{"restitchable": true}'
+printf 'my own edit\n' >>"$RS_DOC"
+rs_out=$("$HT" --restitch --yes --output-dir "$RS" a1a10001 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && ! grep -qF "Replaced:" <<<"$rs_out" && grep -qxF "my own edit" "$RS_DOC" &&
+  head -1 "$RS/2026-10-15_split-huddle-2_a1a10001.md" 2>/dev/null | grep -qF "may duplicate 2026-10-15_split-huddle_a1a10001.md"; then
+  pass "--restitch keeps a transcript edited by hand and writes -2"
+else
+  fail "--restitch keeps a transcript edited by hand and writes -2" "exit $rc: $rs_out"
+fi
+# Reviewed while the run transcribes: the last look before writing sees it.
+restitch_seed '{"restitchable": true}'
+rs_out=$(MW_MARK_REVIEWED="$RS_META" "$HT" --restitch --yes --output-dir "$RS" a1a10001 2>&1) && rc=0 || rc=$?
+rs_first=$(cat "$RS_DOC" 2>/dev/null || true)
+if [[ $rc -eq 0 && "$rs_first" == "one-part transcript" ]] && ! grep -qF "Replaced:" <<<"$rs_out" &&
+  grep -qF "was reviewed or edited while this ran; writing 2026-10-15_split-huddle-2_a1a10001.md instead" <<<"$rs_out" &&
+  head -1 "$RS/2026-10-15_split-huddle-2_a1a10001.md" 2>/dev/null | grep -qF "may duplicate 2026-10-15_split-huddle_a1a10001.md" &&
+  [[ "$(jq -r '.reviewed' "$RS_META" 2>/dev/null || true)" == "true" ]]; then
+  pass "--restitch writes -2 when the transcript is reviewed mid-run"
+else
+  fail "--restitch writes -2 when the transcript is reviewed mid-run" "exit $rc: $rs_out"
+fi
+
+# --pending: left out, named at the end. Here it is the first piece, so
+# session_id is the first part held; the name stays.
+restitch_seed '{}'
+rm -f "$RS_DOC" "$RS_META" "$HUDDLE_PIECES_DIR/a1a10001.md"
+rs_out=$("$HT" --restitch --yes --output-dir "$RS" --pending a1a10001 a1a10002 2>&1) && rc=0 || rc=$?
+rs_meta=$(jq -c '[.session_id, .session_ids, .pending_session_ids, .restitchable, (.doc_sha256 | length)]' "$RS_META" 2>/dev/null || true)
+rs_tail=$(tail -1 "$RS_DOC" 2>/dev/null || true)
+rs_heads=$(grep '^## ' "$RS_DOC" 2>/dev/null | tr '\n' '|' || true)
+if [[ $rc -eq 0 && "$rs_meta" == '["a1a10002",["a1a10002","a1a10003"],["a1a10001"],true,64]' ]] &&
+  [[ "$rs_heads" == "## Part 2 of 3 — starts at 01:29, after a 6 s gap|## Part 3 of 3 — starts at 02:16, after a 4 s gap|" ]] &&
+  [[ "$rs_tail" == "> **Note:** this transcript may be incomplete. MacWhisper had not finished saving part 1 of 3 (starts at 00:00, session a1a10001) when it was written. It will be updated when that part finishes." ]] &&
+  grep -qx "Part pending: a1a10001" <<<"$rs_out"; then
+  pass "--pending leaves a recording out, records it, and ends the transcript with a note naming it"
+else
+  fail "--pending leaves a recording out, records it, and ends the transcript with a note naming it" "exit $rc: $rs_meta $rs_heads $rs_tail"
+fi
+rs_out=$("$HT" --restitch --yes --output-dir "$RS" --pending a1a10001 a1a10001 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 0 ]] && grep -qF "Already transcribed: $RS_META" <<<"$rs_out"; then
+  pass "--restitch with the same recording still pending does nothing"
+else
+  fail "--restitch with the same recording still pending does nothing" "exit $rc: $rs_out"
+fi
+# By hand, a missing or pending part counts as covered: retrying it is the watcher's job.
+all_out=$("$HT" --all --dry-run --output-dir "$RS" 2>&1 || true)
+skip_out=$("$HT" --skip-existing --yes --output-dir "$RS" a1a10001 2>&1) && rc=0 || rc=$?
+if ! grep -qF a1a10001 <<<"$all_out" && [[ $rc -eq 0 ]] && grep -qF "Already transcribed: $RS_META" <<<"$skip_out"; then
+  pass "--all and --skip-existing leave a meeting with a pending part to the watcher"
+else
+  fail "--all and --skip-existing leave a meeting with a pending part to the watcher" "$all_out / exit $rc: $skip_out"
+fi
+rm -f "$WORK/mw-calls"
+rs_out=$(MW_CALLS="$WORK/mw-calls" "$HT" --restitch --yes --output-dir "$RS" a1a10001 2>&1) && rc=0 || rc=$?
+rs_meta=$(jq -c '[.session_id, .session_ids, has("pending_session_ids")]' "$RS_META" 2>/dev/null || true)
+if [[ $rc -eq 0 && "$rs_meta" == '["a1a10001",["a1a10001","a1a10002","a1a10003"],false]' ]] &&
+  grep -qF "Replaced: $RS_DOC" <<<"$rs_out" && ! grep -qF "may be incomplete" "$RS_DOC" &&
+  grep -qF "## Part 1 of 3" "$RS_DOC" && [[ "$(grep -c . "$WORK/mw-calls" 2>/dev/null || true)" == "1" ]]; then
+  pass "once the pending recording is ready, --restitch replaces the transcript and the note goes"
+else
+  fail "once the pending recording is ready, --restitch replaces the transcript and the note goes" "exit $rc: $rs_meta $rs_out"
+fi
+for bad_pending in "xyz" "--all"; do
+  expect_rc "--pending '$bad_pending' is rejected" 1 --restitch --dry-run --output-dir "$RS" --pending "$bad_pending" a1a10001
+done
+expect_rc "--pending cannot be combined with --all" 1 --all --dry-run --output-dir "$RS" --pending a1a10001
+# Like any session id: dashes and case are ignored, and a prefix matches. A
+# cached piece is never pending, so these run without the cache.
+HUDDLE_PIECES_DIR="$WORK/no-pieces" expect_out "--pending takes a dashed, upper-case id" \
+  "Part 3:   a1a10003 starts at 02:16, after a 4 s gap: (not ready yet; left out)" \
+  --dry-run --output-dir "$RS" --pending A1A1-0003 a1a10001
+HUDDLE_PIECES_DIR="$WORK/no-pieces" expect_out "--pending matches by prefix; with none ready, nothing is written" \
+  "Error: no recording of the meeting a1a10001 is ready yet." --restitch --yes --output-dir "$RS" --pending a1a1000 a1a10001
+absent "--pending with none ready creates no cache" "$WORK/no-pieces"
+rm -rf "$RS"
+expect_rc "--restitch cannot be combined with --all" 1 --restitch --all --output-dir "$RS"
+expect_rc "--restitch cannot be combined with --mark-reviewed" 1 --restitch --mark-reviewed a1a10001
+
+# --mark-reviewed through any recording removes every piece's audio, and nothing else's.
+for sid in a1a10001 a1a10002 a1a10003; do
+  printf 'cached\n' >"$HUDDLE_PIECES_DIR/$sid.md"
+done
+mr_out=$("$HT" --dry-run --mark-reviewed --yes --output-dir "$OUT_ST" a1a10003 2>&1 || true)
+if grep -qF "would mark reviewed and delete 3 files" <<<"$mr_out" && grep -qF "S3 it's merged.m4a" <<<"$mr_out" &&
+  grep -qF "  $HUDDLE_PIECES_DIR/a1a10002.md" <<<"$mr_out"; then
+  pass "--dry-run --mark-reviewed lists every piece of a split meeting and its cached transcripts"
+else
+  fail "--dry-run --mark-reviewed lists every piece of a split meeting and its cached transcripts" "$mr_out"
+fi
+exists "--dry-run --mark-reviewed keeps the pieces" "$MEDIA/S1_merged.m4a"
+# A removal failing part-way names what is already gone. The stub trash
+# refuses the second piece; the full run below then finishes the job.
+TRASH_BIN="$WORK/trash-bin"
+mkdir -p "$TRASH_BIN" "$WORK/trashed"
+cat >"$TRASH_BIN/trash" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" != *S2_merged.m4a ]] || exit 1
+mv -- "$1" "$TRASHED_DIR/"
+STUB
+chmod +x "$TRASH_BIN/trash"
+mr_out=$(PATH="$TRASH_BIN:$PATH" TRASHED_DIR="$WORK/trashed" \
+  "$HT" --mark-reviewed --yes --output-dir "$OUT_ST" a1a10003 2>&1) && rc=0 || rc=$?
+if [[ $rc -ne 0 ]] && grep -qF "failed to trash $MEDIA/S2_merged.m4a" <<<"$mr_out" &&
+  grep -qF "Already removed: $MEDIA/S1_merged.m4a" <<<"$mr_out"; then
+  pass "a removal failing part-way names the files already removed"
+else
+  fail "a removal failing part-way names the files already removed" "exit $rc: $mr_out"
+fi
+expect_rc "--mark-reviewed through a later recording succeeds" 0 \
+  --mark-reviewed --yes --output-dir "$OUT_ST" a1a10003
+for gone in S1_merged.m4a S2_merged.m4a "S3 it's merged.m4a"; do
+  absent "--mark-reviewed removes $gone" "$MEDIA/$gone"
+done
+for sid in a1a10001 a1a10002 a1a10003; do
+  absent "--mark-reviewed removes the cached transcript of $sid" "$HUDDLE_PIECES_DIR/$sid.md"
+done
+exists "--mark-reviewed leaves another app's recording alone" "$MEDIA/S4_merged.m4a"
+exists "--mark-reviewed leaves a recording past the gap alone" "$MEDIA/S5_merged.m4a"
+mr_flags=$(jq -r '[.reviewed, .deleted_source] | join(",")' "$ST_BASE.meta.json" 2>/dev/null || true)
+if [[ "$mr_flags" == "true,true" ]]; then
+  pass "the stitched sidecar records reviewed and deleted_source"
+else
+  fail "the stitched sidecar records reviewed and deleted_source" "flags: $mr_flags"
+fi
+expect_out "a repeated --mark-reviewed reports the pieces already gone" "already gone" \
+  --mark-reviewed --yes --output-dir "$OUT_ST" a1a10001
+
+# A piece with its own pre-stitching transcript releases only its own audio.
+reset_split_media
+OUT_LEGACY="$WORK/out-legacy"
+rm -rf "$OUT_LEGACY"
+mkdir -p "$OUT_LEGACY"
+printf 'transcript body\n' >"$OUT_LEGACY/2026-10-15_later-piece_a1a10002.md"
+printf '{"session_id": "a1a10002", "output_file": "2026-10-15_later-piece_a1a10002.md"}\n' \
+  >"$OUT_LEGACY/2026-10-15_later-piece_a1a10002.meta.json"
+mr_out=$("$HT" --dry-run --mark-reviewed --yes --output-dir "$OUT_LEGACY" a1a10002 2>&1 || true)
+if grep -qF "would mark reviewed and delete $MEDIA/S2_merged.m4a)" <<<"$mr_out"; then
+  pass "--dry-run --mark-reviewed of a per-piece transcript names only that piece"
+else
+  fail "--dry-run --mark-reviewed of a per-piece transcript names only that piece" "$mr_out"
+fi
+expect_rc "--mark-reviewed of a per-piece transcript succeeds" 0 \
+  --mark-reviewed --yes --output-dir "$OUT_LEGACY" a1a10002
+absent "--mark-reviewed of a per-piece transcript removes that piece" "$MEDIA/S2_merged.m4a"
+exists "--mark-reviewed of a per-piece transcript keeps the first piece" "$MEDIA/S1_merged.m4a"
+exists "--mark-reviewed of a per-piece transcript keeps the last piece" "$MEDIA/S3 it's merged.m4a"
+# Stitched by hand after the pieces had their own transcripts: the refusal
+# names both sidecars and says what to move.
+printf 'stitched body\n' >"$OUT_LEGACY/2026-10-15_split-huddle_a1a10001.md"
+printf '{"session_id": "a1a10001", "session_ids": ["a1a10001", "a1a10002", "a1a10003"], "output_file": "2026-10-15_split-huddle_a1a10001.md"}\n' \
+  >"$OUT_LEGACY/2026-10-15_split-huddle_a1a10001.meta.json"
+mr_out=$("$HT" --mark-reviewed --yes --output-dir "$OUT_LEGACY" a1a10002 2>&1) && rc=0 || rc=$?
+if [[ $rc -eq 1 ]] && grep -qF "2026-10-15_later-piece_a1a10002.meta.json" <<<"$mr_out" &&
+  grep -qF "2026-10-15_split-huddle_a1a10001.meta.json" <<<"$mr_out" &&
+  grep -qF "2026-10-15_later-piece_a1a10002.md, holds a1a10002 (a per-recording transcript)" <<<"$mr_out" &&
+  grep -qF "move each per-recording .md and .meta.json pair" <<<"$mr_out"; then
+  pass "--mark-reviewed names the per-recording and stitched sidecars it refuses over, and the fix"
+else
+  fail "--mark-reviewed names the per-recording and stitched sidecars it refuses over, and the fix" "exit $rc: $mr_out"
+fi
+exists "the refusal keeps the last piece's audio" "$MEDIA/S3 it's merged.m4a"
+rm -rf "$OUT_LEGACY"
+
+sqlite3 "$DB" "DELETE FROM session WHERE hex(id) LIKE 'A1A1000%'; DELETE FROM recordedmeeting WHERE id IN (x'a1', x'a2', x'a3', x'a4', x'a5'); DELETE FROM mediafile WHERE hex(sessionID) LIKE 'A1A1000%';"
+rm -f "$MEDIA"/S[1-5]*.m4a
+rm -rf "$OUT_ST" "$HUDDLE_PIECES_DIR"
+unset HUDDLE_PIECES_DIR
+
 # --- huddle-watch ------------------------------------------------------
 #
 # The watcher is driven purely through its environment overrides. Its
@@ -883,6 +1704,10 @@ if [[ -n "${ALREADY_TRANSCRIBED:-}" ]]; then
   echo "Already transcribed: /tmp/out/${1:0:8}.meta.json"
   exit 0
 fi
+# The lines a split meeting's partial join and in-place re-stitch print.
+[[ -z "${STUB_PART_FAILED:-}" ]] || echo "Part failed: $STUB_PART_FAILED (mw transcribe failed for x.m4a)"
+[[ -z "${STUB_PART_PENDING:-}" ]] || echo "Part pending: $STUB_PART_PENDING"
+[[ -z "${STUB_REPLACED:-}" ]] || echo "Replaced: ${STUB_OUT_PATH:-/tmp/out/${1:0:8}.md}"
 echo "Transcript written: ${STUB_OUT_PATH:-/tmp/out/${1:0:8}.md}"
 STUB
 chmod +x "$WBIN/huddle-transcribe"
@@ -1040,6 +1865,10 @@ INSERT INTO session VALUES (x'dead2020', '2026-08-21 10:00:00.000', 'Null Flags'
 -- Added after the inserts above, which are positional. 0 for every row: none
 -- of them is a live meeting still in progress.
 ALTER TABLE session ADD COLUMN isIncomingLiveStream BOOLEAN NOT NULL DEFAULT 0;
+-- NULL for every row above, which keeps them out of split-meeting grouping.
+ALTER TABLE recordedmeeting ADD COLUMN date TEXT;
+ALTER TABLE recordedmeeting ADD COLUMN appName TEXT;
+ALTER TABLE recordedmeeting ADD COLUMN bundleIdentifier TEXT;
 
 -- Every session except bbbb2222 has its audio saved, so each one is gated
 -- only by the condition its comment names.
@@ -1201,14 +2030,14 @@ fi
 #
 # These are never marked diarized. Saved audio and the live flag gate them.
 sqlite3 "$WDB" <<'SQL'
-INSERT INTO recordedmeeting VALUES (x'81', 1500.0, 'rmLiveDone');
+INSERT INTO recordedmeeting (id, duration, title) VALUES (x'81', 1500.0, 'rmLiveDone');
 INSERT INTO session VALUES (x'abcd1313', '2026-09-24 20:01:11.000', 'Live Finalized',
   NULL, x'81', NULL, 1, 0, 0, 0, NULL, NULL, 0);
 INSERT INTO mediafile VALUES (x'abcd1313', 'mergedMultitrack', 'live.m4a');
-INSERT INTO recordedmeeting VALUES (x'82', 1500.0, 'rmLiveNow');
+INSERT INTO recordedmeeting (id, duration, title) VALUES (x'82', 1500.0, 'rmLiveNow');
 INSERT INTO session VALUES (x'abcd1414', '2026-09-24 21:00:00.000', 'Live In Progress',
   NULL, x'82', NULL, 1, 0, 0, 0, NULL, NULL, 1);
-INSERT INTO recordedmeeting VALUES (x'83', 1500.0, 'rmLiveNowAudio');
+INSERT INTO recordedmeeting (id, duration, title) VALUES (x'83', 1500.0, 'rmLiveNowAudio');
 INSERT INTO session VALUES (x'abcd1515', '2026-09-24 22:00:00.000', 'Live With Audio',
   NULL, x'83', NULL, 1, 0, 0, 0, NULL, NULL, 1);
 INSERT INTO mediafile VALUES (x'abcd1515', 'mergedMultitrack', 'live2.m4a');
@@ -1388,10 +2217,10 @@ else
   fail "only the newly-ready session was transcribed" "$call_count calls"
 fi
 expect_watch_rc "run after success exits 0 with nothing pending" 0 --once
-if [[ -f "$CALLS" ]] && grep -q -- '--skip-existing' "$CALLS"; then
-  pass "--skip-existing is passed so finished sessions are not redone"
+if [[ -f "$CALLS" ]] && grep -q -- '--restitch' "$CALLS"; then
+  pass "--restitch is passed so finished sessions are not redone"
 else
-  fail "--skip-existing is passed so finished sessions are not redone"
+  fail "--restitch is passed so finished sessions are not redone"
 fi
 
 # --- a session that already has a transcript is recorded, not redone ---
@@ -2670,7 +3499,7 @@ notify_reset
 # huddle-transcribe prints no "Transcript written:" line, which is the path
 # that puts an untrusted title into the AppleScript.
 build_watch_db
-sqlite3 "$WDB" "INSERT INTO recordedmeeting VALUES (x'8f', 900.0, 'rmHostileTitle');"
+sqlite3 "$WDB" "INSERT INTO recordedmeeting (id, duration, title) VALUES (x'8f', 900.0, 'rmHostileTitle');"
 sqlite3 "$WDB" "INSERT INTO session VALUES (x'beef7777', '2026-08-17 10:00:00.000', 'x\" & (do shell script \"touch $WORK/APPLEPWNED\") & \"y back\\slash', NULL, x'8f', NULL, 1, 1, 0, 0, NULL, NULL, 0);"
 sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'beef7777', 'mergedMultitrack', 'saved.m4a');"
 # A stub that succeeds but prints nothing, forcing the title-fallback path.
@@ -2730,6 +3559,558 @@ if grep -qF '"open -- "' "$NOTIFYLOG" 2>/dev/null; then
 else
   pass "with no transcript path, the alert offers only OK"
 fi
+
+# --- split meetings: each piece as it lands, then re-stitched -----------
+
+echo "huddle-watch: split meetings"
+# Pieces end 6 s and 4 s apart; the last ends 2026-10-15 15:21:35.394 UTC.
+add_split_meeting() {
+  sqlite3 "$WDB" <<'SQL'
+INSERT INTO recordedmeeting VALUES (x'c1', 83.073625, NULL, '2026-10-15 15:01:23.955', 'Slack', 'com.tinyspeck.slackmacgap');
+INSERT INTO session VALUES (x'c1c10001', '2026-10-15 15:02:54.630', 'Split Watch', NULL, x'c1', NULL, 1, 0, 0, 0, NULL, NULL, 0);
+INSERT INTO mediafile VALUES (x'c1c10001', 'mergedMultitrack', 'w1.m4a');
+INSERT INTO recordedmeeting VALUES (x'c2', 42.2019375, NULL, '2026-10-15 15:02:53.351', 'Slack', 'com.tinyspeck.slackmacgap');
+INSERT INTO session VALUES (x'c1c10002', '2026-10-15 15:03:40.742', 'Split Watch 2', NULL, x'c2', NULL, 1, 0, 0, 0, NULL, NULL, 0);
+INSERT INTO mediafile VALUES (x'c1c10002', 'mergedMultitrack', 'w2.m4a');
+INSERT INTO recordedmeeting VALUES (x'c3', 1075.9269375, NULL, '2026-10-15 15:03:39.467', 'Slack', 'com.tinyspeck.slackmacgap');
+INSERT INTO session VALUES (x'c1c10003', '2026-10-15 15:22:56.495', 'Split Watch 3', NULL, x'c3', NULL, 1, 0, 0, 0, NULL, NULL, 0);
+SQL
+}
+calls_for() {
+  grep -c "$1" "$CALLS" 2>/dev/null || true
+}
+split_fresh() {
+  build_watch_db
+  watch_reset
+  watch --once >/dev/null 2>&1 || true
+  add_split_meeting
+  sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'c1c10003', 'mergedMultitrack', 'w3.m4a');"
+}
+
+build_watch_db
+watch_reset
+watch --once >/dev/null 2>&1 || true
+add_split_meeting
+
+# The newest piece has no saved audio yet. The ready ones go now, and the
+# child is told which one is not ready.
+split_out=$(watch --dry-run 2>&1 || true)
+if grep -qF "would transcribe  c1c10001" <<<"$split_out" &&
+  grep -qF "(stitched from 2 of 3 recordings, 2 new; 1 not ready yet)" <<<"$split_out"; then
+  pass "a split meeting does not wait for a piece that is not ready"
+else
+  fail "a split meeting does not wait for a piece that is not ready" "$split_out"
+fi
+watch --once >/dev/null 2>&1 || true
+lead_calls=$(calls_for '^c1c10001 --yes --restitch --pending c1c10003$')
+if [[ "$lead_calls" == "1" ]] &&
+  grep -q '^c1c10001 done$' "$WSTATE" && grep -q '^c1c10002 done$' "$WSTATE" && ! grep -q '^c1c10003 ' "$WSTATE"; then
+  pass "the ready pieces are transcribed with --pending for the one that is not"
+else
+  diag_calls=$(dump "$CALLS")
+  diag_state=$(dump "$WSTATE")
+  diag="calls=$diag_calls state=$diag_state"
+  fail "the ready pieces are transcribed with --pending for the one that is not" "$diag"
+fi
+if grep -qF "STITCH c1c10001: c1c10001 c1c10002 (new: c1c10001 c1c10002; not ready yet: c1c10003)" "$WLOG" 2>/dev/null; then
+  pass "the piece that is not ready is logged with the stitch"
+else
+  diag=$(dump "$WLOG")
+  fail "the piece that is not ready is logged with the stitch" "$diag"
+fi
+# A piece that stays not ready neither re-runs the meeting nor fills the log.
+watch --once >/dev/null 2>&1 || true
+watch --once >/dev/null 2>&1 || true
+stitch_logs=$(grep -c 'STITCH c1c10001' "$WLOG" 2>/dev/null || true)
+if [[ "$(grep -c . "$CALLS" 2>/dev/null || true)" == "1" && "$stitch_logs" == "1" ]]; then
+  pass "a piece that stays not ready causes no re-run and no repeated log line"
+else
+  diag=$(dump "$CALLS")
+  fail "a piece that stays not ready causes no re-run and no repeated log line" "calls=$diag stitch_logs=$stitch_logs"
+fi
+
+# When it becomes ready, the meeting is re-stitched once, without --pending.
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'c1c10003', 'mergedMultitrack', 'w3.m4a');"
+split_out=$(watch --dry-run 2>&1 || true)
+split_lines=$(grep -c c1c1000 <<<"$split_out" || true)
+if grep -qF "would transcribe  c1c10001" <<<"$split_out" &&
+  grep -qF "(stitched from 3 recordings, 1 new)" <<<"$split_out" && [[ "$split_lines" == "1" ]]; then
+  pass "--dry-run shows a complete split meeting once"
+else
+  fail "--dry-run shows a complete split meeting once" "$split_out"
+fi
+split_out=$(watch --list 2>&1 || true)
+if grep -qE '^c1c10003 .* yes ' <<<"$split_out" && grep -qE '^c1c10001 .* seen ' <<<"$split_out"; then
+  pass "--list shows the new piece as ready and the done ones as seen"
+else
+  fail "--list shows the new piece as ready and the done ones as seen" "$split_out"
+fi
+watch --once >/dev/null 2>&1 || true
+split_calls=$(grep -c . "$CALLS" 2>/dev/null || true)
+lead_calls=$(calls_for '^c1c10001 --yes --restitch$')
+if [[ "$split_calls" == "2" && "$lead_calls" == "1" ]]; then
+  pass "a piece that becomes ready re-stitches the meeting via its first piece, with --restitch"
+else
+  diag=$(dump "$CALLS")
+  fail "a piece that becomes ready re-stitches the meeting via its first piece, with --restitch" "$diag"
+fi
+if grep -q '^c1c10001 done$' "$WSTATE" && grep -q '^c1c10002 done$' "$WSTATE" &&
+  grep -q '^c1c10003 done$' "$WSTATE"; then
+  pass "every piece of the meeting is recorded as done"
+else
+  diag=$(dump "$WSTATE")
+  fail "every piece of the meeting is recorded as done" "$diag"
+fi
+if grep -qF "STITCH c1c10001: c1c10001 c1c10002 c1c10003 (new: c1c10003)" "$WLOG" 2>/dev/null; then
+  pass "the stitch decision is logged with every piece"
+else
+  diag=$(dump "$WLOG")
+  fail "the stitch decision is logged with every piece" "$diag"
+fi
+watch --once >/dev/null 2>&1 || true
+split_calls=$(grep -c . "$CALLS" 2>/dev/null || true)
+if [[ "$split_calls" == "2" ]]; then
+  pass "a transcribed split meeting is not queued again"
+else
+  diag=$(dump "$CALLS")
+  fail "a transcribed split meeting is not queued again" "$diag"
+fi
+split_out=$(watch --list 2>&1 || true)
+if grep -qE '^c1c10003 .* seen ' <<<"$split_out"; then
+  pass "--list shows a meeting with every piece done as seen"
+else
+  fail "--list shows a meeting with every piece done as seen" "$split_out"
+fi
+
+# A child that still finds a piece not ready leaves it unrecorded.
+watch_reset
+printf '# huddle-watch state v1\naaaa1111 done\nbbbb8888 done\nc1c10001 done\nc1c10002 done\n' >"$WSTATE"
+STUB_PART_PENDING=c1c10003 watch --once >/dev/null 2>&1 || true
+lead_calls=$(calls_for '^c1c10001 ')
+if [[ "$lead_calls" == "1" ]] && ! grep -q '^c1c10003 ' "$WSTATE"; then
+  pass "a piece the child reports not ready is not recorded as done"
+else
+  diag=$(dump "$WSTATE")
+  fail "a piece the child reports not ready is not recorded as done" "$diag"
+fi
+printf '# huddle-watch state v1\naaaa1111 done\nbbbb8888 done\nc1c10001 done\nc1c10002 done\nc1c10003 done\n' >"$WSTATE"
+
+# The bug this fixes: a piece saved after its meeting was handled was skipped
+# for good. Now it makes the meeting pending again.
+sqlite3 "$WDB" <<'SQL'
+INSERT INTO recordedmeeting VALUES (x'c4', 30.0, NULL, '2026-10-15 15:21:40.000', 'Slack', 'com.tinyspeck.slackmacgap');
+INSERT INTO session VALUES (x'c1c10004', '2026-10-15 15:23:30.000', 'Split Watch 4', NULL, x'c4', NULL, 1, 0, 0, 0, NULL, NULL, 0);
+INSERT INTO mediafile VALUES (x'c1c10004', 'mergedMultitrack', 'w4.m4a');
+SQL
+split_out=$(watch --dry-run 2>&1 || true)
+if grep -qF "would transcribe  c1c10001" <<<"$split_out" && grep -qF "(stitched from 4 recordings, 1 new)" <<<"$split_out"; then
+  pass "a piece saved after its meeting was transcribed makes the meeting pending"
+else
+  fail "a piece saved after its meeting was transcribed makes the meeting pending" "$split_out"
+fi
+notify_reset
+rm -f "$CALLS"
+STUB_REPLACED=1 watch --once >/dev/null 2>&1 || true
+lead_calls=$(calls_for '^c1c10001 --yes --restitch$')
+if [[ "$lead_calls" == "1" ]] && grep -q '^c1c10004 done$' "$WSTATE"; then
+  pass "the late piece re-stitches the meeting and is recorded as done"
+else
+  diag_calls=$(dump "$CALLS")
+  diag_state=$(dump "$WSTATE")
+  diag="calls=$diag_calls state=$diag_state"
+  fail "the late piece re-stitches the meeting and is recorded as done" "$diag"
+fi
+if grep -qF "(updated with a later recording)" "$NOTIFYLOG" 2>/dev/null; then
+  pass "a re-stitched transcript raises a new ready alert saying it was updated"
+else
+  diag=$(dump "$NOTIFYLOG")
+  fail "a re-stitched transcript raises a new ready alert saying it was updated" "$diag"
+fi
+
+# A piece already done before (e.g. transcribed alone) does not hold back
+# the others: the child is still run, and the sidecars decide.
+watch_reset
+printf '# huddle-watch state v1\naaaa1111 done\nbbbb8888 done\nc1c10003 done\n' >"$WSTATE"
+watch --once >/dev/null 2>&1 || true
+lead_calls=$(calls_for '^c1c10001 ')
+if [[ "$lead_calls" == "1" ]] && grep -q '^c1c10002 done$' "$WSTATE"; then
+  pass "a meeting with only some pieces done is still processed"
+else
+  diag_calls=$(dump "$CALLS")
+  diag_state=$(dump "$WSTATE")
+  diag="calls=$diag_calls state=$diag_state"
+  fail "a meeting with only some pieces done is still processed" "$diag"
+fi
+watch_reset
+printf '# huddle-watch state v1\naaaa1111 done\nbbbb8888 done\nc1c10001 done\nc1c10002 3\nc1c10003 done\nc1c10004 done\n' >"$WSTATE"
+watch --once >/dev/null 2>&1 || true
+absent "a meeting whose pieces are all done or given up is not run" "$CALLS"
+
+# A failure costs each pending piece one attempt; a piece the child reports
+# failed is retried alone, the rest recorded done.
+split_fresh
+watch_failing --once >/dev/null 2>&1 || true
+split_calls=$(grep -c . "$CALLS" 2>/dev/null || true)
+if [[ "$split_calls" == "1" ]] && grep -q '^c1c10001 1$' "$WSTATE" && grep -q '^c1c10002 1$' "$WSTATE" &&
+  grep -q '^c1c10003 1$' "$WSTATE"; then
+  pass "a failed split meeting costs one attempt on each pending piece"
+else
+  diag="calls=$split_calls state=$(dump "$WSTATE")"
+  fail "a failed split meeting costs one attempt on each pending piece" "$diag"
+fi
+split_fresh
+notify_reset
+STUB_PART_FAILED=c1c10002 watch --once >/dev/null 2>&1 || true
+if grep -q '^c1c10001 done$' "$WSTATE" && grep -q '^c1c10002 1$' "$WSTATE" &&
+  grep -q '^c1c10003 done$' "$WSTATE" && grep -qF "Meeting transcript ready" "$NOTIFYLOG" 2>/dev/null; then
+  pass "a part the child could not transcribe is retried alone; the meeting is still announced"
+else
+  diag="state=$(dump "$WSTATE")"
+  fail "a part the child could not transcribe is retried alone; the meeting is still announced" "$diag"
+fi
+for n in 2 3; do
+  STUB_PART_FAILED=c1c10002 watch --once >/dev/null 2>&1 || true
+done
+if grep -q '^c1c10002 3$' "$WSTATE" && grep -q 'GAVE UP on c1c10002' "$WLOG" &&
+  grep -qF "Transcription FAILED" "$NOTIFYLOG" 2>/dev/null; then
+  pass "a piece that keeps failing is given up on by itself"
+else
+  diag="state=$(dump "$WSTATE")"
+  fail "a piece that keeps failing is given up on by itself" "$diag"
+fi
+split_calls=$(grep -c . "$CALLS" 2>/dev/null || true)
+watch --once >/dev/null 2>&1 || true
+calls_after=$(grep -c . "$CALLS" || true)
+if [[ "$calls_after" == "$split_calls" ]]; then
+  pass "a meeting whose last pending piece was given up on is not run again"
+else
+  diag=$(dump "$CALLS")
+  fail "a meeting whose last pending piece was given up on is not run again" "$diag"
+fi
+
+# A first run seeds every ready piece; there is no gap window any more.
+build_watch_db
+watch_reset
+add_split_meeting
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'c1c10003', 'mergedMultitrack', 'w3.m4a');"
+watch --once >/dev/null 2>&1 || true
+if grep -q '^c1c10001 done$' "$WSTATE" && grep -q '^c1c10003 done$' "$WSTATE"; then
+  pass "seeding records every piece of a ready meeting"
+else
+  diag=$(dump "$WSTATE")
+  fail "seeding records every piece of a ready meeting" "$diag"
+fi
+absent "seeding transcribes nothing" "$CALLS"
+
+# Nothing ready at all: the empty pending list must not trip set -u.
+build_watch_db
+watch_reset
+watch --once >/dev/null 2>&1 || true
+sqlite3 "$WDB" "UPDATE session SET transcriptionDidSucceed = 0;"
+expect_watch_rc "a run with nothing ready exits 0" 0 --once
+expect_watch_rc "a dry run with nothing ready exits 0" 0 --dry-run
+
+for bad in "" "abc" "1;--"; do
+  rc=0
+  HUDDLE_STITCH_GAP_SECONDS="$bad" watch --dry-run >/dev/null 2>&1 || rc=$?
+  if [[ $rc -eq 1 ]]; then pass "watch HUDDLE_STITCH_GAP_SECONDS='$bad' rejected"; else fail "watch HUDDLE_STITCH_GAP_SECONDS='$bad' rejected" "exit $rc"; fi
+done
+
+# bash 4.2/4.3 call an empty "${a[@]}" unbound under set -u. Statically:
+# every bare expansion must be of an array listed here as never empty.
+nonempty=" DEL_PATHS GROUP_IDS PART_IDS id_matches idx_rows member_list missing_ids ok_files ok_ids pending"
+nonempty+=" args done_ids member_ids new_ids texts opens "
+bare=$(grep -ohE '[^+]"\$\{!?[A-Za-z_]+\[[@*]\]\}"' "$SCRIPT" "$WATCH" | sed -E 's/.*\{!?([A-Za-z_]+)\[.*/\1/' | sort -u)
+unlisted=""
+for name in $bare; do
+  [[ "$nonempty" == *" $name "* ]] || unlisted+="$name "
+done
+if [[ -z "$unlisted" && -n "$bare" ]]; then
+  pass "every bare array expansion is of an array known to be non-empty"
+else
+  fail "every bare array expansion is of an array known to be non-empty" "unlisted: $unlisted"
+fi
+for guarded in metas order PENDING; do
+  if grep -qE "[^+]\"\\\$\{$guarded\[@\]\}\"" "$SCRIPT" "$WATCH"; then
+    fail "the possibly-empty array '$guarded' is expanded with the guard"
+  else
+    pass "the possibly-empty array '$guarded' is expanded with the guard"
+  fi
+done
+
+# --- the watcher drives the real huddle-transcribe -------------------------
+
+# Real days replayed through huddle-watch and huddle-transcribe (stub mw).
+# Rows appear after a recording ends: pieces are added one at a time.
+echo "huddle-watch: split meetings, end to end"
+RP="$WORK/out-replay"
+RP_PIECES="$WORK/pieces-replay"
+HTW=$(build "$BIN/mw" "$WORK/htw.sh" "$WDB" "$RP")
+watch_real() {
+  local rc=0
+  env -u FAIL_TRANSCRIBE \
+    HUDDLE_DB="$WDB" \
+    HUDDLE_TRANSCRIBE_BIN="$HTW" \
+    HUDDLE_STATE_FILE="$WSTATE" \
+    HUDDLE_LOG_FILE="$WLOG" \
+    HUDDLE_PIECES_DIR="$RP_PIECES" \
+    MW_CALLS="$WORK/mw-calls" \
+    MW_FAIL_MATCH="${MW_FAIL_MATCH:-}" \
+    "$WATCH" "$@" || rc=$?
+  notify_drain
+  return $rc
+}
+replay_fresh() {
+  build_watch_db
+  watch_reset
+  rm -rf "$RP" "$RP_PIECES" "$WORK/mw-calls"
+  watch_real --once >/dev/null 2>&1 || true
+}
+# add_piece SID RM START DURATION CREATED FILE TITLE: one saved Slack recording.
+add_piece() {
+  sqlite3 "$WDB" "
+INSERT INTO recordedmeeting VALUES (x'$2', $4, NULL, '$3', 'Slack', 'com.tinyspeck.slackmacgap');
+INSERT INTO session VALUES (x'$1', '$5', $7, NULL, x'$2', NULL, 1, 0, 0, 0, NULL, NULL, 0);
+INSERT INTO mediafile VALUES (x'$1', 'mergedMultitrack', '$6');"
+  touch "$MEDIA/$6"
+}
+# 2026-10-13: 1749 s, 841 s and 5071 s pieces, 11.3 s and 9.6 s apart; each
+# row landed 1.3 to 7.5 minutes after its recording ended.
+oct13_piece() {
+  case "$1" in
+    1) add_piece e1e10001 e1 '2026-10-13 20:04:01.020' 1749.1883333 '2026-10-13 20:35:48.870' e1.m4a "'Design Review'" ;;
+    2) add_piece e1e10002 e2 '2026-10-13 20:33:21.473' 840.6741042 '2026-10-13 20:48:38.189' e2.m4a NULL ;;
+    *) add_piece e1e10003 e3 '2026-10-13 20:47:31.760' 5071.4638542 '2026-10-13 22:19:34.262' e3.m4a NULL ;;
+  esac
+}
+RP_DOC="$RP/2026-10-13_design-review_e1e10001.md"
+RP_META="$RP/2026-10-13_design-review_e1e10001.meta.json"
+# Snapshot after each run, so no check below masks a command's status.
+rp_snap() {
+  N_MW=0
+  [[ ! -f "$WORK/mw-calls" ]] || N_MW=$(grep -c . "$WORK/mw-calls" || true)
+  N_DOCS=$(find "$RP" -name '*.md' ! -name '_index.md' 2>/dev/null | wc -l | tr -d ' ' || true)
+  D_LOG=$(dump "$WLOG")
+  D_STATE=$(dump "$WSTATE")
+  D_DOC=$(dump "$RP_DOC")
+  D_META=$(dump "$RP_META")
+}
+
+replay_fresh
+oct13_piece 1
+notify_reset
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+if [[ -f "$RP_DOC" ]] && grep -qxF "hello from e1.m4a" "$RP_DOC" && ! grep -q '^## Part' "$RP_DOC" &&
+  [[ "$N_MW" == "1" ]] && grep -q '^e1e10001 done$' "$WSTATE"; then
+  pass "Oct 13: the first piece is transcribed alone as soon as it is saved"
+else
+  fail "Oct 13: the first piece is transcribed alone as soon as it is saved" "$D_LOG"
+fi
+rp_flag=$(jq -r '.restitchable' "$RP_META" 2>/dev/null || true)
+if [[ "$rp_flag" == "true" ]] &&
+  grep -qF "2026-10-13_design-review_e1e10001.md" "$NOTIFYLOG" 2>/dev/null; then
+  pass "Oct 13: its sidecar is marked replaceable and a ready alert is raised"
+else
+  fail "Oct 13: its sidecar is marked replaceable and a ready alert is raised" "$D_META"
+fi
+oct13_piece 2
+notify_reset
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+if [[ "$N_DOCS" == "1" ]] && grep -qxF "## Part 2 of 2 — starts at 29:20, after a 11 s gap" "$RP_DOC" &&
+  grep -qxF "hello from e1.m4a" "$RP_DOC" && grep -qxF "hello from e2.m4a" "$RP_DOC" &&
+  [[ "$N_MW" == "2" ]] && grep -q '^e1e10002 done$' "$WSTATE"; then
+  pass "Oct 13: the second piece re-stitches the same transcript, transcribing only itself"
+else
+  fail "Oct 13: the second piece re-stitches the same transcript, transcribing only itself" "docs=$N_DOCS mw=$N_MW $D_DOC"
+fi
+if grep -qF "(updated with a later recording)" "$NOTIFYLOG" 2>/dev/null &&
+  grep -qF "Part 2:   e1e10002 starts at 29:20, after a 11 s gap" "$WLOG"; then
+  pass "Oct 13: the update is announced and its gap logged"
+else
+  fail "Oct 13: the update is announced and its gap logged" "$D_LOG"
+fi
+oct13_piece 3
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+rp_heads=$(grep '^## ' "$RP_DOC" 2>/dev/null || true)
+want_heads="## Part 1 of 3 — starts at 00:00
+## Part 2 of 3 — starts at 29:20, after a 11 s gap
+## Part 3 of 3 — starts at 43:31, after a 10 s gap"
+if [[ "$N_DOCS" == "1" && "$rp_heads" == "$want_heads" && "$N_MW" == "3" ]] &&
+  grep -qxF "*43:31-43:37*" "$RP_DOC"; then
+  pass "Oct 13: the third piece completes the one transcript, timestamps continuous"
+else
+  fail "Oct 13: the third piece completes the one transcript, timestamps continuous" "mw=$N_MW $rp_heads"
+fi
+rp_ids=$(jq -c '.session_ids' "$RP_META" 2>/dev/null || true)
+if [[ "$rp_ids" == '["e1e10001","e1e10002","e1e10003"]' ]] && grep -qxF "hello from e3.m4a" "$RP_DOC" &&
+  grep -q '^e1e10003 done$' "$WSTATE"; then
+  pass "Oct 13: nothing is lost -- every piece is in the transcript and its sidecar"
+else
+  fail "Oct 13: nothing is lost -- every piece is in the transcript and its sidecar" "$rp_ids"
+fi
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+if [[ "$N_MW" == "3" ]]; then
+  pass "Oct 13: a later run finds nothing to do"
+else
+  fail "Oct 13: a later run finds nothing to do" "mw=$N_MW"
+fi
+
+# 2026-10-15: 83 s and 42 s pieces are under the 300 s floor on their own,
+# so nothing runs until the third makes the meeting long enough.
+replay_fresh
+add_piece f1f10001 f1 '2026-10-15 15:01:23.955' 83.073625 '2026-10-15 15:02:54.630' f1.m4a "'Standup'"
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+add_piece f1f10002 f2 '2026-10-15 15:02:53.351' 42.2019375 '2026-10-15 15:03:40.742' f2.m4a NULL
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+if [[ "$N_MW" == "0" ]] && ! grep -q '^f1f1' "$WSTATE"; then
+  pass "Oct 15: pieces under the floor together wait, untouched"
+else
+  fail "Oct 15: pieces under the floor together wait, untouched" "mw=$N_MW $D_STATE"
+fi
+add_piece f1f10003 f3 '2026-10-15 15:03:39.467' 1075.9269375 '2026-10-15 15:22:56.495' f3.m4a NULL
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+oct15_doc="$RP/2026-10-15_standup_f1f10001.md"
+oct15_heads=$(grep '^## ' "$oct15_doc" 2>/dev/null | tr '\n' '|' || true)
+if [[ "$N_MW" == "3" && "$N_DOCS" == "1" ]] &&
+  [[ "$oct15_heads" == "## Part 1 of 3 — starts at 00:00|## Part 2 of 3 — starts at 01:29, after a 6 s gap|## Part 3 of 3 — starts at 02:16, after a 4 s gap|" ]] &&
+  grep -q '^f1f10001 done$' "$WSTATE" && grep -q '^f1f10003 done$' "$WSTATE"; then
+  pass "Oct 15: the third piece brings the whole meeting in, once"
+else
+  fail "Oct 15: the third piece brings the whole meeting in, once" "mw=$N_MW $oct15_heads"
+fi
+
+# A saved piece not finished (transcriptionDidSucceed = 0) holds back
+# nothing; the transcript names it, then takes it in.
+replay_fresh
+oct13_piece 1
+oct13_piece 2
+oct13_piece 3
+sqlite3 "$WDB" "UPDATE session SET transcriptionDidSucceed = 0 WHERE id = x'e1e10002';"
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+rp_tail=$(tail -1 "$RP_DOC" 2>/dev/null || true)
+rp_pend=$(jq -c '[.session_ids, .pending_session_ids]' "$RP_META" 2>/dev/null || true)
+if [[ "$N_MW" == "2" && "$N_DOCS" == "1" && "$rp_pend" == '[["e1e10001","e1e10003"],["e1e10002"]]' ]] &&
+  [[ "$rp_tail" == "> **Note:** this transcript may be incomplete. MacWhisper had not finished saving part 2 of 3 (starts at 29:20, session e1e10002) when it was written. It will be updated when that part finishes." ]] &&
+  grep -q '^e1e10001 done$' "$WSTATE" && grep -q '^e1e10003 done$' "$WSTATE" && ! grep -q '^e1e10002 ' "$WSTATE"; then
+  pass "not ready: the ready pieces are joined now, and the transcript ends naming the other"
+else
+  fail "not ready: the ready pieces are joined now, and the transcript ends naming the other" "mw=$N_MW $rp_pend $rp_tail $D_STATE"
+fi
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+if [[ "$N_MW" == "2" ]]; then
+  pass "not ready: a piece that stays not ready runs nothing"
+else
+  fail "not ready: a piece that stays not ready runs nothing" "mw=$N_MW"
+fi
+sqlite3 "$WDB" "UPDATE session SET transcriptionDidSucceed = 1 WHERE id = x'e1e10002';"
+notify_reset
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+if [[ "$N_MW" == "3" && "$N_DOCS" == "1" ]] && grep -qxF "hello from e2.m4a" "$RP_DOC" &&
+  ! grep -qF "may be incomplete" "$RP_DOC" && grep -qF "(updated with a later recording)" "$NOTIFYLOG" 2>/dev/null &&
+  [[ "$(jq -c '[.session_ids, has("pending_session_ids")]' "$RP_META" 2>/dev/null || true)" == '[["e1e10001","e1e10002","e1e10003"],false]' ]] &&
+  grep -q '^e1e10002 done$' "$WSTATE"; then
+  pass "not ready: when it is ready, the same transcript is replaced and the note is gone"
+else
+  fail "not ready: when it is ready, the same transcript is replaced and the note is gone" "mw=$N_MW $D_LOG"
+fi
+
+# Reviewed before the last piece landed: that transcript stays and the
+# late piece goes to -2; review released the others' audio and cache.
+replay_fresh
+oct13_piece 1
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+oct13_piece 2
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+HUDDLE_PIECES_DIR="$RP_PIECES" "$HTW" --mark-reviewed --yes e1e10001 >/dev/null 2>&1 || true
+before=$(cat "$RP_DOC" 2>/dev/null || true)
+if [[ ! -e "$MEDIA/e1.m4a" && ! -e "$MEDIA/e2.m4a" ]]; then
+  pass "reviewed: --mark-reviewed removed both pieces' audio"
+else
+  fail "reviewed: --mark-reviewed removed both pieces' audio"
+fi
+if [[ ! -e "$RP_PIECES/e1e10001.md" && ! -e "$RP_PIECES/e1e10002.md" ]]; then
+  pass "reviewed: --mark-reviewed removed both pieces' cached transcripts"
+else
+  fail "reviewed: --mark-reviewed removed both pieces' cached transcripts" "$(ls "$RP_PIECES" 2>&1 || true)"
+fi
+oct13_piece 3
+notify_reset
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+rp_two="$RP/2026-10-13_design-review-2_e1e10001.md"
+after=$(cat "$RP_DOC" 2>/dev/null || true)
+if [[ "$after" == "$before" ]] && head -1 "$rp_two" 2>/dev/null | grep -qF "may duplicate 2026-10-13_design-review_e1e10001.md" &&
+  grep -qxF "> **Note:** this part (session e1e10002) was not transcribed: audio file not found at $MEDIA/e2.m4a." "$rp_two" &&
+  ! grep -qxF "hello from e1.m4a" "$rp_two" && grep -qxF "hello from e3.m4a" "$rp_two" &&
+  grep -qF "design-review-2_e1e10001.md" "$NOTIFYLOG" && grep -q '^e1e10003 done$' "$WSTATE"; then
+  pass "reviewed: the late piece writes -2 and leaves the reviewed one alone"
+else
+  fail "reviewed: the late piece writes -2 and leaves the reviewed one alone" "$D_LOG"
+fi
+rp_flags=$(jq -r '.reviewed' "$RP_META" 2>/dev/null || true)
+rp_flags+=,$(jq -r '.restitchable' "$RP/2026-10-13_design-review-2_e1e10001.meta.json" 2>/dev/null || true)
+if [[ "$rp_flags" == "true,true" ]]; then
+  pass "reviewed: the original stays reviewed; the -2 is the one later pieces may replace"
+else
+  fail "reviewed: the original stays reviewed; the -2 is the one later pieces may replace"
+fi
+rc=0
+HUDDLE_PIECES_DIR="$RP_PIECES" "$HTW" --mark-reviewed --yes e1e10003 >/dev/null 2>&1 || rc=$?
+rp_sid=$(jq -r '.session_id' "$RP/2026-10-13_design-review-2_e1e10001.meta.json" 2>/dev/null || true)
+if [[ $rc -eq 0 && ! -e "$MEDIA/e3.m4a" && "$rp_sid" == "e1e10003" ]]; then
+  pass "reviewed: the -2 releases the late piece, which only it holds"
+else
+  fail "reviewed: the -2 releases the late piece, which only it holds" "exit $rc"
+fi
+
+# One bad piece: the meeting is written without it, with a note; a retry
+# that works completes the same transcript.
+replay_fresh
+oct13_piece 1
+oct13_piece 2
+oct13_piece 3
+notify_reset
+MW_FAIL_MATCH="e2.m4a" watch_real --once >/dev/null 2>&1 || true
+rp_snap
+if grep -qxF "> **Note:** this part (session e1e10002) was not transcribed: mw transcribe failed for $MEDIA/e2.m4a." "$RP_DOC" &&
+  grep -qxF "hello from e3.m4a" "$RP_DOC" && grep -q '^e1e10002 1$' "$WSTATE" &&
+  grep -q '^e1e10001 done$' "$WSTATE" && grep -q '^e1e10003 done$' "$WSTATE" &&
+  grep -qF "Meeting transcript ready" "$NOTIFYLOG" 2>/dev/null; then
+  pass "failed piece: the meeting is joined without it, noted, and announced"
+else
+  fail "failed piece: the meeting is joined without it, noted, and announced" "$D_STATE $D_DOC"
+fi
+before=$(cat "$RP_DOC" 2>/dev/null || true)
+MW_FAIL_MATCH="e2.m4a" watch_real --once >/dev/null 2>&1 || true
+rp_snap
+after=$(cat "$RP_DOC" 2>/dev/null || true)
+if [[ "$after" == "$before" ]] && grep -q '^e1e10002 2$' "$WSTATE" && [[ "$N_MW" == "4" ]]; then
+  pass "failed piece: a retry that fails again costs an attempt and rewrites nothing"
+else
+  fail "failed piece: a retry that fails again costs an attempt and rewrites nothing" "mw=$N_MW $D_STATE"
+fi
+watch_real --once >/dev/null 2>&1 || true
+rp_snap
+if [[ "$N_DOCS" == "1" ]] && grep -qxF "hello from e2.m4a" "$RP_DOC" && ! grep -qF "was not transcribed" "$RP_DOC" &&
+  grep -q '^e1e10002 done$' "$WSTATE" && [[ "$N_MW" == "5" ]]; then
+  pass "failed piece: a retry that works completes the same transcript"
+else
+  fail "failed piece: a retry that works completes the same transcript" "mw=$N_MW $D_STATE"
+fi
+rm -rf "$RP" "$RP_PIECES" "$WORK/mw-calls"
+rm -f "$MEDIA"/e[123].m4a "$MEDIA"/f[123].m4a
 
 # --- --once is required, not inert ------------------------------------
 

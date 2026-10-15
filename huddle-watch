@@ -110,6 +110,12 @@ if ! [[ "$MIN_DURATION_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "Error: HUDDLE_MIN_DURATION must be a whole number of seconds (got '$MIN_DURATION_SECONDS')." >&2
   exit 1
 fi
+# Same setting and meaning as huddle-transcribe; both are interpolated into SQL.
+STITCH_GAP_SECONDS="${HUDDLE_STITCH_GAP_SECONDS-60}"
+if ! [[ "$STITCH_GAP_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "Error: HUDDLE_STITCH_GAP_SECONDS must be a whole number of seconds (got '$STITCH_GAP_SECONDS')." >&2
+  exit 1
+fi
 
 ONCE=0
 DRY_RUN=0
@@ -147,7 +153,11 @@ Environment overrides (chiefly for testing):
   HUDDLE_TRANSCRIBE_BIN Path to huddle-transcribe
   HUDDLE_STATE_FILE     Seen-session state file
   HUDDLE_LOG_FILE       Log file
-  HUDDLE_MIN_DURATION   Minimum session duration in seconds (default 300)
+  HUDDLE_MIN_DURATION   Minimum session duration in seconds (default 300);
+                        a split meeting is measured by its total
+  HUDDLE_STITCH_GAP_SECONDS
+                        Largest gap between two same-app recordings of one
+                        split meeting; 0 disables stitching (default 60)
   HUDDLE_POLL_INTERVAL  Seconds between timed launchd runs, recorded into the
                         plist by --install (default 600)
   HUDDLE_NO_NOTIFY      Set to any value to suppress macOS alerts and
@@ -486,10 +496,7 @@ sql() {
 # non-zero, the watcher retries to MAX_ATTEMPTS and then reports
 # "Transcription FAILED" for a recording that was never eligible. Adding a
 # duration source here without adding it there re-creates that.
-#
-# Columns, separated by $SEP (0x1F):
-#   session_id, dateCreated, duration, title
-READY_WHERE="
+READY_GATES="
   s.transcriptionDidSucceed = 1
   AND s.isIncomingLiveStream = 0
   AND EXISTS (SELECT 1 FROM mediafile m WHERE m.sessionID = s.id
@@ -497,7 +504,50 @@ READY_WHERE="
   AND s.isBeingRetranscribed = 0
   AND s.isTransient = 0
   AND s.dateDeleted IS NULL
-  AND COALESCE(rm.duration, sar.duration, 0) > $MIN_DURATION_SECONDS
+"
+
+# grp: huddle-transcribe's GROUP_CTE row for row, plus rec.ok = the recording
+# passes READY_GATES. Keep the two grouping rules identical.
+GROUP_CTE="
+WITH rec AS (
+  SELECT lower(hex(s.id)) AS sid,
+    COALESCE(rm.bundleIdentifier, 'app:' || rm.appName) AS app,
+    julianday(rm.date) AS t0,
+    julianday(rm.date) + COALESCE(rm.duration, 0) / 86400.0 AS t1,
+    COALESCE(rm.duration, 0) AS dur,
+    CASE WHEN $READY_GATES THEN 1 ELSE 0 END AS ok
+  FROM session s JOIN recordedmeeting rm ON rm.id = s.recordedMeetingID
+  WHERE s.dateDeleted IS NULL
+    AND COALESCE(rm.bundleIdentifier, rm.appName) IS NOT NULL
+    AND julianday(rm.date) IS NOT NULL
+), gaps AS (
+  SELECT *, (t0 - MAX(t1) OVER (PARTITION BY app ORDER BY t0, sid
+    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)) * 86400.0 AS gap
+  FROM rec
+), num AS (
+  SELECT *, SUM(CASE WHEN $STITCH_GAP_SECONDS > 0
+      AND gap BETWEEN 0 AND $STITCH_GAP_SECONDS THEN 0 ELSE 1 END)
+    OVER (PARTITION BY app ORDER BY t0, sid ROWS UNBOUNDED PRECEDING) AS gno
+  FROM gaps
+), grp AS (
+  SELECT sid, t0, FIRST_VALUE(sid) OVER w AS lead, COUNT(*) OVER w AS n,
+    SUM(dur) OVER w AS total, MAX(t1) OVER w AS last_end
+  FROM num
+  WINDOW w AS (PARTITION BY app, gno ORDER BY t0, sid
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+)"
+DURATION_EXPR="CASE WHEN g.n > 1 THEN g.total ELSE COALESCE(rm.duration, sar.duration, 0) END"
+
+# A recording of a split meeting is ready on its own once the meeting's total
+# clears the floor; it never waits for a sibling that is not ready.
+READY_WHERE="
+  $READY_GATES
+  AND $DURATION_EXPR > $MIN_DURATION_SECONDS
+"
+# lead, sid of every recording of a split meeting that is not ready yet.
+NOT_READY_QUERY="$GROUP_CTE
+SELECT g.lead, g.sid FROM grp g JOIN rec r ON r.sid = g.sid
+WHERE g.n > 1 AND r.ok = 0 ORDER BY g.t0, g.sid
 "
 
 # The title is selected LAST and scrubbed of tab/CR/LF in SQL, matching
@@ -505,16 +555,21 @@ READY_WHERE="
 # a stray control character can only truncate the title rather than displace
 # the session id.
 READY_QUERY="
+$GROUP_CTE
+-- Columns, separated by \$SEP (0x1F): session_id, dateCreated, duration,
+-- group lead id, title.
 SELECT
   lower(hex(s.id)),
   s.dateCreated,
-  COALESCE(rm.duration, sar.duration, 0),
+  $DURATION_EXPR,
+  COALESCE(g.lead, lower(hex(s.id))),
   replace(replace(replace(
     COALESCE(s.userChosenTitle, s.aiTitle, rm.title, sar.title, 'Untitled'),
     char(9), ' '), char(10), ' '), char(13), ' ')
 FROM session s
 LEFT JOIN recordedmeeting rm ON rm.id = s.recordedMeetingID
 LEFT JOIN systemaudiorecording sar ON sar.id = s.systemAudioRecordingID
+LEFT JOIN grp g ON g.sid = lower(hex(s.id))
 WHERE $READY_WHERE
 ORDER BY s.dateCreated DESC
 "
@@ -630,6 +685,16 @@ state_set() {
     return 1
   fi
   return 0
+}
+
+# state_set for every recording of a split meeting; non-zero if any write failed.
+state_set_all() {
+  local status="$1" id rc=0
+  shift
+  for id in "$@"; do
+    state_set "$id" "$status" || rc=1
+  done
+  return $rc
 }
 
 # --- locking -----------------------------------------------------------
@@ -1076,10 +1141,11 @@ if [[ $LIST -eq 1 ]]; then
   # READY itself is READY_WHERE evaluated in SQL, so it cannot drift from the
   # predicate the way a second copy of the logic in bash once could.
   LIST_QUERY="
+$GROUP_CTE
 SELECT
   lower(hex(s.id)),
   s.dateCreated,
-  COALESCE(rm.duration, sar.duration, 0),
+  $DURATION_EXPR,
   COALESCE(s.transcriptionDidSucceed, 0),
   s.isIncomingLiveStream,
   CASE WHEN EXISTS (SELECT 1 FROM mediafile m WHERE m.sessionID = s.id
@@ -1089,12 +1155,14 @@ SELECT
   s.isTransient,
   CASE WHEN s.dateDeleted IS NULL THEN 0 ELSE 1 END,
   CASE WHEN $READY_WHERE THEN 1 ELSE 0 END,
+  COALESCE(g.lead, lower(hex(s.id))),
   replace(replace(replace(
     COALESCE(s.userChosenTitle, s.aiTitle, rm.title, sar.title, 'Untitled'),
     char(9), ' '), char(10), ' '), char(13), ' ')
 FROM session s
 LEFT JOIN recordedmeeting rm ON rm.id = s.recordedMeetingID
 LEFT JOIN systemaudiorecording sar ON sar.id = s.systemAudioRecordingID
+LEFT JOIN grp g ON g.sid = lower(hex(s.id))
 ORDER BY s.dateCreated DESC
 LIMIT 10
 "
@@ -1108,11 +1176,12 @@ LIMIT 10
   fi
   printf '%-8s  %-19s  %-8s  %-3s %-3s %-3s %-3s %-3s %-3s  %-5s  %s\n' \
     "SESSION" "DATE" "DURATION" "OK" "LIV" "AUD" "RTX" "TRA" "DEL" "READY" "TITLE"
-  while IFS="$SEP" read -r sid date dur ok liv aud rtx tra del is_ready title; do
+  while IFS="$SEP" read -r sid date dur ok liv aud rtx tra del is_ready _lead title; do
     ready="no"
     if [[ "$is_ready" == "1" ]]; then
-      ready="yes"
-      state_is_done "$sid" && ready="seen"
+      # Each recording of a split meeting is handled as it becomes ready.
+      ready="seen"
+      state_is_done "$sid" || ready="yes"
     fi
     pretty_dur=$(fmt_duration "$dur")
     printf '%-8s  %-19s  %-8s  %-3s %-3s %-3s %-3s %-3s %-3s  %-5s  %s\n' \
@@ -1150,6 +1219,41 @@ if ! READY_ROWS=$(sql "$READY_QUERY"); then
   exit 1
 fi
 
+# PENDING: per meeting with a new ready recording: lead, ready, new and
+# not-ready members, date, duration, title.
+collect_pending() {
+  local sid date dur lead title l not_ready
+  local -a order=()
+  local -A members=() fresh=() lead_row=() waiting=()
+  PENDING=()
+  while IFS="$SEP" read -r sid date dur lead title; do
+    [[ -n "$sid" ]] || continue
+    [[ -n "$lead" ]] || lead="$sid"
+    [[ -n "${members[$lead]+set}" ]] || order+=("$lead")
+    # Rows come newest first; prepending lists a meeting's pieces oldest first.
+    members[$lead]="$sid${members[$lead]:+ ${members[$lead]}}"
+    if [[ "$sid" == "$lead" || -z "${lead_row[$lead]+set}" ]]; then
+      lead_row[$lead]="$date$SEP$dur$SEP$title"
+    fi
+    if ! state_is_done "$sid"; then
+      fresh[$lead]="$sid${fresh[$lead]:+ ${fresh[$lead]}}"
+    fi
+  done <<<"$READY_ROWS"
+  # Queried only when something is new: the usual run has nothing to do.
+  if [[ ${#fresh[@]} -gt 0 ]]; then
+    not_ready=$(sql "$NOT_READY_QUERY") || return 1
+    while IFS="$SEP" read -r lead sid; do
+      [[ -n "$sid" ]] || continue
+      waiting[$lead]="${waiting[$lead]:+${waiting[$lead]} }$sid"
+    done <<<"$not_ready"
+  fi
+  # The guarded expansion: bash before 4.4 calls an empty array unbound.
+  for l in ${order[@]+"${order[@]}"}; do
+    [[ -n "${fresh[$l]+set}" ]] || continue
+    PENDING+=("$l$SEP${members[$l]}$SEP${fresh[$l]}$SEP${waiting[$l]:-}$SEP${lead_row[$l]}")
+  done
+}
+
 # --- --dry-run ---------------------------------------------------------
 
 # Checked BEFORE the state file is created or touched, and before any lock is
@@ -1165,16 +1269,27 @@ if [[ $DRY_RUN -eq 1 ]]; then
     echo "A real first run would seed it with the sessions below and transcribe none."
   fi
   found=0
-  while IFS="$SEP" read -r sid date dur title; do
-    [[ -n "$sid" ]] || continue
-    if [[ -s "$STATE_FILE" ]] && state_is_done "$sid"; then
-      continue
-    fi
+  if ! collect_pending; then
+    echo "Error: failed to query MacWhisper database at $DB" >&2
+    exit 1
+  fi
+  # The guarded expansion: bash before 4.4 calls an empty array unbound.
+  for entry in ${PENDING[@]+"${PENDING[@]}"}; do
+    IFS="$SEP" read -r sid members new waiting date dur title <<<"$entry" || true
+    read -r -a member_ids <<<"$members"
+    read -r -a new_ids <<<"$new"
+    read -r -a waiting_ids <<<"$waiting" || true
     found=$((found + 1))
     pretty_dur=$(fmt_duration "$dur")
+    if [[ ${#waiting_ids[@]} -gt 0 ]]; then
+      title="$title (stitched from ${#member_ids[@]} of $((${#member_ids[@]} + ${#waiting_ids[@]})) recordings,"
+      title+=" ${#new_ids[@]} new; ${#waiting_ids[@]} not ready yet)"
+    elif [[ ${#member_ids[@]} -gt 1 ]]; then
+      title="$title (stitched from ${#member_ids[@]} recordings, ${#new_ids[@]} new)"
+    fi
     printf 'would transcribe  %-8s  %-19s  %-8s  %s\n' \
       "${sid:0:8}" "${date%.*}" "$pretty_dur" "$title"
-  done <<<"$READY_ROWS"
+  done
   if [[ $found -eq 0 ]]; then
     echo "(dry run — nothing pending)"
   fi
@@ -1204,7 +1319,7 @@ if [[ ! -s "$STATE_FILE" ]]; then
   # seed never to produce one. Every reader skips STATE_COMMENT lines.
   printf '%s huddle-watch state v1\n' "$STATE_COMMENT" >>"$seed_tmp"
   seeded=0
-  while IFS="$SEP" read -r sid _date _dur _title; do
+  while IFS="$SEP" read -r sid _date _dur _lead _title; do
     [[ -n "$sid" ]] || continue
     printf '%s %s\n' "$sid" "$STATE_DONE" >>"$seed_tmp"
     seeded=$((seeded + 1))
@@ -1221,12 +1336,10 @@ fi
 # Collect the pending ids before taking the lock: the transcribe loop below
 # is long-running, and reading the whole list up front keeps the database
 # handle short-lived.
-PENDING=()
-while IFS="$SEP" read -r sid _date _dur title; do
-  [[ -n "$sid" ]] || continue
-  state_is_done "$sid" && continue
-  PENDING+=("$sid$SEP$title")
-done <<<"$READY_ROWS"
+if ! collect_pending; then
+  echo "Error: failed to query MacWhisper database at $DB" >&2
+  exit 1
+fi
 
 # The overwhelmingly common case: launchd fired because MacWhisper updated
 # something unrelated (its full-text index, a dictation row). Exit quietly.
@@ -1249,32 +1362,84 @@ if [[ ! -x "$TRANSCRIBE_BIN" ]]; then
   exit 1
 fi
 
+# One more failed attempt for one recording; an alert when it is given up on.
+record_failure() {
+  local fsid="$1" rc="$2" n
+  n=$(state_attempts "$fsid")
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  n=$((n + 1))
+  if ! state_set "$fsid" "$n"; then
+    log_to_file "ERROR could not record attempt $n for ${fsid:0:8} in $STATE_FILE"
+    echo "Error: could not update $STATE_FILE for ${fsid:0:8}." >&2
+  fi
+  if ((n >= MAX_ATTEMPTS)); then
+    log_to_file "GAVE UP on ${fsid:0:8} after $n attempt(s) (exit $rc)"
+    echo "Error: gave up on session ${fsid:0:8} after $n attempt(s). See $LOG_FILE" >&2
+    alert failed \
+      "Gave up on ${fsid:0:8} ($title) after $n tries. Log: $LOG_FILE" \
+      "$LOG_FILE"
+  else
+    log_to_file "FAILED ${fsid:0:8} (exit $rc), attempt $n/$MAX_ATTEMPTS; will retry"
+    echo "Error: session ${fsid:0:8} failed (attempt $n/$MAX_ATTEMPTS). See $LOG_FILE" >&2
+  fi
+}
+
 overall_rc=0
-for entry in "${PENDING[@]}"; do
-  IFS="$SEP" read -r sid title <<<"$entry" || true
+for entry in ${PENDING[@]+"${PENDING[@]}"}; do
+  # sid is the group's first recording; members lists every recording in it.
+  IFS="$SEP" read -r sid members _new waiting _date _dur title <<<"$entry" || true
+  read -r -a member_ids <<<"$members"
+  read -r -a waiting_ids <<<"$waiting" || true
   # Re-check under the lock. A concurrent run that finished between the
   # collection above and the lock acquisition may already have handled this.
-  state_is_done "$sid" && continue
+  new_ids=()
+  attempts=0
+  for m in "${member_ids[@]}"; do
+    state_is_done "$m" && continue
+    new_ids+=("$m")
+    a=$(state_attempts "$m")
+    [[ "$a" =~ ^[0-9]+$ ]] || a=0
+    ((a <= attempts)) || attempts=$a
+  done
+  [[ ${#new_ids[@]} -gt 0 ]] || continue
 
-  attempts=$(state_attempts "$sid")
-  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
-
-  log_to_file "transcribing session ${sid:0:8} ($title) attempt $((attempts + 1))/$MAX_ATTEMPTS"
+  stitch_note=""
+  pending_args=()
+  if [[ ${#waiting_ids[@]} -gt 0 ]]; then
+    stitch_note=" stitched from ${#member_ids[@]} recordings, ${#waiting_ids[@]} not ready yet"
+    # Logged only when a ready piece is new, so a piece stuck forever cannot spam.
+    log_to_file "STITCH ${sid:0:8}: ${member_ids[*]} (new: ${new_ids[*]}; not ready yet: ${waiting_ids[*]})"
+    for m in ${waiting_ids[@]+"${waiting_ids[@]}"}; do
+      pending_args+=(--pending "$m")
+    done
+  elif [[ ${#member_ids[@]} -gt 1 ]]; then
+    stitch_note=" stitched from ${#member_ids[@]} recordings"
+    # The child's "Part N:" lines add each piece's start and gap.
+    log_to_file "STITCH ${sid:0:8}: ${member_ids[*]} (new: ${new_ids[*]})"
+  fi
+  log_to_file "transcribing session ${sid:0:8} ($title)$stitch_note attempt $((attempts + 1))/$MAX_ATTEMPTS"
 
   # The session id is passed EXPLICITLY, never `latest`. Two meetings that
   # finish close together would otherwise race: whichever run gets there
   # second re-transcribes the newer session and never touches the older one.
   #
-  # --skip-existing makes the child exit 0 without running mw when the session
-  # already has a sidecar. The state file and the sidecars are two records of
-  # the same fact, and they drift: sessions transcribed by hand or by --all
-  # never reach this file, and re-running them here would overwrite their
-  # transcripts and, where --mark-reviewed has removed the audio, fail to the
-  # attempt cap and report "Transcription FAILED" for finished work.
+  # --restitch implies --skip-existing, which makes the child exit 0 without
+  # running mw when the session already has a sidecar. The state file and the
+  # sidecars are two records of the same fact, and they drift: sessions
+  # transcribed by hand or by --all never reach this file, and re-running them
+  # here would duplicate their transcripts and, where --mark-reviewed has
+  # removed the audio, fail to the attempt cap and report "Transcription
+  # FAILED" for finished work.
   #
   # "$BASH", not the shebang: under launchd, `env bash` finds /bin/bash 3.2.
   run_rc=0
-  run_out=$("$BASH" "$TRANSCRIBE_BIN" "$sid" --yes --skip-existing 2>&1) || run_rc=$?
+  run_out=$("$BASH" "$TRANSCRIBE_BIN" "$sid" --yes --restitch ${pending_args[@]+"${pending_args[@]}"} 2>&1) || run_rc=$?
+  # A recording the child still found not ready stays unrecorded, for next time.
+  child_pending=$(sed -n 's/^Part pending: \([0-9a-f]*\)$/\1/p' <<<"$run_out")
+  ready_ids=()
+  for m in "${new_ids[@]}"; do
+    grep -qx -- "$m" <<<"$child_pending" || ready_ids+=("$m")
+  done
 
   # Log the child's combined output regardless of outcome; it is the only
   # record of what happened inside a launchd-driven run.
@@ -1292,7 +1457,7 @@ for entry in "${PENDING[@]}"; do
   if [[ $run_rc -eq 0 ]] && grep -q '^Already transcribed: ' <<<"$run_out"; then
     # Finished work, not new work: record it so it is never queued again, and
     # stay quiet -- a "Transcript ready" alert here would announce nothing new.
-    if ! state_set "$sid" "$STATE_DONE"; then
+    if [[ ${#ready_ids[@]} -gt 0 ]] && ! state_set_all "$STATE_DONE" ${ready_ids[@]+"${ready_ids[@]}"}; then
       log_to_file "ERROR could not record ${sid:0:8} as done in $STATE_FILE"
       echo "Error: could not update $STATE_FILE for ${sid:0:8}." >&2
       overall_rc=1
@@ -1311,11 +1476,23 @@ for entry in "${PENDING[@]}"; do
       base="$title"
       out_path=""
     fi
+    # A piece that failed is retried on its own; the rest of the meeting is
+    # written without it, so one bad piece cannot hold back the others.
+    failed_parts=$(sed -n 's/^Part failed: \([0-9a-f]*\).*/\1/p' <<<"$run_out")
+    done_ids=()
+    for m in ${ready_ids[@]+"${ready_ids[@]}"}; do
+      if grep -qx -- "$m" <<<"$failed_parts"; then
+        record_failure "$m" 0
+        overall_rc=1
+      else
+        done_ids+=("$m")
+      fi
+    done
     # Mark seen ONLY after a successful run, so a transient failure retries.
     # A failure to record it is loud but NOT fatal: the transcription already
     # succeeded, and aborting here would drop every remaining queue entry and
     # re-transcribe this session on the next firing.
-    if ! state_set "$sid" "$STATE_DONE"; then
+    if [[ ${#done_ids[@]} -gt 0 ]] && ! state_set_all "$STATE_DONE" "${done_ids[@]}"; then
       log_to_file "ERROR could not record success for ${sid:0:8} in $STATE_FILE; it will be re-transcribed"
       echo "Error: transcribed ${sid:0:8} but could not update $STATE_FILE; it will be re-transcribed." >&2
       alert state \
@@ -1323,26 +1500,21 @@ for entry in "${PENDING[@]}"; do
         "$LOG_FILE"
       overall_rc=1
     fi
-    log_to_file "OK ${sid:0:8} -> ${base}"
-    echo "Transcribed ${sid:0:8}: $base"
-    alert ready "$base" "$out_path"
-  else
-    attempts=$((attempts + 1))
-    if ! state_set "$sid" "$attempts"; then
-      log_to_file "ERROR could not record attempt $attempts for ${sid:0:8} in $STATE_FILE"
-      echo "Error: could not update $STATE_FILE for ${sid:0:8}." >&2
-    fi
-    overall_rc=1
-    if ((attempts >= MAX_ATTEMPTS)); then
-      log_to_file "GAVE UP on ${sid:0:8} after $attempts attempt(s) (exit $run_rc)"
-      echo "Error: gave up on session ${sid:0:8} after $attempts attempt(s). See $LOG_FILE" >&2
-      alert failed \
-        "Gave up on ${sid:0:8} ($title) after $attempts tries. Log: $LOG_FILE" \
-        "$LOG_FILE"
+    if grep -q '^Replaced: ' <<<"$run_out"; then
+      log_to_file "OK ${sid:0:8} -> ${base} (replaced, now with ${#member_ids[@]} recordings)"
+      echo "Transcribed ${sid:0:8}: $base (updated)"
+      alert ready "$base (updated with a later recording)" "$out_path"
     else
-      log_to_file "FAILED ${sid:0:8} (exit $run_rc), attempt $attempts/$MAX_ATTEMPTS; will retry"
-      echo "Error: session ${sid:0:8} failed (attempt $attempts/$MAX_ATTEMPTS). See $LOG_FILE" >&2
+      log_to_file "OK ${sid:0:8} -> ${base}"
+      echo "Transcribed ${sid:0:8}: $base"
+      alert ready "$base" "$out_path"
     fi
+  else
+    # Nothing was written: every recording still pending costs one attempt.
+    for m in "${new_ids[@]}"; do
+      record_failure "$m" "$run_rc"
+    done
+    overall_rc=1
   fi
 done
 
