@@ -22,7 +22,7 @@ a README, a LICENSE, and the CI workflows.
 ## Commands
 
 ```bash
-./tests/run-tests.sh                          # 386 behavioral tests (some skip off macOS)
+./tests/run-tests.sh                          # 408 behavioral tests (some skip off macOS)
 shellcheck -S info huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -w huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
@@ -315,6 +315,26 @@ audio would fail to the attempt cap.
 
 `huddle-mic-guard` takes its stop signal from the same audio row; see its
 section below.
+
+### huddle-watch alerts
+
+`alert()` raises a `display alert` that stays until dismissed. It detaches
+with `set -m` inside a subshell, which gives osascript its own process group:
+launchd kills the job's group at exit, and a plain `( cmd & )` died with it.
+Do not use `AbandonProcessGroup` instead — it also stops launchd killing an
+in-flight `huddle-transcribe` on bootout.
+
+Alerts of one kind (`ready`, `failed`, `state`) merge rather than stack. The
+items live in `$STATE_FILE.alert-<kind>.list`, the on-screen alert's pid in
+`.pid`. A new alert merges only when that pid is alive and its command line
+names both the notify bin and the list path, so a reused pid is never killed.
+Dismissal runs the alert's own `rm` of both files; a replaced alert is killed
+first, so it never clears them. Two benign races remain: a dismissal
+landing mid-replace can re-show an item already seen, and a killed alert
+whose `rm` was already running can delete the new alert's files, so the
+next alert stacks once instead of merging. `state` is its own kind because its message
+says the transcript succeeded: merged into `failed` it would read
+"Transcription FAILED".
 
 ### huddle-watch state
 
