@@ -3159,7 +3159,7 @@ done
 # Deletion is soft: dateDeleted is set and the mediafile row stays.
 guard_reset
 guard_save 02 "$G_START" mergedMultitrack '2026-09-24 15:16:00.100'
-sqlite3 "$GDB" "UPDATE session SET dateDeleted = 1790263000;
+sqlite3 "$GDB" "UPDATE session SET dateDeleted = 1790263000 WHERE id = X'02FF';
   UPDATE recordedmeeting SET dateDeleted = 1790263000 WHERE id = X'02';"
 expect_guard "a saved-then-deleted recording still suppresses the alert" quiet 120
 
@@ -3193,6 +3193,12 @@ expect_guard "a saved row linked to no recording does not suppress the alert" al
 guard_reset
 guard_save 06 '2026-09-24 15:00:10.000' mergedMultitrack '2026-09-24 15:01:25.000'
 expect_guard "a save of an earlier recording does not suppress the alert" alert 120
+
+# Known trade-off: a recording started 20 s before the `yes` (MacWhisper
+# re-taking the mic mid-recording) is saved but still alerts.
+guard_reset
+guard_save 07 '2026-09-24 15:01:03.000' mergedMultitrack '2026-09-24 15:16:00.100'
+expect_guard "a save of a recording started 20 s before the yes still alerts" alert 120
 
 # --- 2026-10-15: one huddle, three recordings ---
 
@@ -3453,7 +3459,7 @@ STUB
   if [[ -n "$guard_plist" ]]; then
     guard_xml=$(plutil -convert xml1 -o - "$guard_plist" 2>/dev/null || true)
     # set -m keeps the alert alive instead; see raise_alert().
-    if ! grep -qF 'AbandonProcessGroup' <<<"$guard_xml"; then
+    if [[ -n "$guard_xml" ]] && ! grep -qF 'AbandonProcessGroup' <<<"$guard_xml"; then
       pass "the guard plist leaves AbandonProcessGroup unset"
     else
       fail "the guard plist leaves AbandonProcessGroup unset" "$guard_xml"
