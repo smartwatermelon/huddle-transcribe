@@ -2802,24 +2802,42 @@ exit 1
 STUB
 chmod +x "$WBIN/ps-stub"
 
+# The columns the guard reads, linked as in MacWhisper: app and mic audio
+# by mediafile.recordedMeetingID, the merged file by its session.
 build_guard_db() {
   rm -f "$GDB"
   sqlite3 "$GDB" <<'SQL'
-CREATE TABLE session (id BLOB PRIMARY KEY, dateDeleted DOUBLE);
-CREATE TABLE recordedmeeting (id BLOB PRIMARY KEY, dateCreated TEXT NOT NULL, dateDeleted DOUBLE);
-CREATE TABLE mediafile (sessionID BLOB, type TEXT NOT NULL, dateCreated TEXT NOT NULL);
--- Yesterday's recording: saved long before this huddle started, so it must
--- not count as this huddle's recording having stopped.
-INSERT INTO mediafile VALUES (X'01', 'mergedMultitrack', '2026-09-23 15:58:23.051');
+CREATE TABLE session (id BLOB PRIMARY KEY, dateDeleted DOUBLE, recordedMeetingID BLOB);
+CREATE TABLE recordedmeeting (id BLOB PRIMARY KEY, date TEXT NOT NULL, dateCreated TEXT NOT NULL, dateDeleted DOUBLE);
+CREATE TABLE mediafile (sessionID BLOB, type TEXT NOT NULL, dateCreated TEXT NOT NULL, recordedMeetingID BLOB);
 SQL
+  # Yesterday's recording: saved long before this huddle started, so it must
+  # not count as this huddle's recording having stopped.
+  guard_save 01 '2026-09-23 15:00:02.000' mergedMultitrack '2026-09-23 15:58:23.051'
+}
+
+# guard_save <id-hex> <start-utc> <type> <saved-utc>: one saved audio row,
+# linked as MacWhisper links it, of a recording begun at <start-utc>.
+guard_save() {
+  local id="$1" started="$2" type="$3" saved="$4"
+  sqlite3 "$GDB" "INSERT OR IGNORE INTO recordedmeeting (id, date, dateCreated)
+    VALUES (X'$id', '$started', '$started');"
+  if [[ "$type" == "mergedMultitrack" ]]; then
+    sqlite3 "$GDB" "INSERT OR IGNORE INTO session (id, recordedMeetingID) VALUES (X'${id}FF', X'$id');
+      INSERT INTO mediafile (sessionID, type, dateCreated) VALUES (X'${id}FF', '$type', '$saved');"
+  else
+    sqlite3 "$GDB" "INSERT INTO mediafile (type, dateCreated, recordedMeetingID)
+      VALUES ('$type', '$saved', X'$id');"
+  fi
 }
 
 # gline <HH:MM:SS.ffffff> <pid> <yes|no>: one coreaudiod line in
-# `log show --style syslog` form, local time at -0700.
+# `log show --style syslog` form, local time at -0700, on G_DAY.
+G_DAY=2026-09-24
 gline() {
-  printf '2026-09-24 %s-0700  localhost coreaudiod[563]: (CoreAudio)    SystemStatusWrapper.mm:89     SystemStatusWrapper::PublishRecordingClientInfo: Report client %s running: %s device: <private>\n' "$1" "$2" "$3"
+  printf '%s %s-0700  localhost coreaudiod[563]: (CoreAudio)    SystemStatusWrapper.mm:89     SystemStatusWrapper::PublishRecordingClientInfo: Report client %s running: %s device: <private>\n' "$G_DAY" "$1" "$2" "$3"
   # The line coreaudiod logs after each report; it must be ignored.
-  printf '2026-09-24 %s-0700  localhost coreaudiod[563]: (CoreAudio)    SystemStatusWrapper.mm:129    SystemStatusWrapper::PublishRecordingClientInfo: Updated recording status successfully.\n' "$1"
+  printf '%s %s-0700  localhost coreaudiod[563]: (CoreAudio)    SystemStatusWrapper.mm:129    SystemStatusWrapper::PublishRecordingClientInfo: Updated recording status successfully.\n' "$G_DAY" "$1"
 }
 
 # The 2026-09-24 timeline. With include_mw=0 the MacWhisper lines are left
@@ -2845,7 +2863,7 @@ guard_ps_both() {
 }
 
 guard_reset() {
-  rm -f "$GSTATE" "$GSTATE.pids" "$GLOG" "$GOSLOG_ARGS" "$NOTIFYLOG"
+  rm -f "$GSTATE" "$GSTATE.pids" "$GSTATE.alert.pid" "$GLOG" "$GOSLOG_ARGS" "$NOTIFYLOG"
   build_guard_db
   today_timeline >"$GOSLOG"
   guard_ps_both
@@ -2986,10 +3004,140 @@ expect_guard "a repeat alert fires after the re-alert interval" alert 376
 expect_guard "a third alert fires after another interval" alert 676
 expect_guard "no alert beyond MAX_ALERTS" quiet 976
 
+# --- the alert stays up, and a repeat replaces it ---
+
+# osascript-hold (defined for huddle-watch above) stays up like a dialog and
+# records its pid and process group.
+guard_reset
+rm -f "$HOLD_RELEASE" "$HOLD_PGIDS"
+HUDDLE_NOTIFY_BIN="$WBIN/osascript-hold" HOLD_RELEASE="$HOLD_RELEASE" \
+  HOLD_PGIDS="$HOLD_PGIDS" guard 76 --once >/dev/null 2>&1 &
+hold_pid=$!
+tries=0
+while kill -0 "$hold_pid" 2>/dev/null && ((tries < 50)); do
+  sleep 0.1
+  tries=$((tries + 1))
+done
+if kill -0 "$hold_pid" 2>/dev/null; then
+  fail "the guard returns while its alert is still open" "still running after 5 s"
+else
+  pass "the guard returns while its alert is still open"
+fi
+wait "$hold_pid" 2>/dev/null || true
+guard_alerts=$(alert_count_after_wait 1)
+if ! command -v pgrep >/dev/null 2>&1; then
+  skip "the guard's alert outlives the run that raised it (pgrep unavailable)"
+elif [[ "$guard_alerts" == "1" ]] && pgrep -f -- "$WBIN/osascript-hold" >/dev/null 2>&1; then
+  pass "the guard's alert outlives the run that raised it"
+else
+  diag=$(dump "$NOTIFYLOG")
+  fail "the guard's alert outlives the run that raised it" "$diag"
+fi
+# set -m in raise_alert(): the alert leads its own process group, so
+# launchd's kill of the job's group at exit does not reach it.
+hold_rec=$(head -n1 "$HOLD_PGIDS" 2>/dev/null || true)
+hold_alert_pid="${hold_rec%% *}"
+hold_alert_pgid="${hold_rec##* }"
+suite_pgid=$(ps -o pgid= -p "$$" | tr -d ' ')
+if [[ -n "$hold_alert_pid" && "$hold_alert_pgid" == "$hold_alert_pid" &&
+  "$hold_alert_pgid" != "$suite_pgid" ]]; then
+  pass "the guard's alert runs in its own process group"
+else
+  fail "the guard's alert runs in its own process group" \
+    "alert pid/pgid=$hold_rec, suite pgid=$suite_pgid"
+fi
+recorded_pid=$(cat "$GSTATE.alert.pid" 2>/dev/null || true)
+if [[ -n "$recorded_pid" && "$recorded_pid" == "$hold_alert_pid" ]]; then
+  pass "the guard records its alert's pid beside the state file"
+else
+  fail "the guard records its alert's pid beside the state file" \
+    "pid file=$recorded_pid, alert pid=$hold_alert_pid"
+fi
+
+# The repeat, 5 minutes on, closes the first alert instead of stacking.
+HUDDLE_NOTIFY_BIN="$WBIN/osascript-hold" HOLD_RELEASE="$HOLD_RELEASE" \
+  HOLD_PGIDS="$HOLD_PGIDS" guard 376 --once >/dev/null 2>&1 || true
+guard_alerts=$(alert_count_after_wait 2)
+tries=0
+while [[ -n "$hold_alert_pid" ]] && kill -0 "$hold_alert_pid" 2>/dev/null && ((tries < 50)); do
+  sleep 0.1
+  tries=$((tries + 1))
+done
+if [[ "$guard_alerts" == "2" && -n "$hold_alert_pid" ]] && ! kill -0 "$hold_alert_pid" 2>/dev/null; then
+  pass "a repeat alert closes the one still on screen"
+else
+  fail "a repeat alert closes the one still on screen" "alerts=$guard_alerts, pid $hold_alert_pid"
+fi
+repeat_pid=$(sed -n 2p "$HOLD_PGIDS" 2>/dev/null || true)
+repeat_pid="${repeat_pid%% *}"
+recorded_pid=$(cat "$GSTATE.alert.pid" 2>/dev/null || true)
+if [[ -n "$repeat_pid" ]] && kill -0 "$repeat_pid" 2>/dev/null &&
+  [[ "$recorded_pid" == "$repeat_pid" ]]; then
+  pass "the repeat alert stays up and its pid replaces the old one"
+else
+  fail "the repeat alert stays up and its pid replaces the old one" \
+    "repeat pid=$repeat_pid, pid file=$recorded_pid"
+fi
+if grep -qF '(6 min ago)' "$NOTIFYLOG" 2>/dev/null; then
+  pass "the repeat alert carries the updated age"
+else
+  diag=$(dump "$NOTIFYLOG")
+  fail "the repeat alert carries the updated age" "$diag"
+fi
+if command -v osacompile >/dev/null 2>&1; then
+  guard_script=()
+  while IFS= read -r line; do guard_script+=(-e "$line"); done <"$NOTIFYLOG"
+  if osacompile -o "$WORK/guard-alert.scpt" "${guard_script[@]}" >/dev/null 2>&1; then
+    pass "the guard alert's AppleScript compiles"
+  else
+    diag=$(dump "$NOTIFYLOG")
+    fail "the guard alert's AppleScript compiles" "$diag"
+  fi
+else
+  skip "the guard alert's AppleScript compiles (osacompile unavailable)"
+fi
+touch "$HOLD_RELEASE"
+notify_drain
+
+# Dismissal runs the alert's rm line. Run it via real AppleScript (no
+# dialog, just do shell script): it must clear the pid file.
+rm_line=$(grep -F '"rm -f -- "' "$NOTIFYLOG" 2>/dev/null | tail -n1 || true)
+if [[ ! -x /usr/bin/osascript ]]; then
+  skip "dismissing the guard's alert clears its pid file (osascript unavailable)"
+elif [[ -z "$rm_line" || ! -f "$GSTATE.alert.pid" ]]; then
+  fail "dismissing the guard's alert clears its pid file" "rm line: $rm_line"
+else
+  /usr/bin/osascript -e "$rm_line" >/dev/null 2>&1 || true
+  if [[ -e "$GSTATE.alert.pid" ]]; then
+    fail "dismissing the guard's alert clears its pid file" "$rm_line"
+  else
+    pass "dismissing the guard's alert clears its pid file"
+  fi
+fi
+
+# A pid file naming a live process that is not our alert (pid reuse) is
+# never killed; the repeat is raised regardless.
+sleep 30 &
+decoy_pid=$!
+printf '%s\n' "$decoy_pid" >"$GSTATE.alert.pid"
+expect_guard "a repeat alert is raised when the recorded pid is not ours" alert 676
+if kill -0 "$decoy_pid" 2>/dev/null; then
+  pass "a recorded pid that is not the guard's alert is not killed"
+else
+  fail "a recorded pid that is not the guard's alert is not killed" "decoy $decoy_pid is gone"
+fi
+kill "$decoy_pid" 2>/dev/null || true
+wait "$decoy_pid" 2>/dev/null || true
+notify_drain
+
 # --- the recording stopped normally ---
 
+# The recording below starts 0.3 s after MacWhisper's 08:01:23.787 `yes`,
+# the lag seen on 2026-10-14 and 15.
+G_START='2026-09-24 15:01:24.090'
+
 guard_reset
-sqlite3 "$GDB" "INSERT INTO mediafile VALUES (X'02', 'mergedMultitrack', '2026-09-24 15:16:00.100');"
+guard_save 02 "$G_START" mergedMultitrack '2026-09-24 15:16:00.100'
 expect_guard "a recording saved 46 s after the huddle ended suppresses the alert" quiet 120
 absent "a suppressed huddle writes no state" "$GSTATE"
 
@@ -2997,41 +3145,137 @@ absent "a suppressed huddle writes no state" "$GSTATE"
 # BEFORE Slack's release. It is still after MacWhisper's own start, so it
 # still proves the recording stopped.
 guard_reset
-sqlite3 "$GDB" "INSERT INTO mediafile VALUES (X'02', 'mergedMultitrack', '2026-09-24 15:15:05.000');"
+guard_save 02 "$G_START" mergedMultitrack '2026-09-24 15:15:05.000'
 expect_guard "a recording saved just before Slack released the mic suppresses the alert" quiet 120
 
 # App-only and mic-only audio are saves too.
 for mtype in meetingAppAudio meetingMicAudio; do
   guard_reset
-  sqlite3 "$GDB" "INSERT INTO mediafile VALUES (X'03', '$mtype', '2026-09-24 15:16:00.100');"
+  guard_save 03 "$G_START" "$mtype" '2026-09-24 15:16:00.100'
   expect_guard "a $mtype row also suppresses the alert" quiet 120
 done
 
 # A recording saved and then deleted still proves capture stopped.
 # Deletion is soft: dateDeleted is set and the mediafile row stays.
 guard_reset
-sqlite3 "$GDB" "INSERT INTO session VALUES (X'02', 1790263000);
-  INSERT INTO recordedmeeting VALUES (X'02', '2026-09-24 15:01:03.000', 1790263000);
-  INSERT INTO mediafile VALUES (X'02', 'mergedMultitrack', '2026-09-24 15:16:00.100');"
+guard_save 02 "$G_START" mergedMultitrack '2026-09-24 15:16:00.100'
+sqlite3 "$GDB" "UPDATE session SET dateDeleted = 1790263000;
+  UPDATE recordedmeeting SET dateDeleted = 1790263000 WHERE id = X'02';"
 expect_guard "a saved-then-deleted recording still suppresses the alert" quiet 120
 
 # A per-track file is not the finished meeting.
 guard_reset
-sqlite3 "$GDB" "INSERT INTO mediafile VALUES (X'03', 'multitrackItem', '2026-09-24 15:16:00.100');"
+guard_save 03 "$G_START" multitrackItem '2026-09-24 15:16:00.100'
 expect_guard "a multitrackItem row does not suppress the alert" alert 120
 
-# Live capture dates the meeting row at its start, before MacWhisper's
-# `yes`. Only its saved audio row counts.
+# Both are cut to whole seconds, so a start 0.3 s after the `yes` can read a
+# second BEFORE it. START_TOLERANCE_SECONDS absorbs that.
 guard_reset
-sqlite3 "$GDB" "INSERT INTO recordedmeeting VALUES (X'04', '2026-09-24 15:01:03.000', NULL);
-  INSERT INTO mediafile VALUES (X'04', 'mergedMultitrack', '2026-09-24 15:16:00.100');"
-expect_guard "a live-captured meeting saved after the huddle suppresses the alert" quiet 120
+guard_save 04 '2026-09-24 15:01:22.900' mergedMultitrack '2026-09-24 15:16:00.100'
+expect_guard "a recording that starts a second before MacWhisper's yes still counts" quiet 120
 
 # A meeting row dated after MacWhisper's `yes` but with no saved audio is a
 # meeting still being captured. It must not silence the alert.
 guard_reset
-sqlite3 "$GDB" "INSERT INTO recordedmeeting VALUES (X'05', '2026-09-24 15:01:25.000', NULL);"
+sqlite3 "$GDB" "INSERT INTO recordedmeeting (id, date, dateCreated)
+  VALUES (X'05', '2026-09-24 15:01:25.000', '2026-09-24 15:01:25.000');"
 expect_guard "a meeting row with no saved audio does not suppress the alert" alert 120
+
+# A save that links to no recording cannot be tied to the one still running,
+# so it proves nothing; the guard errs toward alerting.
+guard_reset
+sqlite3 "$GDB" "INSERT INTO mediafile (type, dateCreated)
+  VALUES ('mergedMultitrack', '2026-09-24 15:16:00.100');"
+expect_guard "a saved row linked to no recording does not suppress the alert" alert 120
+
+# A save of an EARLIER recording, dated after MacWhisper's last `yes`, is not
+# this recording stopping. The next section replays the real case.
+guard_reset
+guard_save 06 '2026-09-24 15:00:10.000' mergedMultitrack '2026-09-24 15:01:25.000'
+expect_guard "a save of an earlier recording does not suppress the alert" alert 120
+
+# --- 2026-10-15: one huddle, three recordings ---
+
+# Andrew shared his screen, and MacWhisper split the huddle into three
+# recordings. Slack Helper is pid 1203, MacWhisper pid 958, verbatim.
+
+# Piece 2 was saved at 08:03:40, 1 s after piece 3 began at the 08:03:39
+# `yes`. The old guard read that as piece 3 stopping.
+
+# Piece 3 ran on to 08:21:35, ~6 min after Slack released the mic at
+# 08:15:07. Its audio was saved at 08:21:38.
+oct15_timeline() {
+  local G_DAY=2026-10-15
+  printf 'Timestamp                       (process)[PID]    \n'
+  gline 08:01:20.175000 1203 yes
+  gline 08:01:20.186000 1203 no
+  gline 08:01:20.201000 1203 yes
+  gline 08:01:22.796000 958 yes
+  gline 08:01:23.305000 958 no
+  gline 08:01:23.379000 958 yes
+  gline 08:01:23.503000 958 no
+  gline 08:01:23.657000 958 yes
+  gline 08:01:23.692000 958 yes
+  gline 08:01:25.262000 1203 no
+  gline 08:01:25.569000 1203 yes
+  gline 08:01:25.990000 1203 no
+  gline 08:01:26.027000 1203 yes
+  gline 08:02:47.038000 958 no
+  gline 08:02:47.073000 958 no
+  gline 08:02:52.854000 958 yes
+  gline 08:02:52.877000 958 no
+  gline 08:02:52.986000 958 yes
+  gline 08:02:53.012000 958 yes
+  gline 08:03:35.560000 958 no
+  gline 08:03:35.573000 958 no
+  gline 08:03:38.969000 958 yes
+  gline 08:03:39.000000 958 no
+  gline 08:03:39.111000 958 yes
+  gline 08:03:39.126000 958 yes
+  gline 08:15:07.539000 1203 no
+  gline 08:15:11.992000 958 no
+  gline 08:15:11.994000 958 no
+  gline 08:15:12.367000 958 yes
+  # Logged only once piece 3 stopped; a run before then cannot see it.
+  if [[ "${1:-}" == "stopped" ]]; then
+    gline 08:21:35.401000 958 no
+  fi
+  return 0
+}
+
+# Every saved row of all three pieces, at its real UTC time. The NOW bound
+# hides each one until its time comes.
+oct15_db() {
+  build_guard_db
+  guard_save eb348782 '2026-10-15 15:01:23.955' meetingAppAudio '2026-10-15 15:02:47.102'
+  guard_save eb348782 '2026-10-15 15:01:23.955' meetingMicAudio '2026-10-15 15:02:47.103'
+  guard_save eb348782 '2026-10-15 15:01:23.955' mergedMultitrack '2026-10-15 15:02:55.081'
+  guard_save 11bf0422 '2026-10-15 15:02:53.351' meetingAppAudio '2026-10-15 15:03:35.608'
+  guard_save 11bf0422 '2026-10-15 15:02:53.351' meetingMicAudio '2026-10-15 15:03:35.609'
+  guard_save 11bf0422 '2026-10-15 15:02:53.351' mergedMultitrack '2026-10-15 15:03:40.997'
+  guard_save d3ea58f7 '2026-10-15 15:03:39.467' meetingAppAudio '2026-10-15 15:21:38.679'
+  guard_save d3ea58f7 '2026-10-15 15:03:39.467' meetingMicAudio '2026-10-15 15:21:38.679'
+  guard_save d3ea58f7 '2026-10-15 15:03:39.467' mergedMultitrack '2026-10-15 15:23:00.452'
+}
+
+# 2026-10-15 08:15:07 -0700, Slack's release that day, as epoch seconds.
+G15_RELEASE=1792077307
+guard_reset
+oct15_db
+oct15_timeline >"$GOSLOG"
+printf '1203|%s\n958|%s\n' "$SLACK_COMM" "$MW_COMM" >"$GPSMAP"
+# guard() takes an offset from G_RELEASE; these are 08:16:07 and 08:22:00.
+expect_guard "2026-10-15: a split huddle alerts while its last piece records" \
+  alert $((G15_RELEASE + 60 - G_RELEASE))
+oct15_timeline stopped >"$GOSLOG"
+expect_guard "2026-10-15: the last piece's own save then silences the guard" \
+  quiet $((G15_RELEASE + 413 - G_RELEASE))
+guard_dry_out=$(guard $((G15_RELEASE + 413 - G_RELEASE)) --dry-run 2>&1 || true)
+if [[ "$guard_dry_out" == *"saved the recording it started"* ]]; then
+  pass "2026-10-15: it is the save that silences the guard"
+else
+  fail "2026-10-15: it is the save that silences the guard" "$guard_dry_out"
+fi
 
 # --- the huddle has not ended ---
 
@@ -3208,11 +3452,11 @@ STUB
   guard_plist=$(find "$WORK/guardhome" -name '*mic-guard.plist' 2>/dev/null | head -1)
   if [[ -n "$guard_plist" ]]; then
     guard_xml=$(plutil -convert xml1 -o - "$guard_plist" 2>/dev/null || true)
-    guard_value=$(plutil -extract AbandonProcessGroup raw -o - "$guard_plist" 2>/dev/null || true)
-    if [[ "$guard_value" == "true" ]]; then
-      pass "the guard plist sets AbandonProcessGroup, so launchd does not kill the alert"
+    # set -m keeps the alert alive instead; see raise_alert().
+    if ! grep -qF 'AbandonProcessGroup' <<<"$guard_xml"; then
+      pass "the guard plist leaves AbandonProcessGroup unset"
     else
-      fail "the guard plist sets AbandonProcessGroup, so launchd does not kill the alert" "$guard_xml"
+      fail "the guard plist leaves AbandonProcessGroup unset" "$guard_xml"
     fi
     if grep -qF '<integer>30</integer>' <<<"$guard_xml"; then
       pass "the guard plist polls every 30 s as a plist integer"
@@ -3241,7 +3485,7 @@ STUB
     fail "--install writes a guard plist" "no plist under $WORK/guardhome"
   fi
 else
-  skip "the guard plist sets AbandonProcessGroup, so launchd does not kill the alert (plutil unavailable)"
+  skip "the guard plist leaves AbandonProcessGroup unset (plutil unavailable)"
   skip "the guard plist polls every 30 s as a plist integer (plutil unavailable)"
   skip "the guard plist runs at load (plutil unavailable)"
   skip "the guard plist names an absolute bash as ProgramArguments[0] (plutil unavailable)"

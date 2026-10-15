@@ -287,16 +287,19 @@ events (`log show`) and alerts when all of these are true:
    ago and has not been taken again. Shorter drops are flaps, not endings.
 2. MacWhisper took the microphone during that huddle.
 3. MacWhisper is still running.
-4. MacWhisper's database has saved no meeting audio since MacWhisper took
-   the microphone. The save time is the audio row's `mediafile.dateCreated`,
-   written when MacWhisper finalizes the meeting.
+4. MacWhisper's database has saved no audio for the recording it started
+   when it last took the microphone. A save of an earlier recording does not
+   count: one huddle can be split into several recordings (screen sharing
+   did this on 2026-10-15). The audio row is written when MacWhisper
+   finalizes a recording.
 
 MacWhisper releasing the microphone is **not** used as "recording stopped".
 On 2026-09-24 MacWhisper's Bluetooth mic dropped 36 s after the huddle ended.
 MacWhisper released it, then kept recording on a fallback mic for 25 more
 minutes.
 
-One huddle end alerts at most 3 times, 5 minutes apart. A huddle that ended
+One huddle end alerts at most 3 times, 5 minutes apart. Each repeat
+replaces the alert still on screen instead of stacking. A huddle that ended
 more than 2 hours ago is ignored. State is in
 `~/.local/state/huddle-transcribe/mic-guard-state`, and the log is
 `~/Library/Logs/huddle-transcribe-mic-guard.log`.
@@ -308,9 +311,11 @@ huddle-mic-guard --status      # report agent, state file, and log
 huddle-mic-guard --uninstall   # unloads and removes the LaunchAgent
 ```
 
-The LaunchAgent sets `AbandonProcessGroup`. Without it, launchd kills the
-job's leftover processes when the job exits, which would close the alert as
-soon as it appeared. `log show` was verified only from an admin account.
+The alert runs in its own process group (`set -m`). Without that, launchd
+kills the job's leftover processes when the job exits, which would close the
+alert as soon as it appeared. A plist from an earlier install may still set
+`AbandonProcessGroup`. It is harmless, and `--install` rewrites the plist
+without it. `log show` was verified only from an admin account.
 Whether a standard user can read coreaudiod's log is not confirmed.
 
 Settings, each read from the environment: `HUDDLE_GUARD_WINDOW_MINUTES`
@@ -408,7 +413,8 @@ validation, state-file corruption handling, alert content, and alert
 merging (a held stub stands in for an alert still on screen).
 Alerts are routed to a stub via `HUDDLE_NOTIFY_BIN`, so running the
 suite never posts a desktop alert. `huddle-mic-guard` replays a real day's
-coreaudiod events through stub `log` and `ps` commands at a fixed "now". It
+coreaudiod events through stub `log` and `ps` commands at a fixed "now",
+including the 2026-10-15 huddle that MacWhisper split into three recordings. It
 does not cover the real `mw` binary's
 own behavior, nor launchd's actual scheduling. CI runs the same three
 commands.

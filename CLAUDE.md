@@ -22,7 +22,7 @@ a README, a LICENSE, and the CI workflows.
 ## Commands
 
 ```bash
-./tests/run-tests.sh                          # 408 behavioral tests (some skip off macOS)
+./tests/run-tests.sh                          # 424 behavioral tests (some skip off macOS)
 shellcheck -S info huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -w huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
@@ -322,7 +322,8 @@ section below.
 with `set -m` inside a subshell, which gives osascript its own process group:
 launchd kills the job's group at exit, and a plain `( cmd & )` died with it.
 Do not use `AbandonProcessGroup` instead — it also stops launchd killing an
-in-flight `huddle-transcribe` on bootout.
+in-flight `huddle-transcribe` on bootout. `huddle-mic-guard` uses the same
+`set -m` detach, for consistency.
 
 Alerts of one kind (`ready`, `failed`, `state`) merge rather than stack. The
 items live in `$STATE_FILE.alert-<kind>.list`, the on-screen alert's pid in
@@ -474,23 +475,40 @@ facts are load-bearing, each verified against the 2026-09-24 overrun:
   Bluetooth mic died at 08:15:50, it reported `running: no`, and it kept
   recording on a fallback mic until 08:41:16. Never use it as the stop signal.
 - **The stop signal is a saved audio `mediafile` row** (the three types
-  huddle-watch gates on) dated after MacWhisper's own `yes`. It used to be
-  `recordedmeeting.dateCreated`, which on 2026-09-24 was the stop time. Since
-  MacWhisper began capturing live that evening, it is the START time, which
-  can precede the `yes`: saved meetings stopped counting, and Oct 5 and 7
-  each got two false alerts after the save. The guard compares against
-  MacWhisper's `yes`, not Slack's release, so stopping MacWhisper a moment
-  before leaving the huddle does not alert. In the old capture mode the audio
-  row landed ~2.5 min after capture stopped, so a session captured that way
-  would alert during that gap.
+  huddle-watch gates on) **of the recording MacWhisper began at its last
+  `yes`**. It used to be `recordedmeeting.dateCreated`, which on 2026-09-24
+  was the stop time. Since MacWhisper began capturing live that evening, it
+  is the START time, which can precede the `yes`: saved meetings stopped
+  counting, and Oct 5 and 7 each got two false alerts after the save. The
+  guard compares against MacWhisper's `yes`, not Slack's release, so stopping
+  MacWhisper a moment before leaving the huddle does not alert. In the old
+  capture mode the audio row landed ~2.5 min after capture stopped, so a
+  session captured that way would alert during that gap.
+- **One huddle can be several recordings.** On 2026-10-15 screen sharing split
+  a huddle into three. Piece 2's merged file was saved at 08:03:40, one second
+  after piece 3 began at MacWhisper's 08:03:39 `yes`. A save dated after the
+  `yes` then read as "stopped", and the guard stayed silent while piece 3
+  recorded ~6 min past the huddle's end. So a save counts only if its
+  recording's `recordedmeeting.date` (the capture start) is no earlier than
+  the `yes` less `START_TOLERANCE_SECONDS` (10 s). App and mic audio link by
+  `mediafile.recordedMeetingID`; the merged file links through its session's
+  `recordedMeetingID`. A save that links to no recording does not count.
+  This uses the start time only to attribute a save, never as proof alone. It
+  assumes MacWhisper's last `yes` before Slack's release starts the running
+  recording. A mid-recording mic re-acquire (seen at 08:15:12 that day, after
+  the release) before the release would break that and alert falsely.
 - **The session start is Slack's FIRST `yes`**, walking back to a `no` held
   for the settle time. Slack flaps for ~7 s at huddle start, past
   MacWhisper's own `yes`, so anchoring on the latest `yes` misses it.
 
-The plist sets `AbandonProcessGroup`, since launchd otherwise kills the
-detached alert when the job exits. `HUDDLE_GUARD_NOW` fixes the clock for
-tests and bounds the database query, so a past day can be replayed with
-`--dry-run` against the real database.
+The alert detaches the same way as huddle-watch's: `set -m` in a subshell
+gives osascript its own process group, so launchd's kill of the job's group
+at exit misses it. The plist does not set `AbandonProcessGroup`. A repeat
+alert replaces the one still on screen: its pid is in
+`$STATE_FILE.alert.pid`, and it is killed only when its command line names
+the notify bin and that pid file. Dismissal removes the pid file.
+`HUDDLE_GUARD_NOW` fixes the clock for tests and bounds the database query,
+so a past day can be replayed with `--dry-run` against the real database.
 
 ## Known state
 
