@@ -22,7 +22,7 @@ binary_next_line = false
 # shfmt's tab default instead of the repo's two-space style, and the
 # pre-commit hook silently reformats the whole file on its first commit.
 # Add every new extensionless script here.
-[{huddle-transcribe,huddle-watch,huddle-migrate-md,huddle-mic-guard}]
+[{huddle-transcribe,huddle-watch,huddle-migrate-md}]
 indent_style = space
 indent_size = 2
 switch_case_indent = true

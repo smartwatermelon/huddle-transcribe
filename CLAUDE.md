@@ -4,28 +4,49 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Four Bash scripts. `huddle-transcribe` wraps MacWhisper Pro's `mw` CLI: it
-picks a meeting recording out of MacWhisper's own SQLite database, transcribes
-it with speaker diarization, and writes a `.md` transcript plus a
-`.meta.json` sidecar. `huddle-watch` drives it from launchd, waking on a
-database change and transcribing each session that has newly become ready.
-`huddle-migrate-md` is a one-shot: it adopts `.txt` transcripts written
-before the Markdown switch by renaming them and repointing their sidecars.
-`huddle-mic-guard` is a notify-only launchd job: it alerts when a Slack
-huddle has ended but MacWhisper has not saved a recording, i.e. it is
-probably still capturing the room.
+Three Bash scripts and an installer. `huddle-transcribe` wraps MacWhisper
+Pro's `mw` CLI: it picks a meeting recording out of MacWhisper's own SQLite
+database, transcribes it with speaker diarization, and writes a `.md`
+transcript plus a `.meta.json` sidecar. `huddle-watch` drives it from
+launchd, waking on a database change and transcribing each session that has
+newly become ready. `huddle-migrate-md` is a one-shot: it adopts `.txt`
+transcripts written before the Markdown switch by renaming them and
+repointing their sidecars.
+
+`huddle-mic-guard` was retired on 2026-10-15: MacWhisper's Finish Recording
+prompt now stays up until dismissed, and transcription gates only on
+MacWhisper's saved-audio row, never on microphone state.
 
 There is no build step and no package manager. The test suite is a single
-Bash script, `tests/run-tests.sh`; the rest of the repo is the four scripts,
-a README, a LICENSE, and the CI workflows.
+Bash script, `tests/run-tests.sh`; the rest of the repo is the scripts,
+`install.sh`, the `huddle-review` skill, a README, a LICENSE, and the CI
+workflows.
+
+## Setup
+
+`install.sh` is the only setup step. It links `huddle-transcribe` and
+`huddle-watch` into `~/.local/bin` and the skill's `SKILL.md` into a real
+`~/.claude/skills/huddle-review/` directory (the per-file convention every
+skill here follows, #36), runs `huddle-watch --install`, and ends with
+`huddle-watch --status`. It also removes an older install's
+`huddle-mic-guard` link and LaunchAgent. `--uninstall` reverses it.
+
+It runs `huddle-watch` from the checkout, never through the
+`~/.local/bin` link: `write_plist` bakes `$SELF_DIR/huddle-watch` into
+`ProgramArguments`, so a run through the link would point launchd at
+`~/.local/bin`. A real file in the way is refused before anything changes.
+`--uninstall` removes only links whose `readlink` is exactly this checkout's
+file. `HUDDLE_BIN_DIR`, `HUDDLE_SKILLS_DIR`, `HUDDLE_WATCH_BIN` and
+`HUDDLE_LAUNCHCTL_BIN` exist so the suite runs it against temp dirs and
+stubs. Never run it against the real HOME from a test.
 
 ## Commands
 
 ```bash
-./tests/run-tests.sh                          # 614 behavioral tests (some skip off macOS)
-shellcheck -S info huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
-shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
-shfmt -i 2 -ci -w huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
+./tests/run-tests.sh                          # 588 behavioral tests (some skip off macOS)
+shellcheck -S info huddle-transcribe huddle-watch huddle-migrate-md install.sh tests/run-tests.sh
+shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-migrate-md install.sh tests/run-tests.sh
+shfmt -i 2 -ci -w huddle-transcribe huddle-watch huddle-migrate-md install.sh tests/run-tests.sh
 ```
 
 CI discovers scripts by shebang over git-tracked files, so a new script is
@@ -49,7 +70,7 @@ it, and keep `binary_next_line = false` in agreement with CI's flags.
 **Every extensionless script must be named in `.editorconfig`'s last
 section.** The repo's scripts have no `.sh` suffix, so they match neither
 `[*]` nor `[*.{sh,bash}]` — only the literal
-`[{huddle-transcribe,huddle-watch,huddle-migrate-md,huddle-mic-guard}]` list. A script left
+`[{huddle-transcribe,huddle-watch,huddle-migrate-md}]` list. A script left
 out of it gets shfmt's *tab* default, and the failure is quiet in the worst
 way: the pre-commit hook reformats the whole file to tabs, reports "All
 checked files are clean", and aborts the commit. Nothing says the file was
@@ -468,17 +489,13 @@ keeps the state file and the sidecars from disagreeing: sessions done by hand
 or by `--all` would otherwise be re-run through `mw`, and those with trashed
 audio would fail to the attempt cap.
 
-`huddle-mic-guard` takes its stop signal from the same audio row; see its
-section below.
-
 ### huddle-watch alerts
 
 `alert()` raises a `display alert` that stays until dismissed. It detaches
 with `set -m` inside a subshell, which gives osascript its own process group:
 launchd kills the job's group at exit, and a plain `( cmd & )` died with it.
 Do not use `AbandonProcessGroup` instead — it also stops launchd killing an
-in-flight `huddle-transcribe` on bootout. `huddle-mic-guard` uses the same
-`set -m` detach, for consistency.
+in-flight `huddle-transcribe` on bootout.
 
 Alerts of one kind (`ready`, `failed`, `state`) merge rather than stack. The
 items live in `$STATE_FILE.alert-<kind>.list`, the on-screen alert's pid in
@@ -619,52 +636,6 @@ read, and the mismatch comparison against an empty `meta_out`) — verified by
 disabling each in turn. That redundancy is deliberate, since this is the
 guard whose failure renames a file the tool does not own. It also means the
 sidecar-less tests pin the outcome rather than any one branch.
-
-## huddle-mic-guard
-
-Notify-only: it reads coreaudiod's `PublishRecordingClientInfo` events via
-`log show`, resolves each pid with `ps`, and raises a detached
-`display alert ... as critical`. It never stops MacWhisper or Slack. Three
-facts are load-bearing, each verified against the 2026-09-24 overrun:
-
-- **MacWhisper's own mic `no` is not "recording stopped".** That day its
-  Bluetooth mic died at 08:15:50, it reported `running: no`, and it kept
-  recording on a fallback mic until 08:41:16. Never use it as the stop signal.
-- **The stop signal is a saved audio `mediafile` row** (the three types
-  huddle-watch gates on) **of the recording MacWhisper began at its last
-  `yes`**. It used to be `recordedmeeting.dateCreated`, which on 2026-09-24
-  was the stop time. Since MacWhisper began capturing live that evening, it
-  is the START time, which can precede the `yes`: saved meetings stopped
-  counting, and Oct 5 and 7 each got two false alerts after the save. The
-  guard compares against MacWhisper's `yes`, not Slack's release, so stopping
-  MacWhisper a moment before leaving the huddle does not alert. In the old
-  capture mode the audio row landed ~2.5 min after capture stopped, so a
-  session captured that way would alert during that gap.
-- **One huddle can be several recordings.** On 2026-10-15 screen sharing split
-  a huddle into three. Piece 2's merged file was saved at 08:03:40, one second
-  after piece 3 began at MacWhisper's 08:03:39 `yes`. A save dated after the
-  `yes` then read as "stopped", and the guard stayed silent while piece 3
-  recorded ~6 min past the huddle's end. So a save counts only if its
-  recording's `recordedmeeting.date` (the capture start) is no earlier than
-  the `yes` less `START_TOLERANCE_SECONDS` (10 s). App and mic audio link by
-  `mediafile.recordedMeetingID`; the merged file links through its session's
-  `recordedMeetingID`. A save that links to no recording does not count.
-  This uses the start time only to attribute a save, never as proof alone. It
-  assumes MacWhisper's last `yes` before Slack's release starts the running
-  recording. A mid-recording mic re-acquire (seen at 08:15:12 that day, after
-  the release) before the release would break that and alert falsely.
-- **The session start is Slack's FIRST `yes`**, walking back to a `no` held
-  for the settle time. Slack flaps for ~7 s at huddle start, past
-  MacWhisper's own `yes`, so anchoring on the latest `yes` misses it.
-
-The alert detaches the same way as huddle-watch's: `set -m` in a subshell
-gives osascript its own process group, so launchd's kill of the job's group
-at exit misses it. The plist does not set `AbandonProcessGroup`. A repeat
-alert replaces the one still on screen: its pid is in
-`$STATE_FILE.alert.pid`, and it is killed only when its command line names
-the notify bin and that pid file. Dismissal removes the pid file.
-`HUDDLE_GUARD_NOW` fixes the clock for tests and bounds the database query,
-so a past day can be replayed with `--dry-run` against the real database.
 
 ## Known state
 

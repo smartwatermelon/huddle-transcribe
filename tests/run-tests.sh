@@ -12,13 +12,11 @@
 # HUDDLE_TRANSCRIBE_BIN points at a stub, so no real transcription and no
 # `--mark-reviewed` can ever run from the suite.
 #
-# huddle-mic-guard is driven the same way: `log show` and `ps` are stubs via
-# HUDDLE_GUARD_LOG_BIN/HUDDLE_GUARD_PS_BIN, fed a replay of a real day's
-# coreaudiod events, with "now" fixed by HUDDLE_GUARD_NOW.
+# install.sh runs on temp dirs with stubbed huddle-watch and launchctl,
+# so it never touches the real HOME or loads a job.
 #
 # What is NOT covered: the real `mw` binary's flag handling and transcription
-# output, launchd/osascript behavior (both absent on a Linux runner), and the
-# real `log show` output format beyond the lines captured into the fixture.
+# output, and launchd/osascript behavior (both absent on a Linux runner).
 # Everything the scripts themselves do -- argument parsing, session
 # selection, row parsing, output naming, the --mark-reviewed guards, and the
 # watcher's readiness predicate, seeding, dedupe, attempt cap and lock --
@@ -3768,7 +3766,7 @@ else
   diag="state=$(dump "$WSTATE")"
   fail "a part the child could not transcribe is retried alone; the meeting is still announced" "$diag"
 fi
-for n in 2 3; do
+for _ in 2 3; do
   STUB_PART_FAILED=c1c10002 watch --once >/dev/null 2>&1 || true
 done
 if grep -q '^c1c10002 3$' "$WSTATE" && grep -q 'GAVE UP on c1c10002' "$WLOG" &&
@@ -4131,776 +4129,6 @@ absent "a bare invocation transcribes nothing" "$CALLS"
 expect_watch_rc "--dry-run works without --once" 0 --dry-run
 expect_watch_rc "--list works without --once" 0 --list
 
-# --- huddle-mic-guard --------------------------------------------------
-#
-# The guard reads three things the runner does not have -- coreaudiod's log
-# (`log show`), process names (`ps`), and MacWhisper's database -- and raises
-# an osascript alert. The first two are stubbed through HUDDLE_GUARD_LOG_BIN
-# and HUDDLE_GUARD_PS_BIN, the database is a synthetic one via HUDDLE_DB, and
-# the alert goes to the suite-wide osascript stub via HUDDLE_NOTIFY_BIN,
-# which is already exported above. HUDDLE_GUARD_NOW fixes "now", so the
-# 60-second settle and the re-alert interval are deterministic.
-#
-# The baseline timeline is the real one from 2026-09-24, verbatim in form:
-# Slack Helper (pid 1215) takes the mic at 08:01:20 and flaps for 7 s,
-# MacWhisper (pid 958) takes it at 08:01:23, Slack releases it at 08:15:14
-# (the real end of the huddle), MacWhisper releases it at 08:15:50 when the
-# Bluetooth mic died -- and MacWhisper went on recording regardless.
-
-echo "huddle-mic-guard"
-
-GDB="$WORK/guard.sqlite"
-GSTATE="$WORK/guard-state"
-GLOG="$WORK/guard.log"
-GOSLOG="$WORK/guard-oslog"
-GOSLOG_ARGS="$WORK/guard-oslog-args"
-GPSMAP="$WORK/guard-psmap"
-# 2026-09-24 08:15:14 -0700, the Slack release, as epoch seconds.
-G_RELEASE=1790262914
-SLACK_COMM="/Applications/Slack.app/Contents/Frameworks/Slack Helper.app/Contents/MacOS/Slack Helper"
-MW_COMM="/Applications/MacWhisper.app/Contents/MacOS/MacWhisper"
-
-# Stub `log`: prints the fixture and records its arguments.
-cat >"$WBIN/oslog-stub" <<'STUB'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >>"$GOSLOG_ARGS"
-cat -- "$GOSLOG"
-STUB
-chmod +x "$WBIN/oslog-stub"
-
-# Stub `ps -p PID -o comm=`: looks the pid up in "pid|comm" lines, and fails
-# like the real ps when the pid is not running.
-cat >"$WBIN/ps-stub" <<'STUB'
-#!/usr/bin/env bash
-[[ "$1" == "-p" ]] || exit 2
-while IFS='|' read -r pid comm; do
-  if [[ "$pid" == "$2" ]]; then
-    printf '%s\n' "$comm"
-    exit 0
-  fi
-done <"$GPSMAP"
-exit 1
-STUB
-chmod +x "$WBIN/ps-stub"
-
-# The columns the guard reads, linked as in MacWhisper: app and mic audio
-# by mediafile.recordedMeetingID, the merged file by its session.
-build_guard_db() {
-  rm -f "$GDB"
-  sqlite3 "$GDB" <<'SQL'
-CREATE TABLE session (id BLOB PRIMARY KEY, dateDeleted DOUBLE, recordedMeetingID BLOB);
-CREATE TABLE recordedmeeting (id BLOB PRIMARY KEY, date TEXT NOT NULL, dateCreated TEXT NOT NULL, dateDeleted DOUBLE);
-CREATE TABLE mediafile (sessionID BLOB, type TEXT NOT NULL, dateCreated TEXT NOT NULL, recordedMeetingID BLOB);
-SQL
-  # Yesterday's recording: saved long before this huddle started, so it must
-  # not count as this huddle's recording having stopped.
-  guard_save 01 '2026-09-23 15:00:02.000' mergedMultitrack '2026-09-23 15:58:23.051'
-}
-
-# guard_save <id-hex> <start-utc> <type> <saved-utc>: one saved audio row,
-# linked as MacWhisper links it, of a recording begun at <start-utc>.
-guard_save() {
-  local id="$1" started="$2" type="$3" saved="$4"
-  sqlite3 "$GDB" "INSERT OR IGNORE INTO recordedmeeting (id, date, dateCreated)
-    VALUES (X'$id', '$started', '$started');"
-  if [[ "$type" == "mergedMultitrack" ]]; then
-    sqlite3 "$GDB" "INSERT OR IGNORE INTO session (id, recordedMeetingID) VALUES (X'${id}FF', X'$id');
-      INSERT INTO mediafile (sessionID, type, dateCreated) VALUES (X'${id}FF', '$type', '$saved');"
-  else
-    sqlite3 "$GDB" "INSERT INTO mediafile (type, dateCreated, recordedMeetingID)
-      VALUES ('$type', '$saved', X'$id');"
-  fi
-}
-
-# gline <HH:MM:SS.ffffff> <pid> <yes|no>: one coreaudiod line in
-# `log show --style syslog` form, local time at -0700, on G_DAY.
-G_DAY=2026-09-24
-gline() {
-  printf '%s %s-0700  localhost coreaudiod[563]: (CoreAudio)    SystemStatusWrapper.mm:89     SystemStatusWrapper::PublishRecordingClientInfo: Report client %s running: %s device: <private>\n' "$G_DAY" "$1" "$2" "$3"
-  # The line coreaudiod logs after each report; it must be ignored.
-  printf '%s %s-0700  localhost coreaudiod[563]: (CoreAudio)    SystemStatusWrapper.mm:129    SystemStatusWrapper::PublishRecordingClientInfo: Updated recording status successfully.\n' "$G_DAY" "$1"
-}
-
-# The 2026-09-24 timeline. With include_mw=0 the MacWhisper lines are left
-# out, for the "MacWhisper was not recording" cases.
-today_timeline() {
-  local include_mw="${1:-1}"
-  printf 'Timestamp                       (process)[PID]    \n'
-  gline 08:01:20.353810 1215 yes
-  gline 08:01:20.368540 1215 no
-  gline 08:01:20.385585 1215 yes
-  ((include_mw == 1)) && gline 08:01:23.787259 958 yes
-  gline 08:01:25.896529 1215 no
-  gline 08:01:26.618088 1215 yes
-  gline 08:01:27.019149 1215 no
-  gline 08:01:27.066022 1215 yes
-  gline 08:15:14.577357 1215 no
-  ((include_mw == 1)) && gline 08:15:50.017071 958 no
-  return 0
-}
-
-guard_ps_both() {
-  printf '1215|%s\n958|%s\n' "$SLACK_COMM" "$MW_COMM" >"$GPSMAP"
-}
-
-guard_reset() {
-  rm -f "$GSTATE" "$GSTATE.pids" "$GSTATE.alert.pid" "$GLOG" "$GOSLOG_ARGS" "$NOTIFYLOG"
-  build_guard_db
-  today_timeline >"$GOSLOG"
-  guard_ps_both
-}
-
-# guard <now-offset-from-release> <args...>
-guard() {
-  local offset="$1"
-  shift
-  env GOSLOG="$GOSLOG" GOSLOG_ARGS="$GOSLOG_ARGS" GPSMAP="$GPSMAP" \
-    HUDDLE_DB="$GDB" \
-    HUDDLE_GUARD_STATE_FILE="$GSTATE" \
-    HUDDLE_GUARD_LOG_FILE="$GLOG" \
-    HUDDLE_GUARD_LOG_BIN="$WBIN/oslog-stub" \
-    HUDDLE_GUARD_PS_BIN="$WBIN/ps-stub" \
-    HUDDLE_GUARD_NOW="$((G_RELEASE + offset))" \
-    "$GUARD" "$@"
-}
-
-# The alert is started detached, so its stub may land a moment after the
-# guard exits. Wait up to ~2 s for NOTIFYLOG to reach <n> alert lines, then
-# report the count seen. Used for both directions: a "no second alert" check
-# waits the same bounded time before concluding nothing arrived.
-alert_count_after_wait() {
-  local want="$1" n=0 tries=0
-  while ((tries < 20)); do
-    n=0
-    [[ -f "$NOTIFYLOG" ]] && n=$(grep -c 'display alert' "$NOTIFYLOG" || true)
-    ((n >= want)) && break
-    sleep 0.1
-    tries=$((tries + 1))
-  done
-  printf '%s\n' "$n"
-}
-
-# expect_guard <name> <alert|quiet> <offset> [args...]
-expect_guard() {
-  local name="$1" want="$2" offset="$3"
-  shift 3
-  local out rc=0
-  out=$(guard "$offset" --once "$@" 2>&1) || rc=$?
-  if ((rc != 0)); then
-    fail "$name" "exit $rc: $out"
-  elif [[ "$want" == "alert" && "$out" == *"ALERT ("* ]]; then
-    pass "$name"
-  elif [[ "$want" == "quiet" && "$out" != *"ALERT"* ]]; then
-    pass "$name"
-  else
-    fail "$name" "wanted $want, got: $out"
-  fi
-}
-
-GUARD="$REPO_ROOT/huddle-mic-guard"
-
-# --- argument handling ---
-
-guard_reset
-guard_help_rc=0
-guard 0 --help >/dev/null 2>&1 || guard_help_rc=$?
-if ((guard_help_rc == 0)); then pass "guard --help exits 0"; else fail "guard --help exits 0" "exit $guard_help_rc"; fi
-guard_bad_rc=0
-guard 0 --bogus >/dev/null 2>&1 || guard_bad_rc=$?
-if ((guard_bad_rc == 1)); then pass "guard unknown flag rejected"; else fail "guard unknown flag rejected" "exit $guard_bad_rc"; fi
-guard_bare_rc=0
-guard_bare_out=$(guard 76 2>&1) || guard_bare_rc=$?
-if ((guard_bare_rc != 0)) && [[ "$guard_bare_out" == *"--once is required"* ]]; then
-  pass "a bare guard invocation requires --once"
-else
-  fail "a bare guard invocation requires --once" "exit $guard_bare_rc: $guard_bare_out"
-fi
-absent "a bare guard invocation writes no state" "$GSTATE"
-
-# --- the 2026-09-24 timeline alerts, once ---
-
-guard_reset
-expect_guard "the 2026-09-24 timeline alerts 76 s after Slack released the mic" alert 76
-guard_alerts=$(alert_count_after_wait 1)
-if [[ "$guard_alerts" == "1" ]]; then
-  pass "the alert reached osascript"
-else
-  diag=$(dump "$NOTIFYLOG")
-  fail "the alert reached osascript" "$diag"
-fi
-if grep -qF 'display alert "Huddle ended — MacWhisper is still recording"' "$NOTIFYLOG" 2>/dev/null &&
-  grep -qF 'as critical' "$NOTIFYLOG" 2>/dev/null; then
-  pass "the alert is a critical display alert with the expected title"
-else
-  diag=$(dump "$NOTIFYLOG")
-  fail "the alert is a critical display alert with the expected title" "$diag"
-fi
-if grep -qF 'ended at 08:15:14' "$NOTIFYLOG" 2>/dev/null ||
-  grep -qF 'ended at 15:15:14' "$NOTIFYLOG" 2>/dev/null; then
-  # 08:15:14 in America/Los_Angeles; 15:15:14 on a UTC runner. Either proves
-  # the -0700 offset was applied rather than the wall-clock time taken as UTC.
-  pass "the alert names the time Slack released the mic"
-else
-  diag=$(dump "$NOTIFYLOG")
-  fail "the alert names the time Slack released the mic" "$diag"
-fi
-guard_state=$(cat "$GSTATE" 2>/dev/null || true)
-if [[ "$guard_state" == "$G_RELEASE 1 $((G_RELEASE + 76))" ]]; then
-  pass "the alert is recorded against the release time"
-else
-  fail "the alert is recorded against the release time" "state: $guard_state"
-fi
-if grep -qF 'ALERT (1/3)' "$GLOG" 2>/dev/null; then
-  pass "the alert is logged"
-else
-  diag=$(dump "$GLOG")
-  fail "the alert is logged" "$diag"
-fi
-if grep -qF -- '--last 240m' "$GOSLOG_ARGS" 2>/dev/null && grep -qF 'show' "$GOSLOG_ARGS" 2>/dev/null; then
-  pass "log show reads the default 240-minute window"
-else
-  diag=$(dump "$GOSLOG_ARGS")
-  fail "log show reads the default 240-minute window" "$diag"
-fi
-
-# A second run for the same huddle end, inside the re-alert interval, is
-# silent: one huddle end must not alert every 30 seconds.
-expect_guard "a second run for the same huddle end does not alert again" quiet 106
-guard_alerts=$(alert_count_after_wait 2)
-if [[ "$guard_alerts" == "1" ]]; then
-  pass "the second run reached osascript zero times"
-else
-  diag=$(dump "$NOTIFYLOG")
-  fail "the second run reached osascript zero times" "$diag"
-fi
-guard_state=$(cat "$GSTATE" 2>/dev/null || true)
-if [[ "$guard_state" == "$G_RELEASE 1 $((G_RELEASE + 76))" ]]; then
-  pass "a suppressed run leaves the state unchanged"
-else
-  fail "a suppressed run leaves the state unchanged" "state: $guard_state"
-fi
-
-# Repeats: every REALERT_SECONDS (300) up to MAX_ALERTS (3), then silence.
-expect_guard "a repeat alert fires after the re-alert interval" alert 376
-expect_guard "a third alert fires after another interval" alert 676
-expect_guard "no alert beyond MAX_ALERTS" quiet 976
-
-# --- the alert stays up, and a repeat replaces it ---
-
-# osascript-hold (defined for huddle-watch above) stays up like a dialog and
-# records its pid and process group.
-guard_reset
-rm -f "$HOLD_RELEASE" "$HOLD_PGIDS"
-HUDDLE_NOTIFY_BIN="$WBIN/osascript-hold" HOLD_RELEASE="$HOLD_RELEASE" \
-  HOLD_PGIDS="$HOLD_PGIDS" guard 76 --once >/dev/null 2>&1 &
-hold_pid=$!
-tries=0
-while kill -0 "$hold_pid" 2>/dev/null && ((tries < 50)); do
-  sleep 0.1
-  tries=$((tries + 1))
-done
-if kill -0 "$hold_pid" 2>/dev/null; then
-  fail "the guard returns while its alert is still open" "still running after 5 s"
-else
-  pass "the guard returns while its alert is still open"
-fi
-wait "$hold_pid" 2>/dev/null || true
-guard_alerts=$(alert_count_after_wait 1)
-if ! command -v pgrep >/dev/null 2>&1; then
-  skip "the guard's alert outlives the run that raised it (pgrep unavailable)"
-elif [[ "$guard_alerts" == "1" ]] && pgrep -f -- "$WBIN/osascript-hold" >/dev/null 2>&1; then
-  pass "the guard's alert outlives the run that raised it"
-else
-  diag=$(dump "$NOTIFYLOG")
-  fail "the guard's alert outlives the run that raised it" "$diag"
-fi
-# set -m in raise_alert(): the alert leads its own process group, so
-# launchd's kill of the job's group at exit does not reach it.
-hold_rec=$(head -n1 "$HOLD_PGIDS" 2>/dev/null || true)
-hold_alert_pid="${hold_rec%% *}"
-hold_alert_pgid="${hold_rec##* }"
-suite_pgid=$(ps -o pgid= -p "$$" | tr -d ' ')
-if [[ -n "$hold_alert_pid" && "$hold_alert_pgid" == "$hold_alert_pid" &&
-  "$hold_alert_pgid" != "$suite_pgid" ]]; then
-  pass "the guard's alert runs in its own process group"
-else
-  fail "the guard's alert runs in its own process group" \
-    "alert pid/pgid=$hold_rec, suite pgid=$suite_pgid"
-fi
-recorded_pid=$(cat "$GSTATE.alert.pid" 2>/dev/null || true)
-if [[ -n "$recorded_pid" && "$recorded_pid" == "$hold_alert_pid" ]]; then
-  pass "the guard records its alert's pid beside the state file"
-else
-  fail "the guard records its alert's pid beside the state file" \
-    "pid file=$recorded_pid, alert pid=$hold_alert_pid"
-fi
-
-# The repeat, 5 minutes on, closes the first alert instead of stacking.
-HUDDLE_NOTIFY_BIN="$WBIN/osascript-hold" HOLD_RELEASE="$HOLD_RELEASE" \
-  HOLD_PGIDS="$HOLD_PGIDS" guard 376 --once >/dev/null 2>&1 || true
-guard_alerts=$(alert_count_after_wait 2)
-tries=0
-while [[ -n "$hold_alert_pid" ]] && kill -0 "$hold_alert_pid" 2>/dev/null && ((tries < 50)); do
-  sleep 0.1
-  tries=$((tries + 1))
-done
-if [[ "$guard_alerts" == "2" && -n "$hold_alert_pid" ]] && ! kill -0 "$hold_alert_pid" 2>/dev/null; then
-  pass "a repeat alert closes the one still on screen"
-else
-  fail "a repeat alert closes the one still on screen" "alerts=$guard_alerts, pid $hold_alert_pid"
-fi
-repeat_pid=$(sed -n 2p "$HOLD_PGIDS" 2>/dev/null || true)
-repeat_pid="${repeat_pid%% *}"
-recorded_pid=$(cat "$GSTATE.alert.pid" 2>/dev/null || true)
-if [[ -n "$repeat_pid" ]] && kill -0 "$repeat_pid" 2>/dev/null &&
-  [[ "$recorded_pid" == "$repeat_pid" ]]; then
-  pass "the repeat alert stays up and its pid replaces the old one"
-else
-  fail "the repeat alert stays up and its pid replaces the old one" \
-    "repeat pid=$repeat_pid, pid file=$recorded_pid"
-fi
-if grep -qF '(6 min ago)' "$NOTIFYLOG" 2>/dev/null; then
-  pass "the repeat alert carries the updated age"
-else
-  diag=$(dump "$NOTIFYLOG")
-  fail "the repeat alert carries the updated age" "$diag"
-fi
-if command -v osacompile >/dev/null 2>&1; then
-  guard_script=()
-  while IFS= read -r line; do guard_script+=(-e "$line"); done <"$NOTIFYLOG"
-  if osacompile -o "$WORK/guard-alert.scpt" "${guard_script[@]}" >/dev/null 2>&1; then
-    pass "the guard alert's AppleScript compiles"
-  else
-    diag=$(dump "$NOTIFYLOG")
-    fail "the guard alert's AppleScript compiles" "$diag"
-  fi
-else
-  skip "the guard alert's AppleScript compiles (osacompile unavailable)"
-fi
-touch "$HOLD_RELEASE"
-notify_drain
-
-# Dismissal runs the alert's rm line. Run it via real AppleScript (no
-# dialog, just do shell script): it must clear the pid file.
-rm_line=$(grep -F '"rm -f -- "' "$NOTIFYLOG" 2>/dev/null | tail -n1 || true)
-if [[ ! -x /usr/bin/osascript ]]; then
-  skip "dismissing the guard's alert clears its pid file (osascript unavailable)"
-elif [[ -z "$rm_line" || ! -f "$GSTATE.alert.pid" ]]; then
-  fail "dismissing the guard's alert clears its pid file" "rm line: $rm_line"
-else
-  /usr/bin/osascript -e "$rm_line" >/dev/null 2>&1 || true
-  if [[ -e "$GSTATE.alert.pid" ]]; then
-    fail "dismissing the guard's alert clears its pid file" "$rm_line"
-  else
-    pass "dismissing the guard's alert clears its pid file"
-  fi
-fi
-
-# A pid file naming a live process that is not our alert (pid reuse) is
-# never killed; the repeat is raised regardless.
-sleep 30 &
-decoy_pid=$!
-printf '%s\n' "$decoy_pid" >"$GSTATE.alert.pid"
-expect_guard "a repeat alert is raised when the recorded pid is not ours" alert 676
-if kill -0 "$decoy_pid" 2>/dev/null; then
-  pass "a recorded pid that is not the guard's alert is not killed"
-else
-  fail "a recorded pid that is not the guard's alert is not killed" "decoy $decoy_pid is gone"
-fi
-kill "$decoy_pid" 2>/dev/null || true
-wait "$decoy_pid" 2>/dev/null || true
-notify_drain
-
-# --- the recording stopped normally ---
-
-# The recording below starts 0.3 s after MacWhisper's 08:01:23.787 `yes`,
-# the lag seen on 2026-10-14 and 15.
-G_START='2026-09-24 15:01:24.090'
-
-guard_reset
-guard_save 02 "$G_START" mergedMultitrack '2026-09-24 15:16:00.100'
-expect_guard "a recording saved 46 s after the huddle ended suppresses the alert" quiet 120
-absent "a suppressed huddle writes no state" "$GSTATE"
-
-# Stopping MacWhisper first and leaving the huddle second saves the row
-# BEFORE Slack's release. It is still after MacWhisper's own start, so it
-# still proves the recording stopped.
-guard_reset
-guard_save 02 "$G_START" mergedMultitrack '2026-09-24 15:15:05.000'
-expect_guard "a recording saved just before Slack released the mic suppresses the alert" quiet 120
-
-# App-only and mic-only audio are saves too.
-for mtype in meetingAppAudio meetingMicAudio; do
-  guard_reset
-  guard_save 03 "$G_START" "$mtype" '2026-09-24 15:16:00.100'
-  expect_guard "a $mtype row also suppresses the alert" quiet 120
-done
-
-# A recording saved and then deleted still proves capture stopped.
-# Deletion is soft: dateDeleted is set and the mediafile row stays.
-guard_reset
-guard_save 02 "$G_START" mergedMultitrack '2026-09-24 15:16:00.100'
-sqlite3 "$GDB" "UPDATE session SET dateDeleted = 1790263000 WHERE id = X'02FF';
-  UPDATE recordedmeeting SET dateDeleted = 1790263000 WHERE id = X'02';"
-expect_guard "a saved-then-deleted recording still suppresses the alert" quiet 120
-
-# A per-track file is not the finished meeting.
-guard_reset
-guard_save 03 "$G_START" multitrackItem '2026-09-24 15:16:00.100'
-expect_guard "a multitrackItem row does not suppress the alert" alert 120
-
-# Both are cut to whole seconds, so a start 0.3 s after the `yes` can read a
-# second BEFORE it. START_TOLERANCE_SECONDS absorbs that.
-guard_reset
-guard_save 04 '2026-09-24 15:01:22.900' mergedMultitrack '2026-09-24 15:16:00.100'
-expect_guard "a recording that starts a second before MacWhisper's yes still counts" quiet 120
-
-# A meeting row dated after MacWhisper's `yes` but with no saved audio is a
-# meeting still being captured. It must not silence the alert.
-guard_reset
-sqlite3 "$GDB" "INSERT INTO recordedmeeting (id, date, dateCreated)
-  VALUES (X'05', '2026-09-24 15:01:25.000', '2026-09-24 15:01:25.000');"
-expect_guard "a meeting row with no saved audio does not suppress the alert" alert 120
-
-# A save that links to no recording cannot be tied to the one still running,
-# so it proves nothing; the guard errs toward alerting.
-guard_reset
-sqlite3 "$GDB" "INSERT INTO mediafile (type, dateCreated)
-  VALUES ('mergedMultitrack', '2026-09-24 15:16:00.100');"
-expect_guard "a saved row linked to no recording does not suppress the alert" alert 120
-
-# A save of an EARLIER recording, dated after MacWhisper's last `yes`, is not
-# this recording stopping. The next section replays the real case.
-guard_reset
-guard_save 06 '2026-09-24 15:00:10.000' mergedMultitrack '2026-09-24 15:01:25.000'
-expect_guard "a save of an earlier recording does not suppress the alert" alert 120
-
-# Known trade-off: a recording started 20 s before the `yes` (MacWhisper
-# re-taking the mic mid-recording) is saved but still alerts.
-guard_reset
-guard_save 07 '2026-09-24 15:01:03.000' mergedMultitrack '2026-09-24 15:16:00.100'
-expect_guard "a save of a recording started 20 s before the yes still alerts" alert 120
-
-# --- 2026-10-15: one huddle, three recordings ---
-
-# Andrew shared his screen, and MacWhisper split the huddle into three
-# recordings. Slack Helper is pid 1203, MacWhisper pid 958, verbatim.
-
-# Piece 2 was saved at 08:03:40, 1 s after piece 3 began at the 08:03:39
-# `yes`. The old guard read that as piece 3 stopping.
-
-# Piece 3 ran on to 08:21:35, ~6 min after Slack released the mic at
-# 08:15:07. Its audio was saved at 08:21:38.
-oct15_timeline() {
-  local G_DAY=2026-10-15
-  printf 'Timestamp                       (process)[PID]    \n'
-  gline 08:01:20.175000 1203 yes
-  gline 08:01:20.186000 1203 no
-  gline 08:01:20.201000 1203 yes
-  gline 08:01:22.796000 958 yes
-  gline 08:01:23.305000 958 no
-  gline 08:01:23.379000 958 yes
-  gline 08:01:23.503000 958 no
-  gline 08:01:23.657000 958 yes
-  gline 08:01:23.692000 958 yes
-  gline 08:01:25.262000 1203 no
-  gline 08:01:25.569000 1203 yes
-  gline 08:01:25.990000 1203 no
-  gline 08:01:26.027000 1203 yes
-  gline 08:02:47.038000 958 no
-  gline 08:02:47.073000 958 no
-  gline 08:02:52.854000 958 yes
-  gline 08:02:52.877000 958 no
-  gline 08:02:52.986000 958 yes
-  gline 08:02:53.012000 958 yes
-  gline 08:03:35.560000 958 no
-  gline 08:03:35.573000 958 no
-  gline 08:03:38.969000 958 yes
-  gline 08:03:39.000000 958 no
-  gline 08:03:39.111000 958 yes
-  gline 08:03:39.126000 958 yes
-  gline 08:15:07.539000 1203 no
-  gline 08:15:11.992000 958 no
-  gline 08:15:11.994000 958 no
-  gline 08:15:12.367000 958 yes
-  # Logged only once piece 3 stopped; a run before then cannot see it.
-  if [[ "${1:-}" == "stopped" ]]; then
-    gline 08:21:35.401000 958 no
-  fi
-  return 0
-}
-
-# Every saved row of all three pieces, at its real UTC time. The NOW bound
-# hides each one until its time comes.
-oct15_db() {
-  build_guard_db
-  guard_save eb348782 '2026-10-15 15:01:23.955' meetingAppAudio '2026-10-15 15:02:47.102'
-  guard_save eb348782 '2026-10-15 15:01:23.955' meetingMicAudio '2026-10-15 15:02:47.103'
-  guard_save eb348782 '2026-10-15 15:01:23.955' mergedMultitrack '2026-10-15 15:02:55.081'
-  guard_save 11bf0422 '2026-10-15 15:02:53.351' meetingAppAudio '2026-10-15 15:03:35.608'
-  guard_save 11bf0422 '2026-10-15 15:02:53.351' meetingMicAudio '2026-10-15 15:03:35.609'
-  guard_save 11bf0422 '2026-10-15 15:02:53.351' mergedMultitrack '2026-10-15 15:03:40.997'
-  guard_save d3ea58f7 '2026-10-15 15:03:39.467' meetingAppAudio '2026-10-15 15:21:38.679'
-  guard_save d3ea58f7 '2026-10-15 15:03:39.467' meetingMicAudio '2026-10-15 15:21:38.679'
-  guard_save d3ea58f7 '2026-10-15 15:03:39.467' mergedMultitrack '2026-10-15 15:23:00.452'
-}
-
-# 2026-10-15 08:15:07 -0700, Slack's release that day, as epoch seconds.
-G15_RELEASE=1792077307
-guard_reset
-oct15_db
-oct15_timeline >"$GOSLOG"
-printf '1203|%s\n958|%s\n' "$SLACK_COMM" "$MW_COMM" >"$GPSMAP"
-# guard() takes an offset from G_RELEASE; these are 08:16:07 and 08:22:00.
-expect_guard "2026-10-15: a split huddle alerts while its last piece records" \
-  alert $((G15_RELEASE + 60 - G_RELEASE))
-oct15_timeline stopped >"$GOSLOG"
-expect_guard "2026-10-15: the last piece's own save then silences the guard" \
-  quiet $((G15_RELEASE + 413 - G_RELEASE))
-guard_dry_out=$(guard $((G15_RELEASE + 413 - G_RELEASE)) --dry-run 2>&1 || true)
-if [[ "$guard_dry_out" == *"saved the recording it started"* ]]; then
-  pass "2026-10-15: it is the save that silences the guard"
-else
-  fail "2026-10-15: it is the save that silences the guard" "$guard_dry_out"
-fi
-
-# --- the huddle has not ended ---
-
-guard_reset
-expect_guard "no alert before Slack's release has held for 60 s" quiet 30
-absent "a settling release writes no state" "$GSTATE"
-
-# A <60 s flap: Slack drops the mic and takes it back 26 s later. The huddle
-# is still on, so there is nothing to alert about.
-guard_reset
-{
-  today_timeline
-  gline 08:15:40.000000 1215 yes
-} >"$GOSLOG"
-expect_guard "a Slack flap shorter than 60 s does not alert" quiet 300
-
-# That flap must not split the huddle either: when it finally ends, the
-# session still reaches back to MacWhisper's 08:01:23 start.
-guard_reset
-{
-  today_timeline
-  gline 08:15:40.000000 1215 yes
-  gline 08:30:00.000000 1215 no
-} >"$GOSLOG"
-# 08:31:30 is 976 s after the 08:15:14 release.
-expect_guard "a mid-huddle flap does not detach MacWhisper's start from the huddle" alert 976
-
-# --- MacWhisper was not recording this huddle ---
-
-guard_reset
-today_timeline 0 >"$GOSLOG"
-expect_guard "no alert when MacWhisper never took the mic during the huddle" quiet 76
-
-# MacWhisper recorded an EARLIER huddle; the later huddle ran without it.
-# Only the later huddle's own MacWhisper start counts. The earlier recording
-# was discarded (no row), so the session boundary -- Slack's 07:30 release,
-# held far past 60 s -- is the ONLY thing keeping its 07:00:03 start from
-# being attributed to the later huddle. With a row for it, this case would
-# pass even with the boundary logic deleted.
-guard_reset
-{
-  printf 'Timestamp                       (process)[PID]    \n'
-  gline 07:00:00.000000 1215 yes
-  gline 07:00:03.000000 958 yes
-  gline 07:30:00.000000 1215 no
-  gline 07:30:05.000000 958 no
-  today_timeline 0 | tail -n +2
-} >"$GOSLOG"
-expect_guard "MacWhisper recording an earlier huddle does not make the later one alert" quiet 76
-
-# MacWhisper has quit: whatever it was doing, it is not recording now.
-guard_reset
-printf '1215|%s\n' "$SLACK_COMM" >"$GPSMAP"
-expect_guard "no alert when MacWhisper is no longer running" quiet 76
-
-# --- Slack Helper exits with the huddle ---
-
-# ps cannot name a dead pid, so a role learned while Slack's helper was alive
-# is cached and used once it is gone.
-guard_reset
-guard 30 --once >/dev/null 2>&1 || true
-printf '958|%s\n' "$MW_COMM" >"$GPSMAP"
-expect_guard "a Slack helper that has exited is still recognised from the pid cache" alert 76
-guard_reset
-printf '958|%s\n' "$MW_COMM" >"$GPSMAP"
-expect_guard "an unknown pid is never assumed to be Slack" quiet 76
-
-# --- stale huddles ---
-
-guard_reset
-expect_guard "a huddle that ended over 120 minutes ago is ignored" quiet $((121 * 60))
-
-# --- --dry-run ---
-
-guard_reset
-guard_dry_out=$(guard 76 --dry-run 2>&1 || true)
-if [[ "$guard_dry_out" == *"(dry run) would alert"* ]]; then
-  pass "--dry-run reports the alert it would raise"
-else
-  fail "--dry-run reports the alert it would raise" "$guard_dry_out"
-fi
-absent "--dry-run writes no state" "$GSTATE"
-absent "--dry-run writes no pid cache" "$GSTATE.pids"
-guard_alerts=$(alert_count_after_wait 1)
-if [[ "$guard_alerts" == "0" ]]; then
-  pass "--dry-run raises no alert"
-else
-  diag=$(dump "$NOTIFYLOG")
-  fail "--dry-run raises no alert" "$diag"
-fi
-
-# --- the database is only ever read ---
-
-guard_reset
-guard_sum_before=$(cksum <"$GDB")
-guard 76 --once >/dev/null 2>&1 || true
-guard_sum_after=$(cksum <"$GDB")
-if [[ "$guard_sum_before" == "$guard_sum_after" ]]; then
-  pass "the guard leaves MacWhisper's database byte-identical"
-else
-  fail "the guard leaves MacWhisper's database byte-identical"
-fi
-
-# --- numeric settings: unset takes the default, empty is rejected ---
-
-guard_reset
-guard_env_rc=0
-guard_env_out=$(env -u HUDDLE_GUARD_SETTLE_SECONDS GOSLOG="$GOSLOG" GOSLOG_ARGS="$GOSLOG_ARGS" GPSMAP="$GPSMAP" \
-  HUDDLE_DB="$GDB" HUDDLE_GUARD_STATE_FILE="$GSTATE" HUDDLE_GUARD_LOG_FILE="$GLOG" \
-  HUDDLE_GUARD_LOG_BIN="$WBIN/oslog-stub" HUDDLE_GUARD_PS_BIN="$WBIN/ps-stub" \
-  HUDDLE_GUARD_NOW="$((G_RELEASE + 59))" "$GUARD" --once 2>&1) || guard_env_rc=$?
-if ((guard_env_rc == 0)) && [[ "$guard_env_out" != *"ALERT"* ]]; then
-  pass "an unset HUDDLE_GUARD_SETTLE_SECONDS takes the 60 s default"
-else
-  fail "an unset HUDDLE_GUARD_SETTLE_SECONDS takes the 60 s default" "exit $guard_env_rc: $guard_env_out"
-fi
-
-guard_reset
-guard_env_rc=0
-guard_env_out=$(HUDDLE_GUARD_SETTLE_SECONDS='' guard 76 --once 2>&1) || guard_env_rc=$?
-if ((guard_env_rc == 1)) && [[ "$guard_env_out" == *"HUDDLE_GUARD_SETTLE_SECONDS must be a whole number"* ]]; then
-  pass "an empty HUDDLE_GUARD_SETTLE_SECONDS is rejected, not defaulted"
-else
-  fail "an empty HUDDLE_GUARD_SETTLE_SECONDS is rejected, not defaulted" "exit $guard_env_rc: $guard_env_out"
-fi
-absent "a rejected setting writes no state" "$GSTATE"
-
-# Paired with the unset case above (no alert at 59 s under the default), this
-# shows the value is actually read.
-guard_reset
-guard_env_out=$(HUDDLE_GUARD_SETTLE_SECONDS=20 guard 30 --once 2>&1 || true)
-if [[ "$guard_env_out" == *"ALERT (1/3)"* ]]; then
-  pass "a 20 s settle alerts 30 s after the release"
-else
-  fail "a 20 s settle alerts 30 s after the release" "$guard_env_out"
-fi
-
-guard_reset
-guard_env_rc=0
-HUDDLE_GUARD_MAX_ALERTS="SETTLE_SECONDS[\$(touch $WORK/guard-pwned)]" guard 76 --once >/dev/null 2>&1 || guard_env_rc=$?
-if ((guard_env_rc == 1)); then
-  pass "a non-numeric HUDDLE_GUARD_MAX_ALERTS is rejected"
-else
-  fail "a non-numeric HUDDLE_GUARD_MAX_ALERTS is rejected" "exit $guard_env_rc"
-fi
-absent "a non-numeric setting executes nothing" "$WORK/guard-pwned"
-
-guard_reset
-guard_env_rc=0
-# Not through guard(), which sets HUDDLE_GUARD_NOW itself.
-env GOSLOG="$GOSLOG" GOSLOG_ARGS="$GOSLOG_ARGS" GPSMAP="$GPSMAP" \
-  HUDDLE_DB="$GDB" HUDDLE_GUARD_STATE_FILE="$GSTATE" HUDDLE_GUARD_LOG_FILE="$GLOG" \
-  HUDDLE_GUARD_LOG_BIN="$WBIN/oslog-stub" HUDDLE_GUARD_PS_BIN="$WBIN/ps-stub" \
-  HUDDLE_GUARD_NOW= "$GUARD" --once >/dev/null 2>&1 || guard_env_rc=$?
-if ((guard_env_rc == 1)); then
-  pass "an empty HUDDLE_GUARD_NOW is rejected rather than read as epoch 0"
-else
-  fail "an empty HUDDLE_GUARD_NOW is rejected rather than read as epoch 0" "exit $guard_env_rc"
-fi
-
-# --- LaunchAgent definition ---
-
-if command -v plutil >/dev/null 2>&1; then
-  # launchctl is shadowed by an inert stub and HOME is repointed, so
-  # --install writes its plist into the fixture and loads nothing.
-  mkdir -p "$WORK/guardhome"
-  cat >"$WBIN/launchctl" <<'STUB'
-#!/usr/bin/env bash
-exit 1
-STUB
-  chmod +x "$WBIN/launchctl"
-  env PATH="$WBIN:$PATH" HOME="$WORK/guardhome" HUDDLE_GUARD_STATE_FILE="$GSTATE" \
-    HUDDLE_GUARD_LOG_FILE="$GLOG" "$GUARD" --install >/dev/null 2>&1 || true
-  guard_plist=$(find "$WORK/guardhome" -name '*mic-guard.plist' 2>/dev/null | head -1)
-  if [[ -n "$guard_plist" ]]; then
-    guard_xml=$(plutil -convert xml1 -o - "$guard_plist" 2>/dev/null || true)
-    # set -m keeps the alert alive instead; see raise_alert().
-    if [[ -n "$guard_xml" ]] && ! grep -qF 'AbandonProcessGroup' <<<"$guard_xml"; then
-      pass "the guard plist leaves AbandonProcessGroup unset"
-    else
-      fail "the guard plist leaves AbandonProcessGroup unset" "$guard_xml"
-    fi
-    if grep -qF '<integer>30</integer>' <<<"$guard_xml"; then
-      pass "the guard plist polls every 30 s as a plist integer"
-    else
-      fail "the guard plist polls every 30 s as a plist integer" "$guard_xml"
-    fi
-    guard_value=$(plutil -extract RunAtLoad raw -o - "$guard_plist" 2>/dev/null || true)
-    if [[ "$guard_value" == "true" ]]; then
-      pass "the guard plist runs at load"
-    else
-      fail "the guard plist runs at load" "$guard_xml"
-    fi
-    guard_interp=$(plutil -extract ProgramArguments.0 raw -o - "$guard_plist" 2>/dev/null || true)
-    if [[ "$guard_interp" == /*bash ]]; then
-      pass "the guard plist names an absolute bash as ProgramArguments[0]"
-    else
-      fail "the guard plist names an absolute bash as ProgramArguments[0]" "$guard_interp"
-    fi
-    guard_value=$(plutil -extract ProgramArguments.2 raw -o - "$guard_plist" 2>/dev/null || true)
-    if [[ "$guard_value" == "--once" ]]; then
-      pass "the guard plist runs --once"
-    else
-      fail "the guard plist runs --once" "$guard_xml"
-    fi
-  else
-    fail "--install writes a guard plist" "no plist under $WORK/guardhome"
-  fi
-else
-  skip "the guard plist leaves AbandonProcessGroup unset (plutil unavailable)"
-  skip "the guard plist polls every 30 s as a plist integer (plutil unavailable)"
-  skip "the guard plist runs at load (plutil unavailable)"
-  skip "the guard plist names an absolute bash as ProgramArguments[0] (plutil unavailable)"
-  skip "the guard plist runs --once (plutil unavailable)"
-fi
-
-# --- the bash 4.2 guard ---
-
-guard_old_bash=""
-for candidate in /bin/bash /usr/bin/bash; do
-  if [[ -x "$candidate" ]] && ! bash_is_modern "$candidate"; then
-    guard_old_bash="$candidate"
-    break
-  fi
-done
-if [[ -n "$guard_old_bash" ]]; then
-  guard_reset
-  guard_old_rc=0
-  guard_old_out=$("$guard_old_bash" "$GUARD" --once 2>&1) || guard_old_rc=$?
-  if ((guard_old_rc != 0)) && [[ "$guard_old_out" == *"requires bash 4.2 or newer"* ]]; then
-    pass "the guard rejects an inadequate bash with an actionable message"
-  else
-    fail "the guard rejects an inadequate bash with an actionable message" "exit $guard_old_rc: $guard_old_out"
-  fi
-else
-  skip "the guard rejects an inadequate bash with an actionable message (no bash <4.2 here)"
-fi
-
 # --- huddle-migrate-md -------------------------------------------------
 #
 # The migration adopts pre-Markdown .txt transcripts. Its whole risk surface
@@ -5121,6 +4349,344 @@ else
   skip "a failed sidecar rename still leaves the .md in place (chflags unavailable)"
   skip "the failure message does not promise a re-run repairs it (chflags unavailable)"
   skip "a re-run does not silently repair the stale sidecar (chflags unavailable)"
+fi
+
+# --- install.sh --------------------------------------------------------
+#
+# HOME and target dirs are in $WORK; launchd calls are stubs.
+
+echo "install.sh"
+
+INSTALL="$REPO_ROOT/install.sh"
+IHOME="$WORK/inst/home"
+IBIN="$IHOME/.local/bin"
+ISKILLS="$IHOME/.claude/skills"
+ISKILL="$ISKILLS/huddle-review"
+ISTUB="$WORK/inst/stub"
+ICALLS="$WORK/inst/calls"
+ISKILL_SRC="$REPO_ROOT/skills/huddle-review/SKILL.md"
+IRETIRED_LABEL="com.smartwatermelon.huddle-transcribe.mic-guard"
+IRETIRED_PLIST="$IHOME/Library/LaunchAgents/$IRETIRED_LABEL.plist"
+
+mkdir -p "$ISTUB"
+# Each stub logs "<name> <args>" to $ICALLS. INSTALL_STUB_FAIL names one
+# "<name> <first-arg>" pair that exits 1.
+for stub in huddle-watch launchctl; do
+  cat >"$ISTUB/$stub" <<'STUB'
+#!/usr/bin/env bash
+name="${0##*/}"
+printf '%s %s\n' "$name" "$*" >>"$ICALLS"
+[[ "${INSTALL_STUB_FAIL:-}" != "$name ${1:-}" ]] || exit 1
+exit 0
+STUB
+  chmod +x "$ISTUB/$stub"
+done
+unset stub
+
+inst_reset() {
+  rm -rf "$IHOME" "$ICALLS"
+  mkdir -p "$IHOME"
+  : >"$ICALLS"
+}
+
+# inst <args...>: run install.sh against the fixture. Output lands in
+# $IOUT and the exit status in $IRC. INST_PATH replaces PATH when set.
+inst() {
+  IRC=0
+  IOUT=$(env HOME="$IHOME" HUDDLE_BIN_DIR="$IBIN" HUDDLE_SKILLS_DIR="$ISKILLS" \
+    HUDDLE_WATCH_BIN="$ISTUB/huddle-watch" \
+    HUDDLE_LAUNCHCTL_BIN="$ISTUB/launchctl" ICALLS="$ICALLS" \
+    PATH="${INST_PATH:-$PATH}" "$INSTALL" "$@" 2>&1) || IRC=$?
+}
+
+# Every assertion also checks install.sh's exit or refusal message, so
+# none passes when install.sh is missing.
+
+# expect_link <name> <path> <want-target> [<want-rc>]
+expect_link() {
+  local target=""
+  if [[ -L "$2" ]]; then
+    target=$(readlink -- "$2")
+  fi
+  if [[ $IRC -eq ${4:-0} && "$target" == "$3" ]]; then
+    pass "$1"
+  else
+    fail "$1" "exit $IRC; $2 -> '${target}' (wanted '$3')"
+  fi
+}
+
+# expect_calls <name> <want>: install.sh exited 0 and the stubs were called
+# exactly as <want>.
+expect_calls() {
+  local calls
+  calls=$(cat "$ICALLS")
+  if [[ $IRC -eq 0 && "$calls" == "$2" ]]; then
+    pass "$1"
+  else
+    fail "$1" "exit $IRC; calls: $calls"
+  fi
+}
+
+inst_reset
+inst --help
+if [[ $IRC -eq 0 && "$IOUT" == *"--uninstall"* ]]; then
+  pass "install.sh --help exits 0 and documents --uninstall"
+else
+  fail "install.sh --help exits 0 and documents --uninstall" "exit $IRC: $IOUT"
+fi
+if [[ $IRC -eq 0 && ! -e "$IBIN" && ! -e "$ISKILLS" ]]; then
+  pass "install.sh --help links nothing"
+else
+  fail "install.sh --help links nothing" "exit $IRC"
+fi
+expect_calls "install.sh --help runs no LaunchAgent command" ""
+
+inst --bogus
+if [[ $IRC -ne 0 && "$IOUT" == *"Unknown option: --bogus"* ]]; then
+  pass "install.sh rejects an unknown option"
+else
+  fail "install.sh rejects an unknown option" "exit $IRC: $IOUT"
+fi
+inst extra
+if [[ $IRC -ne 0 && "$IOUT" == *"unexpected argument 'extra'"* && ! -e "$IBIN" ]]; then
+  pass "install.sh rejects a positional argument and installs nothing"
+else
+  fail "install.sh rejects a positional argument and installs nothing" "exit $IRC: $IOUT"
+fi
+
+# Fresh install.
+inst_reset
+inst
+if [[ $IRC -eq 0 ]]; then
+  pass "a fresh install exits 0"
+else
+  fail "a fresh install exits 0" "exit $IRC: $IOUT"
+fi
+for name in huddle-transcribe huddle-watch; do
+  expect_link "a fresh install links $name into the bin dir" \
+    "$IBIN/$name" "$REPO_ROOT/$name"
+done
+if [[ $IRC -eq 0 && ! -e "$IBIN/huddle-mic-guard" && ! -L "$IBIN/huddle-mic-guard" ]]; then
+  pass "a fresh install does not link the retired huddle-mic-guard"
+else
+  fail "a fresh install does not link the retired huddle-mic-guard" "exit $IRC"
+fi
+if [[ $IRC -eq 0 && -d "$ISKILL" && ! -L "$ISKILL" ]]; then
+  pass "the skill directory is a real directory, not a link"
+else
+  fail "the skill directory is a real directory, not a link"
+fi
+expect_link "the skill's SKILL.md is a link into the checkout" \
+  "$ISKILL/SKILL.md" "$ISKILL_SRC"
+want_calls=$'huddle-watch --install\nhuddle-watch --status'
+expect_calls "install runs huddle-watch --install, then --status last" "$want_calls"
+if [[ "$IOUT" == *"is not on PATH"* ]]; then
+  pass "install warns when the bin dir is not on PATH"
+else
+  fail "install warns when the bin dir is not on PATH" "$IOUT"
+fi
+
+# The warning is absent once the bin dir is on PATH.
+inst_reset
+INST_PATH="$IBIN:$PATH" inst
+if [[ $IRC -eq 0 && "$IOUT" != *"is not on PATH"* ]]; then
+  pass "install does not warn when the bin dir is on PATH"
+else
+  fail "install does not warn when the bin dir is on PATH" "exit $IRC: $IOUT"
+fi
+
+# A re-run is a no-op for the links, and still drives the install.
+: >"$ICALLS"
+inst
+if [[ $IRC -eq 0 && "$IOUT" == *"(already)"* && "$IOUT" != *"Relinked"* ]]; then
+  pass "a re-run exits 0 and relinks nothing"
+else
+  fail "a re-run exits 0 and relinks nothing" "exit $IRC: $IOUT"
+fi
+expect_link "a re-run leaves the huddle-watch link as it was" \
+  "$IBIN/huddle-watch" "$REPO_ROOT/huddle-watch"
+expect_link "a re-run leaves the SKILL.md link as it was" \
+  "$ISKILL/SKILL.md" "$ISKILL_SRC"
+expect_calls "a re-run runs the LaunchAgent install again" "$want_calls"
+
+# A stale link -- dangling, or into another checkout -- is replaced.
+mkdir -p "$IBIN" "$ISKILL"
+rm -f "$IBIN/huddle-watch" "$ISKILL/SKILL.md"
+ln -s "$WORK/inst/no-such-checkout/huddle-watch" "$IBIN/huddle-watch"
+ln -s "$WORK/inst/no-such-checkout/SKILL.md" "$ISKILL/SKILL.md"
+inst
+if [[ $IRC -eq 0 && "$IOUT" == *"Relinked"* ]]; then
+  pass "install with stale links exits 0 and reports the relink"
+else
+  fail "install with stale links exits 0 and reports the relink" "exit $IRC: $IOUT"
+fi
+expect_link "a stale bin link is replaced" "$IBIN/huddle-watch" "$REPO_ROOT/huddle-watch"
+expect_link "a stale SKILL.md link is replaced" "$ISKILL/SKILL.md" "$ISKILL_SRC"
+
+# A real file is never overwritten, and a refusal changes nothing: a
+# stale link elsewhere is not repaired either.
+inst_reset
+mkdir -p "$IBIN"
+printf 'precious\n' >"$IBIN/huddle-transcribe"
+ln -s "$WORK/inst/elsewhere/huddle-watch" "$IBIN/huddle-watch"
+inst
+refused=0
+[[ $IRC -eq 0 || "$IOUT" != *"refusing to overwrite"* ]] || refused=1
+if [[ $refused -eq 1 && "$IOUT" == *"$IBIN/huddle-transcribe"* ]]; then
+  pass "install refuses a real file in the bin dir and names it"
+else
+  fail "install refuses a real file in the bin dir and names it" "exit $IRC: $IOUT"
+fi
+content=$(cat "$IBIN/huddle-transcribe" 2>/dev/null || true)
+if [[ $refused -eq 1 && ! -L "$IBIN/huddle-transcribe" && "$content" == "precious" ]]; then
+  pass "the refused real file is left untouched"
+else
+  fail "the refused real file is left untouched"
+fi
+expect_link "a refusal leaves a stale link elsewhere unrepaired" \
+  "$IBIN/huddle-watch" "$WORK/inst/elsewhere/huddle-watch" 1
+calls=$(cat "$ICALLS")
+if [[ $refused -eq 1 && ! -e "$ISKILLS" && -z "$calls" ]]; then
+  pass "a refusal creates no skill directory and runs no LaunchAgent command"
+else
+  fail "a refusal creates no skill directory and runs no LaunchAgent command" "calls: $calls"
+fi
+
+# Same rule for a real SKILL.md inside a real skill directory.
+inst_reset
+mkdir -p "$ISKILL"
+printf 'local edit\n' >"$ISKILL/SKILL.md"
+inst
+content=$(cat "$ISKILL/SKILL.md" 2>/dev/null || true)
+if [[ "$IOUT" == *"refusing to overwrite"* && $IRC -ne 0 &&
+  "$content" == "local edit" && ! -L "$ISKILL/SKILL.md" ]]; then
+  pass "install refuses a real SKILL.md and leaves it untouched"
+else
+  fail "install refuses a real SKILL.md and leaves it untouched" "exit $IRC: $IOUT"
+fi
+
+# The old README form: the skill directory itself linked into the checkout.
+inst_reset
+mkdir -p "$ISKILLS"
+ln -s "$REPO_ROOT/skills/huddle-review" "$ISKILL"
+inst
+if [[ $IRC -eq 0 && -d "$ISKILL" && ! -L "$ISKILL" ]]; then
+  pass "an old directory-link skill becomes a real directory"
+else
+  fail "an old directory-link skill becomes a real directory" "exit $IRC: $IOUT"
+fi
+expect_link "the converted skill directory holds a SKILL.md link" \
+  "$ISKILL/SKILL.md" "$ISKILL_SRC"
+if [[ $IRC -eq 0 && -f "$ISKILL_SRC" && ! -L "$ISKILL_SRC" ]]; then
+  pass "converting the directory link leaves the checkout's SKILL.md in place"
+else
+  fail "converting the directory link leaves the checkout's SKILL.md in place"
+fi
+
+# Retired huddle-mic-guard: an old link into this checkout and its plist
+# are removed. retired_setup <link-target> lays them down.
+retired_setup() {
+  inst_reset
+  mkdir -p "$IBIN" "${IRETIRED_PLIST%/*}"
+  ln -s "$1" "$IBIN/huddle-mic-guard"
+  printf '<plist/>\n' >"$IRETIRED_PLIST"
+}
+iuid=$(id -u)
+retired_setup "$REPO_ROOT/huddle-mic-guard"
+inst
+if [[ $IRC -eq 0 && ! -L "$IBIN/huddle-mic-guard" ]]; then
+  pass "install removes the retired huddle-mic-guard link into this checkout"
+else
+  fail "install removes the retired huddle-mic-guard link into this checkout" "exit $IRC: $IOUT"
+fi
+absent "install removes the retired mic-guard plist" "$IRETIRED_PLIST"
+expect_calls "install boots out the retired mic-guard agent" \
+  "launchctl bootout gui/$iuid/$IRETIRED_LABEL"$'\n'"$want_calls"
+if [[ "$IOUT" == *"Removed:   $IRETIRED_PLIST"* ]]; then
+  pass "install reports the retired plist it removed"
+else
+  fail "install reports the retired plist it removed" "$IOUT"
+fi
+
+# A mic-guard link into some other checkout is not ours to remove.
+retired_setup "$WORK/inst/other-checkout/huddle-mic-guard"
+inst
+expect_link "install leaves a huddle-mic-guard link into another checkout" \
+  "$IBIN/huddle-mic-guard" "$WORK/inst/other-checkout/huddle-mic-guard"
+
+# --uninstall removes only what points into this checkout.
+inst_reset
+inst
+mkdir -p "$IBIN"
+rm -f "$IBIN/huddle-watch"
+ln -s "$WORK/inst/other-checkout/huddle-watch" "$IBIN/huddle-watch"
+ln -s "$WORK/inst/other-tool" "$IBIN/other-tool"
+: >"$ICALLS"
+inst --uninstall
+if [[ $IRC -eq 0 ]]; then
+  pass "--uninstall exits 0"
+else
+  fail "--uninstall exits 0" "exit $IRC: $IOUT"
+fi
+if [[ $IRC -eq 0 && ! -e "$IBIN/huddle-transcribe" && ! -L "$IBIN/huddle-transcribe" ]]; then
+  pass "--uninstall removes the links into this checkout"
+else
+  fail "--uninstall removes the links into this checkout"
+fi
+expect_link "--uninstall leaves a link into another checkout" \
+  "$IBIN/huddle-watch" "$WORK/inst/other-checkout/huddle-watch"
+expect_link "--uninstall leaves an unrelated link" \
+  "$IBIN/other-tool" "$WORK/inst/other-tool"
+if [[ $IRC -eq 0 && ! -e "$ISKILL" && ! -L "$ISKILL" ]]; then
+  pass "--uninstall removes the emptied skill directory"
+else
+  fail "--uninstall removes the emptied skill directory"
+fi
+expect_calls "--uninstall runs huddle-watch --uninstall" "huddle-watch --uninstall"
+
+# --uninstall cleans up the retired mic-guard the same way install does.
+retired_setup "$REPO_ROOT/huddle-mic-guard"
+inst --uninstall
+if [[ $IRC -eq 0 && ! -L "$IBIN/huddle-mic-guard" && ! -e "$IRETIRED_PLIST" ]]; then
+  pass "--uninstall removes the retired mic-guard link and plist"
+else
+  fail "--uninstall removes the retired mic-guard link and plist" "exit $IRC: $IOUT"
+fi
+expect_calls "--uninstall boots out the retired mic-guard agent" \
+  $'huddle-watch --uninstall\n'"launchctl bootout gui/$iuid/$IRETIRED_LABEL"
+
+# A skill directory holding anything else is kept, minus our link.
+inst_reset
+inst
+mkdir -p "$ISKILL"
+printf 'notes\n' >"$ISKILL/NOTES.md"
+inst --uninstall
+if [[ $IRC -eq 0 && -d "$ISKILL" && -f "$ISKILL/NOTES.md" && ! -L "$ISKILL/SKILL.md" ]]; then
+  pass "--uninstall keeps a non-empty skill directory but removes SKILL.md"
+else
+  fail "--uninstall keeps a non-empty skill directory but removes SKILL.md" "$IOUT"
+fi
+
+# A real file where a link was is never removed by --uninstall.
+inst_reset
+mkdir -p "$IBIN"
+printf 'precious\n' >"$IBIN/huddle-transcribe"
+inst --uninstall
+content=$(cat "$IBIN/huddle-transcribe" 2>/dev/null || true)
+if [[ $IRC -eq 0 && ! -L "$IBIN/huddle-transcribe" && "$content" == "precious" ]]; then
+  pass "--uninstall leaves a real file in the bin dir"
+else
+  fail "--uninstall leaves a real file in the bin dir" "exit $IRC: $IOUT"
+fi
+
+# A LaunchAgent install failure is not swallowed.
+inst_reset
+INSTALL_STUB_FAIL="huddle-watch --install" inst
+calls=$(cat "$ICALLS")
+if [[ $IRC -ne 0 && "$calls" == "huddle-watch --install" ]]; then
+  pass "a failed huddle-watch --install fails install.sh"
+else
+  fail "a failed huddle-watch --install fails install.sh" "exit $IRC; calls: $calls"
 fi
 
 # --- summary -----------------------------------------------------------

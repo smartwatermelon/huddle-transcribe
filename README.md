@@ -24,12 +24,20 @@ transcript plus a metadata sidecar to a target directory.
 
 ```bash
 git clone git@github.com:smartwatermelon/huddle-transcribe.git
-ln -s "$(pwd)/huddle-transcribe/huddle-transcribe" ~/.local/bin/huddle-transcribe
-ln -s "$(pwd)/huddle-transcribe/huddle-watch" ~/.local/bin/huddle-watch
-ln -s "$(pwd)/huddle-transcribe/huddle-mic-guard" ~/.local/bin/huddle-mic-guard
+huddle-transcribe/install.sh
 ```
 
-Ensure `~/.local/bin` is on your `PATH`.
+`install.sh` links `huddle-transcribe` and `huddle-watch` into
+`~/.local/bin`, links the [`huddle-review` skill](#reviewing-a-transcript)
+into `~/.claude/skills/huddle-review/`, installs the `huddle-watch`
+LaunchAgent, and ends by printing `huddle-watch --status`. Files are linked,
+not copied, so an edit in the checkout takes effect immediately. It warns
+when `~/.local/bin` is not on your `PATH`.
+
+It is safe to re-run. A link that points elsewhere is replaced. A real file
+in the way is never overwritten: the script names it and changes nothing.
+`install.sh --uninstall` removes the LaunchAgent and only the links that
+point into this checkout.
 
 ## Usage
 
@@ -385,60 +393,6 @@ through the environment. `HUDDLE_MIN_DURATION` and
 `HUDDLE_STITCH_GAP_SECONDS` must be whole numbers: they are interpolated
 into SQL, so anything else is rejected at startup rather than trusted.
 
-## Recorder-still-running alert (`huddle-mic-guard`)
-
-MacWhisper notices when a Slack huddle ends, but it only offers a "Finish
-Recording" prompt, and that prompt can disappear. The recording then goes on
-capturing the room. `huddle-mic-guard` watches for that and raises a modal
-alert: "Huddle ended — MacWhisper is still recording". It only alerts. It
-never stops MacWhisper or touches Slack.
-
-Every 30 seconds it reads the last 4 hours of coreaudiod's microphone-client
-events (`log show`) and alerts when all of these are true:
-
-1. Slack's microphone (its "Slack Helper" process) was released at least 60 s
-   ago and has not been taken again. Shorter drops are flaps, not endings.
-2. MacWhisper took the microphone during that huddle.
-3. MacWhisper is still running.
-4. MacWhisper's database has saved no audio for the recording it started
-   when it last took the microphone. A save of an earlier recording does not
-   count: one huddle can be split into several recordings (screen sharing
-   did this on 2026-10-15). The audio row is written when MacWhisper
-   finalizes a recording.
-
-MacWhisper releasing the microphone is **not** used as "recording stopped".
-On 2026-09-24 MacWhisper's Bluetooth mic dropped 36 s after the huddle ended.
-MacWhisper released it, then kept recording on a fallback mic for 25 more
-minutes.
-
-One huddle end alerts at most 3 times, 5 minutes apart. Each repeat
-replaces the alert still on screen instead of stacking. A huddle that ended
-more than 2 hours ago is ignored. State is in
-`~/.local/state/huddle-transcribe/mic-guard-state`, and the log is
-`~/Library/Logs/huddle-transcribe-mic-guard.log`.
-
-```bash
-huddle-mic-guard --dry-run     # report what a check would do; alerts nothing
-huddle-mic-guard --install     # writes and loads the LaunchAgent (every 30 s)
-huddle-mic-guard --status      # report agent, state file, and log
-huddle-mic-guard --uninstall   # unloads and removes the LaunchAgent
-```
-
-The alert runs in its own process group (`set -m`). Without that, launchd
-kills the job's leftover processes when the job exits, which would close the
-alert as soon as it appeared. A plist from an earlier install may still set
-`AbandonProcessGroup`. It is harmless, and `--install` rewrites the plist
-without it. `log show` was verified only from an admin account.
-Whether a standard user can read coreaudiod's log is not confirmed.
-
-Settings, each read from the environment: `HUDDLE_GUARD_WINDOW_MINUTES`
-(240), `HUDDLE_GUARD_SETTLE_SECONDS` (60), `HUDDLE_GUARD_REALERT_SECONDS`
-(300), `HUDDLE_GUARD_MAX_ALERTS` (3), `HUDDLE_GUARD_MAX_AGE_MINUTES` (120),
-and `HUDDLE_GUARD_POLL_INTERVAL` (30, read by `--install` only). An unset
-variable takes the default; an empty or non-numeric one is an error.
-`HUDDLE_DB`, `HUDDLE_NO_NOTIFY`, and `HUDDLE_NOTIFY_BIN` work as they do for
-`huddle-watch`.
-
 ## Configuration
 
 Output directory defaults to a `transcripts/` folder inside the user's
@@ -471,11 +425,18 @@ source audio.
 
 It is written for [Claude Code](https://claude.com/claude-code) and ships here
 rather than in a dotfiles repo, so the procedure travels with the tool that
-produces its input. Install it by symlinking into the skills directory:
+produces its input. [`install.sh`](#installation) installs it. By hand, it
+follows the convention every other skill uses, a real directory holding a
+linked `SKILL.md`:
 
 ```bash
-ln -s "$(pwd)/skills/huddle-review" ~/.claude/skills/huddle-review
+mkdir -p ~/.claude/skills/huddle-review
+ln -s "$(pwd)/skills/huddle-review/SKILL.md" \
+  ~/.claude/skills/huddle-review/SKILL.md
 ```
+
+The file is linked rather than copied so an edit in the checkout takes
+effect immediately, with no sync step and no drift.
 
 Then ask for a review — "the huddle transcript is ready", "index today's
 transcript" — and it runs.
@@ -510,8 +471,8 @@ Two behaviors are deliberate and worth knowing before use:
 There is no build step. Before committing:
 
 ```bash
-shellcheck -S info huddle-transcribe huddle-watch huddle-mic-guard tests/run-tests.sh
-shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-mic-guard tests/run-tests.sh
+shellcheck -S info huddle-transcribe huddle-watch huddle-migrate-md install.sh tests/run-tests.sh
+shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-migrate-md install.sh tests/run-tests.sh
 ./tests/run-tests.sh
 ```
 
@@ -525,9 +486,8 @@ first-run seeding, dedupe, the attempt cap, the lock, `HUDDLE_MIN_DURATION`
 validation, state-file corruption handling, alert content, and alert
 merging (a held stub stands in for an alert still on screen).
 Alerts are routed to a stub via `HUDDLE_NOTIFY_BIN`, so running the
-suite never posts a desktop alert. `huddle-mic-guard` replays a real day's
-coreaudiod events through stub `log` and `ps` commands at a fixed "now",
-including the 2026-10-15 huddle that MacWhisper split into three recordings. It
+suite never posts a desktop alert. `install.sh` runs against temp
+directories with stub `huddle-watch` and `launchctl` commands. The suite
 does not cover the real `mw` binary's
 own behavior, nor launchd's actual scheduling. CI runs the same three
 commands.
