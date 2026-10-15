@@ -120,6 +120,14 @@ Only a tool that parses the *timestamp* line needs the wider pattern
 the format was switched; `--format html` was rejected precisely because it
 collapses the body to one line and would have invalidated §5.1.
 
+**Update (2026-10-15):** a meeting MacWhisper split into several recordings
+is transcribed piece by piece and joined. The joined file adds a leading
+`> **Note:**` line and a `## Part i of N — starts at …` heading per piece;
+each part's blocks keep the four-line shape, with timestamps moved by the
+part's start. Nothing added starts with `*`, so the label anchor still
+matches only `mw`'s labels. But **numbering restarts in each part**, so a
+mapping must be per part (between `## Part` headings), not per file.
+
 Census: 40 LABEL / 40 TIME / 40 TEXT / 41 BLANK. Zero occurrences of the string
 `Speaker` inside body text across the corpus.
 

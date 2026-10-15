@@ -22,7 +22,7 @@ a README, a LICENSE, and the CI workflows.
 ## Commands
 
 ```bash
-./tests/run-tests.sh                          # 425 behavioral tests (some skip off macOS)
+./tests/run-tests.sh                          # 610 behavioral tests (some skip off macOS)
 shellcheck -S info huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -d huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
 shfmt -i 2 -ci -w huddle-transcribe huddle-watch huddle-migrate-md huddle-mic-guard tests/run-tests.sh
@@ -133,6 +133,151 @@ has no duration filter: an explicit id is unambiguous (#37).
 **Audio source preference** is merged multitrack → app/system audio → mic
 audio, resolved from the three filename columns after selection.
 
+### Split meetings (`GROUP_CTE`)
+
+MacWhisper sometimes saves one meeting as several back-to-back recordings
+(2026-10-06, -13 and -15 Slack huddles: three pieces each, 4–26 s apart; it
+stops recording when a screen share starts).
+`GROUP_CTE` chains same-app `recordedmeeting` rows whose gap
+(`next.date − (prev.date + prev.duration)`, using the running max end) is in
+`[0, HUDDLE_STITCH_GAP_SECONDS]` (default 60, `0` disables) into groups, via
+SQLite window functions. Overlaps are not joined. The one real overlap by
+`rm.date + duration` (2026-09-22, Chrome, pre-live capture mode) is not a
+split, so it stays two sessions. Deleted sessions and rows
+without `date`, or without both `bundleIdentifier` and `appName`, are never
+grouped. Use `rm.date`, not `s.dateCreated`: for live captures the latter
+is roughly the END.
+
+"Same app" is `bundleIdentifier`, not `appName`: the real database has 14
+`Chrome` and 9 `Google Chrome` rows, all `com.google.Chrome` (and 26 Slack
+rows, `com.tinyspeck.slackmacgap`; no NULL bundle ids, 2026-10-15). A row
+with a NULL bundle id keys on `'app:' || appName`, which keeps the old rule
+for it but can never chain it to a bundle-keyed row. A test compares the two
+scripts' `GROUP_CTE`s, minus the watcher's readiness column.
+
+The CTE is prefixed to `SESSION_SELECT`, which keeps its 7 columns; column 3
+becomes `DURATION_EXPR`, the group total when the group has more than one
+piece and the old `COALESCE` otherwise. The floored queries add
+`IS_GROUP_LEAD`, so `latest`, dates, `--list` and `--all` see a group once,
+as its first piece, measured by its total.
+
+Two facts, both checked on live data (2026-10-15), shape the rest:
+
+- **MacWhisper writes no row for a recording while it records.** The
+  session, `recordedmeeting` and `mediafile` rows appear only after it ends
+  (on 2026-10-13, 1.3 to 7.5 minutes after). So when piece 1 is ready,
+  piece 2 usually does not exist yet, and no wait inside one run can see
+  it. An earlier design waited out a gap window and then treated the group
+  as done; a later piece was then skipped for good.
+- **`mw` on ffmpeg-joined audio loses all capitalization and punctuation**
+  (Whisper Large v3 Turbo), while each piece alone comes back punctuated.
+  Re-encoding and `--language en` did not help. So pieces are transcribed
+  one by one and the TRANSCRIPTS are joined. There is no ffmpeg any more.
+
+**Parts.** After selection the script resolves the group (`group_members`:
+each member's start and end in milliseconds after the lead's `rm.date`),
+re-reads the lead's row, and builds the parts: every member with a cached
+transcript, or with an audio `mediafile` row and not named by `--pending`.
+Any other member, the lead included, is pending: left out, listed as
+`Part pending: <id>`, and named in a closing `> **Note:**` (part number,
+start, short id) saying the transcript may be incomplete. `--pending` is
+how the watcher passes members that fail `READY_GATES`; the transcriber
+has no copy of those gates. Each member's start and its gap after the
+previous member are rounded to whole seconds (the gap from milliseconds,
+so it is not off by two roundings). Part numbers count every member, so
+`## Part 2 of 3` can follow `## Part 1 of 3` with part 3 pending, or a
+pending part 1 can leave the doc starting at part 2.
+
+**Per-piece cache.** Each part's raw `mw` output is kept at
+`$PIECES_DIR/<session id>.md` (`HUDDLE_PIECES_DIR`, default
+`~/.local/state/huddle-transcribe/pieces`), outside the KB, written via a
+temp file beside it and `mv`. `--restitch` uses a cached piece whenever it
+exists, so a re-stitch transcribes only the new piece. A manual run
+transcribes afresh any piece whose audio is still there, and uses the cache
+only when the audio is gone. `--mark-reviewed` removes the cache files of
+the ids it releases (exact paths), after the sidecar is written, so a late
+piece after review gets a `-N` with the reviewed parts as "not transcribed"
+notes. `build()` in the suite points the cache into `$WORK`; never let a
+test write the real one.
+
+**The join** is one Markdown document: a `> **Note:**` line saying it was
+joined (speaker numbers restart in each part), then per part a
+`## Part i of n — starts at MM:SS, after a G s gap` heading and the
+part's transcript with every `*start-end*` line moved by the part's start
+(`offset_transcript`, awk; `HH:MM:SS` from the hour on, as `mw` prints).
+Every other line, speaker labels included, is passed through as `mw` wrote
+it. Nothing added starts with `*`, so the `^\*\*Speaker` anchors of the
+warning and of `docs/plans/speaker-name-attribution.md` see only `mw`'s
+labels. A part that failed (mw error, audio and cache both gone) is a
+heading and a `> **Note:**` line naming it; the rest is still written.
+No part transcribed: exit 1, nothing written. A group of one part (the
+lone path) is `mw`'s output unchanged, written straight to the temp
+transcript when it is not `--restitch`.
+
+**Sidecar.** A stitched sidecar adds `session_ids` (the parts it HOLDS) and
+`source_files`, plus `missing_session_ids` for parts it could not include
+and `pending_session_ids` for parts not ready. Keeping those out of
+`session_ids` is what stops `--mark-reviewed` deleting the only copy of
+their audio. `session_id`/`source_file` are the first part it holds, so
+`session_id` is always in `session_ids`; the file name stays the lead's,
+so a re-stitch keeps it. A `--restitch` run adds `restitchable: true` and
+`doc_sha256` (`shasum -a 256` of the doc as written). A manual single
+recording's sidecar is byte-for-byte unchanged.
+
+**"Done" is "every part named".** `--skip-existing`, `--restitch` and
+`--all` treat a meeting as transcribed only when sidecars (via
+`(.session_ids // [.session_id])`) name every part. For `--restitch` a late
+piece, a failed part or a pending one that became ready is therefore new.
+`--all` and a manual `--skip-existing` use `sidecar_index covered`, which
+also counts `missing_session_ids` and `pending_session_ids`: retrying those
+is the watcher's job, and counting them stops a manual `--all` writing a
+`-N`. Per-piece sidecars written before stitching existed count when
+together they name every part.
+
+**Replacing vs never overwriting.** Manual runs never overwrite (decision
+d): a taken name means the next free `-N` with the duplicate note.
+`--restitch` (what `huddle-watch` runs) is the one exception: it replaces,
+in place, a sidecar that names this meeting's sessions only (held, missing
+or pending), carries `restitchable: true` and a `doc_sha256` the doc still
+matches, and is neither `reviewed` nor `deleted_source`. It writes the
+transcript to that sidecar's `output_file`, keeps its `may_duplicate`, and
+prints `Replaced: <path>`. `still_replaceable` re-reads the sidecar and
+re-hashes the doc just before the dup-note step; a change since (a
+racing `--mark-reviewed`, a hand edit) flips the run to `-N`, leaving only
+jq and two `mv`s in the window. Anything else (a manual transcript, a
+reviewed or edited one, two candidates) gets a new `-N`. With
+`--skip-existing` or `--restitch`, a run that transcribes no part not
+already named (the failed piece failed again) exits 1 and rewrites nothing.
+
+`--mark-reviewed` finds the sidecar that names the requested piece, and
+deletes the audio of every id that sidecar lists, resolved by exact id; it
+refuses before deleting anything if one cannot be resolved, and refuses as
+ambiguous while two sidecars name the piece (a reviewed transcript plus its
+`-2`, or per-piece transcripts plus a hand stitch). The refusal lists each
+sidecar, its transcript and ids, flags a per-recording one, and says which
+pair to move out.
+
+`huddle-watch` duplicates `GROUP_CTE` (plus `rec.ok`, the row passing
+`READY_GATES`) and must stay identical to the transcriber's. A grouped row
+is ready on its own gates once the group total clears the floor; it never
+waits for a sibling (an earlier `all_ok` gate let one stuck piece block the
+meeting forever). The 83 s and 42 s pieces of 2026-10-15 still wait until
+the third row exists, because the total is under the floor. There is no
+waiting inside a run: `PENDING` holds one entry per group with a ready
+member not `done` or given up, keyed by the lead, with the ready members
+oldest first and, from `NOT_READY_QUERY` (run only when something is new),
+the members failing the gates. The child gets the lead id, `--restitch`
+and one `--pending <id>` per such member. Its `Part failed: <id>` lines
+cost that piece one attempt, its `Part pending: <id>` lines leave a piece
+unrecorded, and every other new piece is marked `done`. A non-zero exit
+costs each new piece one attempt. A not-ready piece is never in the state
+file and never triggers a run, so it cannot loop; when it becomes ready it
+is new, and the child re-stitches. The watcher logs `STITCH <lead>: <ids>
+(new: <ids>[; not ready yet: <ids>])` and the child's `Part N:` lines
+(start and gap), so a wrong merge of two back-to-back meetings is visible
+in the log. A replaced transcript raises a new `ready` alert, "(updated with
+a later recording)".
+
 **Date selection matches the calendar date, not a timestamp distance.**
 `find_session_by_date` compares the `YYYY-MM-DD` prefix of each row's
 `dateCreated` against the target. An earlier version anchored the target at
@@ -156,6 +301,15 @@ id suffix is what keeps two same-day sessions with colliding slugs from
 overwriting each other — and, because `--mark-reviewed` finds its sidecar by
 that same basename, it is also what stops the delete path from acting on a
 different session's sidecar. Do not drop it.
+
+**Nothing is overwritten.** If the derived `.md` or `.meta.json` exists, the
+run writes `<date>_<slug>-N_<id>` with the next free N (2, 3, ...). N sits
+before the id because `--mark-reviewed`, `--skip-existing`, `--all` and
+`write_index` all match `_<8-hex>.meta.json` or `_????????.md` at the end.
+`DUP_OF` names the transcript the new one may duplicate (that file, or one
+an older-titled sidecar names). The transcript then opens with a `> **Note:**`
+line naming it, and the sidecar adds `may_duplicate`. Two sidecars for one
+session make `--mark-reviewed` refuse as ambiguous, which the suite pins.
 
 **The extension is `.md`, and that is a delivery constraint, not a taste
 call.** Transcripts land in Google Drive, whose web viewer previews Markdown
@@ -304,10 +458,11 @@ both (`LIV`, `AUD`) and computes `READY` from `READY_WHERE` in SQL, so a
 Finalization can lag the end of a call: `ad99fee3` (a 73-minute meeting
 created 18:01 UTC) was not updated until 01:32 the next day.
 
-The watcher runs `huddle-transcribe --skip-existing`, which exits 0 with
-`Already transcribed: <sidecar>` when the session's sidecar exists (same
-id-suffix glob and `session_id` check as `--mark-reviewed`, and checked before
-the source-audio test, since a reviewed session's audio is gone). The watcher
+The watcher runs `huddle-transcribe --restitch` (which implies
+`--skip-existing`). It exits 0 with `Already transcribed: <sidecar>` when
+sidecars name every part of the meeting (for a lone recording, the same
+id-suffix glob and `session_id` check as `--mark-reviewed`), checked before
+the source-audio test, since a reviewed session's audio is gone. The watcher
 logs that as `SKIP`, marks it done, and posts no notification. This is what
 keeps the state file and the sidecars from disagreeing: sessions done by hand
 or by `--all` would otherwise be re-run through `mw`, and those with trashed
@@ -411,7 +566,8 @@ checks, each of which exists because its absence was a reproducible
 data-loss bug:
 
 1. a sidecar must exist for the resolved session;
-2. that sidecar's `session_id` must equal the resolved `$SID`;
+2. that sidecar's `session_id` must equal the requested session id, or its
+   `session_ids` must list it (a stitched meeting);
 3. the transcript must exist and be non-empty;
 4. `--dry-run` is honored *before* this block runs.
 

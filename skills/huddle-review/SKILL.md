@@ -84,6 +84,14 @@ Labels are `Speaker 1`, `Speaker 2`, … and carry no identity. Two facts from
   Never carry a mapping across transcripts.
 - **Frequency does not identify anyone.** Common first names are ordinary
   English words, so counting tokens produces confident nonsense.
+- **A stitched transcript restarts numbering in each part.** MacWhisper can
+  split one meeting into several recordings. The transcript then opens with
+  `> **Note:** joined from N recordings of one meeting` and has one
+  `## Part i of N` heading per recording, and `Speaker 1` in part 2 need not
+  be `Speaker 1` in part 1. Attribute each part on its own. A part can have
+  no speaker labels at all, be only a note that it was not transcribed, or
+  be absent, named in a closing note as not ready yet; say so in the note
+  rather than guess.
 
 Attribute from direct address in the transcript ("thanks, X", "X, can you") and
 from who owns the work being described. **State in the note that attribution is
@@ -145,8 +153,20 @@ huddle-transcribe --mark-reviewed <session-id>
 otherwise outright. Pass the **session id**, not the date, for the reason in
 step 1.
 
-Only after the note exists **and** is registered (step 5). Never after step 2
-stopped on a silence transcript: there the audio is the only useful copy.
+Only after the note exists **and** is registered (step 5). Never after
+step 2 stopped on a silence transcript: there the audio is the only useful
+copy.
+
+While the sidecar has `"restitchable": true` and is not reviewed,
+`huddle-watch` replaces the transcript in place if a later recording of the
+same meeting lands. Marking it reviewed stops that; a later piece then goes
+to a new `-2` transcript instead. If the user keeps the audio, say that the
+note may need updating should a later part arrive.
+
+A transcript that ends with `> **Note:** this transcript may be incomplete`
+(its sidecar has `pending_session_ids`) is missing a part MacWhisper had
+not finished. Say so in the note, and say that marking it reviewed now
+sends that part to a separate `-2` transcript when it arrives.
 
 What happens next depends on `RELEASE_AUDIO`:
 

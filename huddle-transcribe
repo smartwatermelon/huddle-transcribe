@@ -36,7 +36,15 @@ if ! [[ "$MIN_DURATION_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "Error: HUDDLE_MIN_DURATION must be a whole number of seconds (got '$MIN_DURATION_SECONDS')." >&2
   exit 1
 fi
+# Back-to-back same-app recordings this close are one split meeting; 0 disables.
+STITCH_GAP_SECONDS="${HUDDLE_STITCH_GAP_SECONDS-60}"
+if ! [[ "$STITCH_GAP_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "Error: HUDDLE_STITCH_GAP_SECONDS must be a whole number of seconds (got '$STITCH_GAP_SECONDS')." >&2
+  exit 1
+fi
 MW_BIN="/usr/local/bin/mw"
+# Per-recording mw transcripts of split meetings, kept outside the KB for re-stitching.
+PIECES_DIR="${HUDDLE_PIECES_DIR:-$HOME/.local/state/huddle-transcribe/pieces}"
 
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 if [[ -f "$CONFIG_FILE" ]]; then
@@ -67,8 +75,11 @@ LIST=0
 MARK_REVIEWED=0
 SKIP_EXISTING=0
 ALL=0
+RESTITCH=0
 ASSUME_YES=0
 TARGET=""
+# Recordings of the meeting huddle-watch found not ready yet (--pending).
+PENDING_ARGS=()
 
 usage() {
   cat <<'EOF'
@@ -86,11 +97,34 @@ Options:
   --mark-reviewed       Set reviewed=true and remove the source .m4a for
                         SESSION_ID_OR_DATE (moved to Trash where trash(1) is
                         available, otherwise deleted outright)
-  --skip-existing       Exit 0 without transcribing when the session
-                        already has a sidecar in the output dir
+  --skip-existing       Exit 0 without transcribing when sidecars in the
+                        output dir already name every recording of the meeting
+  --restitch            What huddle-watch runs: --skip-existing, plus a
+                        meeting that gained a recording replaces the
+                        transcript an earlier --restitch run wrote, in place,
+                        while it is unreviewed; reuses cached pieces
+  --pending SESSION_ID  A recording of the meeting that is not ready yet: it
+                        is left out and named at the end of the transcript
+                        (repeatable; huddle-watch passes these)
   --yes                 Skip confirmation prompt
   --output-dir PATH     Override default output dir
   -h, --help            Show this help
+
+A meeting MacWhisper split into back-to-back recordings of the same app is
+one transcript, named after its first recording. Each recording is
+transcribed on its own and the transcripts are joined, one part each.
+
+An existing transcript is never overwritten: a second run writes the next
+free name (<date>_<slug>-2_<id>.md, ...) with a note naming the first. The
+one exception is --restitch, above.
+
+Environment:
+  HUDDLE_MIN_DURATION        Floor in seconds for latest/date/--list/--all,
+                             applied to a stitched meeting's total (default 300)
+  HUDDLE_STITCH_GAP_SECONDS  Largest gap in seconds between two recordings
+                             of one meeting; 0 disables stitching (default 60)
+  HUDDLE_PIECES_DIR          Cache of per-recording transcripts (default
+                             ~/.local/state/huddle-transcribe/pieces)
 EOF
 }
 
@@ -116,9 +150,27 @@ while [[ $# -gt 0 ]]; do
       SKIP_EXISTING=1
       shift
       ;;
+    --restitch)
+      RESTITCH=1
+      SKIP_EXISTING=1
+      shift
+      ;;
     --yes)
       ASSUME_YES=1
       shift
+      ;;
+    --pending)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --pending requires a SESSION_ID argument" >&2
+        exit 1
+      fi
+      pending_arg=$(printf '%s' "${2//-/}" | tr '[:upper:]' '[:lower:]')
+      if ! [[ "$pending_arg" =~ ^[0-9a-f]+$ ]]; then
+        echo "Error: --pending '$2' is not a session id (expected hex)." >&2
+        exit 1
+      fi
+      PENDING_ARGS+=("$pending_arg")
+      shift 2
       ;;
     --output-dir)
       if [[ $# -lt 2 ]]; then
@@ -157,7 +209,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $SKIP_EXISTING -eq 1 && $MARK_REVIEWED -eq 1 ]]; then
-  echo "Error: --skip-existing cannot be combined with --mark-reviewed." >&2
+  echo "Error: --skip-existing and --restitch cannot be combined with --mark-reviewed." >&2
+  exit 1
+fi
+if [[ $RESTITCH -eq 1 && $ALL -eq 1 ]]; then
+  echo "Error: --restitch takes one session; it cannot be combined with --all." >&2
+  exit 1
+fi
+if [[ ${#PENDING_ARGS[@]} -gt 0 && ($ALL -eq 1 || $MARK_REVIEWED -eq 1) ]]; then
+  echo "Error: --pending names recordings of one meeting being transcribed; it cannot be combined with --all or --mark-reviewed." >&2
   exit 1
 fi
 
@@ -214,6 +274,40 @@ sql() {
   sqlite3 -separator "$SEP" "$DB" "$1"
 }
 
+# grp: same-app recordings (bundle id, else 'app:' || appName) chained into
+# split meetings. Must match huddle-watch's GROUP_CTE row for row.
+GROUP_CTE="
+WITH rec AS (
+  SELECT lower(hex(s.id)) AS sid,
+    COALESCE(rm.bundleIdentifier, 'app:' || rm.appName) AS app,
+    julianday(rm.date) AS t0,
+    julianday(rm.date) + COALESCE(rm.duration, 0) / 86400.0 AS t1,
+    COALESCE(rm.duration, 0) AS dur
+  FROM session s JOIN recordedmeeting rm ON rm.id = s.recordedMeetingID
+  WHERE s.dateDeleted IS NULL
+    AND COALESCE(rm.bundleIdentifier, rm.appName) IS NOT NULL
+    AND julianday(rm.date) IS NOT NULL
+), gaps AS (
+  SELECT *, (t0 - MAX(t1) OVER (PARTITION BY app ORDER BY t0, sid
+    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)) * 86400.0 AS gap
+  FROM rec
+), num AS (
+  SELECT *, SUM(CASE WHEN $STITCH_GAP_SECONDS > 0
+      AND gap BETWEEN 0 AND $STITCH_GAP_SECONDS THEN 0 ELSE 1 END)
+    OVER (PARTITION BY app ORDER BY t0, sid ROWS UNBOUNDED PRECEDING) AS gno
+  FROM gaps
+), grp AS (
+  SELECT sid, t0, FIRST_VALUE(sid) OVER w AS lead, COUNT(*) OVER w AS n,
+    SUM(dur) OVER w AS total, MAX(t1) OVER w AS last_end
+  FROM num
+  WINDOW w AS (PARTITION BY app, gno ORDER BY t0, sid
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+)"
+# A split meeting's floor and displayed duration are its total; a single
+# recording keeps exactly the old expression.
+DURATION_EXPR="CASE WHEN g.n > 1 THEN g.total ELSE COALESCE(rm.duration, sar.duration, 0) END"
+IS_GROUP_LEAD="(g.lead IS NULL OR g.lead = lower(hex(s.id)))"
+
 # A newline inside a field would still split one row into two, so the title
 # is scrubbed of tab/CR/LF in SQL -- it is the only free-text field a user
 # can type anything into. It is also selected LAST, so that even an
@@ -224,10 +318,11 @@ sql() {
 #   session_id, dateCreated, duration,
 #   merged_filename, app_audio_filename, mic_audio_filename, title
 SESSION_SELECT="
+$GROUP_CTE
 SELECT
   lower(hex(s.id)),
   s.dateCreated,
-  COALESCE(rm.duration, sar.duration, 0),
+  $DURATION_EXPR,
   COALESCE((SELECT filename FROM mediafile WHERE sessionID = s.id AND type = 'mergedMultitrack' LIMIT 1), ''),
   COALESCE((SELECT filename FROM mediafile WHERE sessionID = s.id AND type = 'meetingAppAudio' LIMIT 1), ''),
   COALESCE((SELECT filename FROM mediafile WHERE sessionID = s.id AND type = 'meetingMicAudio' LIMIT 1), ''),
@@ -237,11 +332,13 @@ SELECT
 FROM session s
 LEFT JOIN recordedmeeting rm ON rm.id = s.recordedMeetingID
 LEFT JOIN systemaudiorecording sar ON sar.id = s.systemAudioRecordingID
+LEFT JOIN grp g ON g.sid = lower(hex(s.id))
 "
 # Used by `latest`, date lookup and --list: the floor keeps accidental short
 # clips from being auto-selected.
 SESSION_QUERY="$SESSION_SELECT
-WHERE COALESCE(rm.duration, sar.duration, 0) > $MIN_DURATION_SECONDS
+WHERE $DURATION_EXPR > $MIN_DURATION_SECONDS
+  AND $IS_GROUP_LEAD
 ORDER BY s.dateCreated DESC
 "
 # Used by lookup by explicit session id: naming an id is unambiguous, so no
@@ -253,7 +350,8 @@ ORDER BY s.dateCreated DESC
 # MacWhisper (whose audio is usually gone too), oldest first so a batch
 # reads in the order the meetings happened.
 SESSION_QUERY_PENDING="$SESSION_SELECT
-WHERE COALESCE(rm.duration, sar.duration, 0) > $MIN_DURATION_SECONDS
+WHERE $DURATION_EXPR > $MIN_DURATION_SECONDS
+  AND $IS_GROUP_LEAD
   AND s.dateDeleted IS NULL
 ORDER BY s.dateCreated ASC
 "
@@ -296,6 +394,103 @@ fmt_duration() {
   printf "%dm%02ds" "$((secs / 60))" "$((secs % 60))"
 }
 
+# Prefer merged multitrack, then app audio, then mic audio.
+pick_source() {
+  local f
+  for f in "$@"; do
+    if [[ -n "$f" ]]; then
+      printf '%s\n' "$f"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# $1's split-meeting group, oldest first, one "<sid>$SEP<start>$SEP<end>" line
+# each, in milliseconds after the first piece began.
+group_members() {
+  local sid="$1" rows
+  # sid is bare hex from lower(hex()), so it is safe to interpolate.
+  if ! rows=$(sql "$GROUP_CTE SELECT g.sid,
+      CAST(ROUND((g.t0 - l.t0) * 86400000) AS INTEGER),
+      CAST(ROUND((r.t1 - l.t0) * 86400000) AS INTEGER)
+    FROM grp g JOIN grp l ON l.sid = g.lead JOIN rec r ON r.sid = g.sid
+    WHERE g.lead = (SELECT lead FROM grp WHERE sid = '$sid') ORDER BY g.t0, g.sid"); then
+    echo "Error: failed to query MacWhisper database at $DB" >&2
+    exit 1
+  fi
+  [[ -n "$rows" ]] || rows="$sid${SEP}0${SEP}0"
+  printf '%s\n' "$rows"
+}
+
+# "<session id>$SEP<sidecar>" per session a sidecar holds (with "covered",
+# also missing and pending). Bad sidecars are skipped.
+sidecar_index() {
+  local meta ids id filter='(.session_ids // [.session_id])'
+  [[ "${1:-}" != "covered" ]] || filter+=' + (.missing_session_ids // []) + (.pending_session_ids // [])'
+  shopt -s nullglob
+  local metas=("$OUTPUT_DIR"/*.meta.json)
+  shopt -u nullglob
+  for meta in ${metas[@]+"${metas[@]}"}; do
+    ids=$(jq -r "$filter | .[] | strings" "$meta" 2>/dev/null) || continue
+    while IFS= read -r id; do
+      [[ -z "$id" ]] || printf '%s%s%s\n' "$id" "$SEP" "$meta"
+    done <<<"$ids"
+  done
+}
+
+# First sidecar in index $1 naming any of the remaining session ids.
+first_naming_sidecar() {
+  local index="$1" id
+  shift
+  for id in "$@"; do
+    awk -F"$SEP" -v id="$id" '$1 == id { print $2; found = 1; exit } END { exit !found }' <<<"$index" && return 0
+  done
+  return 1
+}
+
+# 0 when the sidecar index in $1 names every remaining session id.
+all_named() {
+  local index="$1" id
+  shift
+  for id in "$@"; do
+    awk -F"$SEP" -v id="$id" '$1 == id { found = 1; exit } END { exit !found }' <<<"$index" || return 1
+  done
+}
+
+# Seconds as mw prints a timestamp: MM:SS, or HH:MM:SS from one hour on.
+fmt_clock() {
+  local s="$1"
+  if ((s >= 3600)); then
+    printf '%02d:%02d:%02d' "$((s / 3600))" "$((s % 3600 / 60))" "$((s % 60))"
+  else
+    printf '%02d:%02d' "$((s / 60))" "$((s % 60))"
+  fi
+}
+
+# mw transcript $1 on stdout with each *start-end* line moved $2 s later;
+# every other line passes through unchanged.
+offset_transcript() {
+  awk -v off="$2" '
+    function secs(t, p, n) {
+      n = split(t, p, ":")
+      return n == 3 ? p[1] * 3600 + p[2] * 60 + p[3] : p[1] * 60 + p[2]
+    }
+    function clock(s) {
+      if (s >= 3600) return sprintf("%02d:%02d:%02d", int(s / 3600), int((s % 3600) / 60), s % 60)
+      return sprintf("%02d:%02d", int(s / 60), s % 60)
+    }
+    /^\*[0-9:]+(-[0-9:]+)?\*$/ {
+      n = split(substr($0, 2, length($0) - 2), ends, "-")
+      out = clock(secs(ends[1]) + off)
+      if (n == 2) out = out "-" clock(secs(ends[2]) + off)
+      print "*" out "*"
+      next
+    }
+    { print }
+  ' "$1"
+}
+
 # Regenerates OUTPUT_DIR/_index.md from every *.meta.json sidecar present.
 # Called only after a successful transcribe or --mark-reviewed -- never from
 # --list or --dry-run, both of which are read-only paths.
@@ -319,7 +514,7 @@ write_index() {
   # in a hand-edited sidecar truncates the title rather than displacing
   # output_file.
   local idx_rows=() meta line date dur reviewed output_file title
-  for meta in "${metas[@]}"; do
+  for meta in ${metas[@]+"${metas[@]}"}; do
     # jq -r (not -e): -e treats a final false/null/empty-string value as
     # failure, which would misclassify a valid reviewed:false sidecar as
     # malformed. A genuinely unparseable file still makes jq exit nonzero.
@@ -430,12 +625,27 @@ if [[ $ALL -eq 1 ]]; then
     exit 1
   fi
   pending=()
+  # Rows are group leads only. A split meeting is done once sidecars name
+  # every piece.
+  if ! group_pairs=$(sql "$GROUP_CTE SELECT lead, sid FROM grp WHERE n > 1"); then
+    echo "Error: failed to query MacWhisper database at $DB" >&2
+    exit 1
+  fi
+  # A part the watcher left missing or pending counts: retrying it is its job.
+  named_index=$(sidecar_index covered)
   if [[ -n "$all_rows" ]]; then
     while IFS="$SEP" read -r sid date dur _merged _app _mic title; do
-      shopt -s nullglob
-      id_matches=("$OUTPUT_DIR"/*_"${sid:0:8}".meta.json)
-      shopt -u nullglob
-      [[ ${#id_matches[@]} -eq 0 ]] || continue
+      members=$(awk -F"$SEP" -v lead="$sid" '$1 == lead { print $2 }' <<<"$group_pairs")
+      if [[ -z "$members" ]]; then
+        shopt -s nullglob
+        id_matches=("$OUTPUT_DIR"/*_"${sid:0:8}".meta.json)
+        shopt -u nullglob
+        [[ ${#id_matches[@]} -eq 0 ]] || continue
+        first_naming_sidecar "$named_index" "$sid" >/dev/null && continue
+      else
+        read -r -d '' -a member_list <<<"$members" || true
+        all_named "$named_index" "${member_list[@]}" && continue
+      fi
       if [[ ${#pending[@]} -eq 0 ]]; then
         printf "%-8s  %-19s  %-8s  %s\n" "SESSION" "DATE" "DURATION" "TITLE"
       fi
@@ -629,7 +839,100 @@ fi
 # trailing newline, which `set -e` would treat as fatal, hence `|| true`.
 IFS="$SEP" read -r SID SDATE SDUR SMERGED SAPP SMIC STITLE <<<"$SELECTED" || true
 
-# Prefer merged multitrack, then app audio, then mic audio.
+# A split meeting is one transcript, named after its first recording.
+REQ_SID="$SID"
+group_rows=$(group_members "$SID")
+GROUP_IDS=()
+GROUP_START=()
+GROUP_END=()
+while IFS="$SEP" read -r m m_start m_end; do
+  [[ -n "$m" ]] || continue
+  GROUP_IDS+=("$m")
+  GROUP_START+=("${m_start:-0}")
+  GROUP_END+=("${m_end:-0}")
+done <<<"$group_rows"
+STITCH=0
+if [[ ${#GROUP_IDS[@]} -gt 1 ]]; then
+  STITCH=1
+  if [[ "${GROUP_IDS[0]}" != "$SID" ]]; then
+    if ! lead_row=$(find_session_by_id "${GROUP_IDS[0]}"); then
+      echo "Error: cannot resolve ${GROUP_IDS[0]:0:8}, the first recording of the meeting ${SID:0:8} belongs to." >&2
+      exit 1
+    fi
+    IFS="$SEP" read -r SID SDATE SDUR SMERGED SAPP SMIC STITLE <<<"$lead_row" || true
+    echo "Note: ${REQ_SID:0:8} is one of ${#GROUP_IDS[@]} recordings of one meeting; using the first, ${SID:0:8}." >&2
+  fi
+fi
+
+# Each member's start, gap and audio. One not ready (--pending, or no audio
+# row) and not cached is pending: left out, named at the end.
+PART_IDS=()
+PART_FILES=()
+PART_START=()
+PART_GAP=()
+PART_POS=()
+PEND_IDS=()
+PEND_POS=()
+PEND_START=()
+M_SRC=()
+M_GAP=()
+prev_end=""
+for i in "${!GROUP_IDS[@]}"; do
+  m="${GROUP_IDS[i]}"
+  m_file=""
+  if member_row=$(find_session_by_id "$m" 2>/dev/null); then
+    IFS="$SEP" read -r _ _ _ m_merged m_app m_mic _ <<<"$member_row" || true
+    m_file=$(pick_source "$m_merged" "$m_app" "$m_mic") || m_file=""
+  fi
+  # Rounded from milliseconds once, so a gap is not off by a rounding of each end.
+  gap=0
+  [[ -z "$prev_end" ]] || gap=$(((GROUP_START[i] - prev_end + 500) / 1000))
+  ((gap >= 0)) || gap=0
+  if [[ -z "$prev_end" ]] || ((GROUP_END[i] > prev_end)); then
+    prev_end="${GROUP_END[i]}"
+  fi
+  M_GAP+=("$gap")
+  m_pending=0
+  if [[ $STITCH -eq 1 && ! -s "$PIECES_DIR/$m.md" ]]; then
+    # MacWhisper adds the audio row when it saves the recording.
+    [[ -n "$m_file" ]] || m_pending=1
+    for pend_arg in ${PENDING_ARGS[@]+"${PENDING_ARGS[@]}"}; do
+      [[ "$m" != "$pend_arg"* ]] || m_pending=1
+    done
+  fi
+  if [[ $m_pending -eq 1 ]]; then
+    echo "Note: ${m:0:8}, recording $((i + 1)) of ${#GROUP_IDS[@]} of this meeting, is not ready yet; it is left out." >&2
+    echo "Part pending: $m"
+    PEND_IDS+=("$m")
+    PEND_POS+=("$((i + 1))")
+    PEND_START+=("$(((GROUP_START[i] + 500) / 1000))")
+    M_SRC+=("(not ready yet; left out)")
+    continue
+  fi
+  PART_IDS+=("$m")
+  PART_FILES+=("$m_file")
+  PART_START+=("$(((GROUP_START[i] + 500) / 1000))")
+  PART_GAP+=("$gap")
+  PART_POS+=("$((i + 1))")
+  if [[ -n "$m_file" ]]; then
+    M_SRC+=("$MEDIA_DIR/$m_file")
+  else
+    M_SRC+=("(no saved audio)")
+  fi
+done
+if [[ ${#PART_IDS[@]} -eq 0 && $MARK_REVIEWED -eq 0 ]]; then
+  echo "Error: no recording of the meeting ${SID:0:8} is ready yet." >&2
+  exit 1
+fi
+# Each part is transcribed alone and the transcripts are joined: mw on
+# ffmpeg-joined audio lost all capitalization and punctuation.
+PIECES=0
+if [[ $STITCH -eq 1 || $RESTITCH -eq 1 ]]; then
+  PIECES=1
+fi
+
+# Prefer merged multitrack, then app audio, then mic audio. A split
+# meeting's first recording may not be ready yet; its parts carry the audio.
 SOURCE_FILENAME=""
 if [[ -n "$SMERGED" ]]; then
   SOURCE_FILENAME="$SMERGED"
@@ -637,7 +940,7 @@ elif [[ -n "$SAPP" ]]; then
   SOURCE_FILENAME="$SAPP"
 elif [[ -n "$SMIC" ]]; then
   SOURCE_FILENAME="$SMIC"
-else
+elif [[ $STITCH -eq 0 ]]; then
   echo "Error: session $SID has no usable audio file." >&2
   exit 1
 fi
@@ -682,10 +985,33 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
   shopt -s nullglob
   id_matches=("$OUTPUT_DIR"/*_"${SID:0:8}".meta.json)
   shopt -u nullglob
+  # In a split meeting, use the sidecar(s) that name the session asked for.
+  if [[ $STITCH -eq 1 ]]; then
+    id_matches=()
+    naming=$(sidecar_index | awk -F"$SEP" -v id="$REQ_SID" '$1 == id { print $2 }')
+    while IFS= read -r meta; do
+      [[ -z "$meta" ]] || id_matches+=("$meta")
+    done <<<"$naming"
+  fi
   if [[ ${#id_matches[@]} -gt 1 ]]; then
-    echo "Error: ${#id_matches[@]} sidecars match session ${SID:0:8} in $OUTPUT_DIR:" >&2
-    printf '  %s\n' "${id_matches[@]}" >&2
-    echo "Refusing to delete source audio. Remove the stale sidecar and re-run." >&2
+    echo "Error: ${#id_matches[@]} sidecars in $OUTPUT_DIR name session ${REQ_SID:0:8}:" >&2
+    per_piece=0
+    for meta in "${id_matches[@]}"; do
+      meta_desc=$(jq -r '"\(.output_file // "?"), holds \((.session_ids // [.session_id]) | map(.[0:8]) | join(" "))"
+        + (if has("session_ids") then "" else " (a per-recording transcript)" end)
+        + (if .reviewed == true then ", reviewed" else "" end)' "$meta" 2>/dev/null) || meta_desc="unreadable"
+      [[ "$meta_desc" != *"(a per-recording transcript)"* ]] || per_piece=$((per_piece + 1))
+      printf '  %s\n    %s\n' "$(basename "$meta")" "$meta_desc" >&2
+    done
+    echo "Refusing to delete source audio: each would release audio the other still points at." >&2
+    if [[ $per_piece -gt 0 && $per_piece -lt ${#id_matches[@]} ]]; then
+      echo "A per-recording transcript from before stitching and a stitched one both hold this recording." >&2
+      echo "To release every recording through the stitched one, move each per-recording .md and .meta.json pair" >&2
+      echo "out of $OUTPUT_DIR (check no KB note's source: names it), then re-run; to release only this" >&2
+      echo "recording, move the stitched pair out instead." >&2
+    else
+      echo "Keep the transcript you reviewed: move the other .md and .meta.json pair out of $OUTPUT_DIR, then re-run." >&2
+    fi
     exit 1
   fi
   if [[ ${#id_matches[@]} -eq 1 ]]; then
@@ -707,16 +1033,115 @@ fi
 # id-suffix glob and session_id equality as --mark-reviewed, so a sidecar
 # that merely shares the 8-hex suffix does not count.
 if [[ $SKIP_EXISTING -eq 1 ]]; then
-  shopt -s nullglob
-  id_matches=("$OUTPUT_DIR"/*_"${SID:0:8}".meta.json)
-  shopt -u nullglob
-  for meta in "${id_matches[@]}"; do
-    meta_session_id=$(jq -r '.session_id // empty' "$meta" 2>/dev/null || true)
-    if [[ "$meta_session_id" == "$SID" ]]; then
-      echo "Already transcribed: $meta"
-      exit 0
-    fi
+  if [[ $STITCH -eq 0 ]]; then
+    shopt -s nullglob
+    id_matches=("$OUTPUT_DIR"/*_"${SID:0:8}".meta.json)
+    shopt -u nullglob
+    for meta in ${id_matches[@]+"${id_matches[@]}"}; do
+      meta_session_id=$(jq -r '.session_id // empty' "$meta" 2>/dev/null || true)
+      if [[ "$meta_session_id" == "$SID" ]]; then
+        echo "Already transcribed: $meta"
+        exit 0
+      fi
+    done
+  fi
+  # Done once sidecars name EVERY part. By hand, a missing or pending part
+  # counts as named: retrying it is the watcher's job.
+  if [[ $RESTITCH -eq 1 ]]; then
+    named_index=$(sidecar_index)
+  else
+    named_index=$(sidecar_index covered)
+  fi
+  if all_named "$named_index" "${PART_IDS[@]}"; then
+    meta=$(first_naming_sidecar "$named_index" "${PART_IDS[@]}")
+    echo "Already transcribed: $meta"
+    exit 0
+  fi
+fi
+
+# sha256 of file $1, or failure. Ties a replaceable sidecar to the exact doc it wrote.
+doc_sha256() {
+  local out
+  out=$(shasum -a 256 <"$1" 2>/dev/null) || return 1
+  out="${out%% *}"
+  [[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# 0 while OUT_META is unreviewed and OUT_DOC is the doc the watcher wrote.
+still_replaceable() {
+  local now
+  jq -e '(.reviewed != true) and (.deleted_source != true)' "$OUT_META" >/dev/null 2>&1 || return 1
+  now=$(doc_sha256 "$OUT_DOC") || return 1
+  [[ "$now" == "$REPLACE_HASH" ]]
+}
+
+# Points OUT_* at the next free <date>_<slug>-N_<id>; N goes before the id,
+# which every *_<id>.meta.json lookup needs.
+take_next_free_name() {
+  local dup_n=2
+  while [[ -e "$OUTPUT_DIR/${SESSION_DATE_ONLY}_${SLUG}-${dup_n}_${SID:0:8}.md" ||
+    -e "$OUTPUT_DIR/${SESSION_DATE_ONLY}_${SLUG}-${dup_n}_${SID:0:8}.meta.json" ]]; do
+    dup_n=$((dup_n + 1))
   done
+  OUT_BASENAME="${SESSION_DATE_ONLY}_${SLUG}-${dup_n}_${SID:0:8}"
+  OUT_DOC="$OUTPUT_DIR/${OUT_BASENAME}.md"
+  OUT_META="$OUTPUT_DIR/${OUT_BASENAME}.meta.json"
+}
+
+# --restitch may replace one unreviewed, unedited transcript an earlier
+# --restitch run wrote for this meeting only.
+REPLACING=0
+REPLACE_HASH=""
+DUP_OF=""
+if [[ $RESTITCH -eq 1 ]]; then
+  replace_metas=()
+  own_metas=$(awk -F"$SEP" 'NR == FNR { want[$1] = 1; next } ($1 in want) && !seen[$2]++ { print $2 }' \
+    <(printf '%s\n' "${PART_IDS[@]}") <(printf '%s\n' "$named_index"))
+  while IFS= read -r meta; do
+    [[ -n "$meta" ]] || continue
+    if jq -e '(.restitchable == true) and (.reviewed != true) and (.deleted_source != true)
+      and ((.output_file // "") | test("^[^/]+[.]md$"))
+      and ((.doc_sha256 // "") | test("^[0-9a-f]{64}$"))
+      and ((((.session_ids // [.session_id]) + (.missing_session_ids // [])
+        + (.pending_session_ids // [])) - $ARGS.positional) == [])' \
+      "$meta" --args "${GROUP_IDS[@]}" >/dev/null 2>&1; then
+      cand_doc="$OUTPUT_DIR/$(jq -r '.output_file' "$meta")"
+      cand_hash=$(jq -r '.doc_sha256' "$meta")
+      if [[ "$(doc_sha256 "$cand_doc" || true)" == "$cand_hash" ]]; then
+        replace_metas+=("$meta")
+      else
+        echo "Note: $(basename "$cand_doc") changed since huddle-watch wrote it; it is kept." >&2
+      fi
+    fi
+  done <<<"$own_metas"
+  if [[ ${#replace_metas[@]} -eq 1 ]]; then
+    REPLACING=1
+    OUT_META="${replace_metas[0]}"
+    OUT_DOC="$OUTPUT_DIR/$(jq -r '.output_file' "$OUT_META")"
+    REPLACE_HASH=$(jq -r '.doc_sha256' "$OUT_META")
+    DUP_OF=$(jq -r '.may_duplicate // empty' "$OUT_META" 2>/dev/null || true)
+    echo "Note: replacing $(basename "$OUT_DOC"), this meeting's earlier unreviewed transcript, now with ${#PART_IDS[@]} part(s)." >&2
+  elif [[ ${#replace_metas[@]} -gt 1 ]]; then
+    echo "Note: ${#replace_metas[@]} transcripts of this meeting could be replaced; writing a new one instead." >&2
+  fi
+fi
+
+# Never overwrite a transcript: take the next free <date>_<slug>-N_<id>.
+if [[ $MARK_REVIEWED -ne 1 && $REPLACING -eq 0 ]]; then
+  if [[ -e "$OUT_DOC" || -e "$OUT_META" ]]; then
+    DUP_OF=$(basename "$OUT_DOC")
+    take_next_free_name
+    echo "Note: $DUP_OF already exists; writing $(basename "$OUT_DOC") instead." >&2
+  else
+    # The same session under an older title, or a per-piece transcript.
+    dup_index=$(sidecar_index)
+    if dup_meta=$(first_naming_sidecar "$dup_index" "${PART_IDS[@]}"); then
+      DUP_OF=$(jq -r '.output_file // empty' "$dup_meta" 2>/dev/null || true)
+      [[ -n "$DUP_OF" ]] || DUP_OF=$(basename "$dup_meta")
+      echo "Note: this session already has a transcript, $DUP_OF; writing a second one." >&2
+    fi
+  fi
 fi
 
 echo "Session:  ${SID:0:8}"
@@ -724,13 +1149,64 @@ echo "Date:     $SDATE"
 SDUR_PRETTY=$(fmt_duration "$SDUR")
 echo "Duration: $SDUR_PRETTY"
 echo "Title:    $STITLE"
-echo "Source:   $SOURCE_PATH"
+if [[ $STITCH -eq 1 ]]; then
+  member_shorts=()
+  for m in ${PART_IDS[@]+"${PART_IDS[@]}"}; do
+    member_shorts+=("${m:0:8}")
+  done
+  if [[ ${#PEND_IDS[@]} -eq 0 ]]; then
+    echo "Stitched: ${#PART_IDS[@]} recordings of one meeting (${member_shorts[*]})"
+  else
+    echo "Stitched: ${#PART_IDS[@]} of ${#GROUP_IDS[@]} recordings of one meeting (${member_shorts[*]-}); the rest are not ready yet"
+  fi
+  # One line per recording, so the watcher log records every stitch decision.
+  for i in "${!GROUP_IDS[@]}"; do
+    part_at="starts at $(fmt_clock "$(((GROUP_START[i] + 500) / 1000))")"
+    ((i == 0)) || part_at+=", after a ${M_GAP[i]} s gap"
+    echo "Part $((i + 1)):   ${GROUP_IDS[i]:0:8} $part_at: ${M_SRC[i]}"
+  done
+else
+  echo "Source:   $SOURCE_PATH"
+fi
 echo "Output:   $OUT_DOC"
 
-if [[ $MARK_REVIEWED -ne 1 && ! -f "$SOURCE_PATH" ]]; then
+if [[ $MARK_REVIEWED -ne 1 && $PIECES -eq 0 && ! -f "$SOURCE_PATH" ]]; then
   echo "Error: source audio file not found at $SOURCE_PATH" >&2
   exit 1
 fi
+
+# --mark-reviewed removes the audio of every session the sidecar names,
+# matched by exact id, never by prefix.
+resolve_delete_paths() {
+  local ids id row r_id r_merged r_app r_mic f
+  DEL_PATHS=()
+  DEL_IDS=()
+  ids=$(jq -r '(.session_ids // [.session_id]) | .[] | strings' "$OUT_META" 2>/dev/null) || return 1
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    DEL_IDS+=("$id")
+    if [[ "$id" == "$SID" && -n "$SOURCE_FILENAME" ]]; then
+      DEL_PATHS+=("$SOURCE_PATH")
+      continue
+    fi
+    row=$(find_session_by_id "$id" 2>/dev/null) || return 1
+    IFS="$SEP" read -r r_id _ _ r_merged r_app r_mic _ <<<"$row" || true
+    [[ "$r_id" == "$id" ]] || return 1
+    f=$(pick_source "$r_merged" "$r_app" "$r_mic") || return 1
+    DEL_PATHS+=("$MEDIA_DIR/$f")
+  done <<<"$ids"
+  [[ ${#DEL_PATHS[@]} -gt 0 ]]
+}
+DEL_PATHS=("$SOURCE_PATH")
+DEL_IDS=()
+
+# The cached piece transcripts of the recordings a review releases.
+released_caches() {
+  local id
+  for id in ${DEL_IDS[@]+"${DEL_IDS[@]}"}; do
+    [[ ! -e "$PIECES_DIR/$id.md" ]] || printf '%s\n' "$PIECES_DIR/$id.md"
+  done
+}
 
 # --dry-run is checked before --mark-reviewed, and must stay that way.
 # --dry-run is the flag a user reaches for when they are unsure what will be
@@ -738,7 +1214,23 @@ fi
 # anyway, because the deletion block ran first.
 if [[ $DRY_RUN -eq 1 ]]; then
   if [[ $MARK_REVIEWED -eq 1 ]]; then
-    echo "(dry run — would mark reviewed and delete $SOURCE_PATH)"
+    if [[ ! -f "$OUT_META" ]] || ! resolve_delete_paths; then
+      DEL_PATHS=("$SOURCE_PATH")
+      DEL_IDS=()
+    fi
+    if [[ ${#DEL_PATHS[@]} -gt 1 ]]; then
+      echo "(dry run — would mark reviewed and delete ${#DEL_PATHS[@]} files:)"
+      printf '  %s\n' "${DEL_PATHS[@]}"
+    else
+      echo "(dry run — would mark reviewed and delete ${DEL_PATHS[0]})"
+    fi
+    caches=$(released_caches)
+    if [[ -n "$caches" ]]; then
+      echo "(and its cached piece transcripts:)"
+      while IFS= read -r cache; do
+        printf '  %s\n' "$cache"
+      done <<<"$caches"
+    fi
   else
     echo "(dry run — no transcription performed)"
   fi
@@ -761,9 +1253,15 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
     echo "Error: $OUT_META is missing a session_id. Refusing to delete source audio." >&2
     exit 1
   fi
-  if [[ "$meta_session_id" != "$SID" ]]; then
-    echo "Error: sidecar $OUT_META describes session ${meta_session_id:0:8}, but the selected session is ${SID:0:8}." >&2
+  # A stitched sidecar also counts when its session_ids names the session.
+  if [[ "$meta_session_id" != "$REQ_SID" ]] &&
+    ! jq -e --arg id "$REQ_SID" '(.session_ids // []) | any(.[]; . == $id)' "$OUT_META" >/dev/null 2>&1; then
+    echo "Error: sidecar $OUT_META describes session ${meta_session_id:0:8}, but the selected session is ${REQ_SID:0:8}." >&2
     echo "Refusing to delete source audio. Pass the session id explicitly to disambiguate." >&2
+    exit 1
+  fi
+  if ! resolve_delete_paths; then
+    echo "Error: cannot resolve the source audio of every session $OUT_META names. Refusing to delete source audio." >&2
     exit 1
   fi
   # Deletion is irreversible and the transcript is the only thing that
@@ -778,7 +1276,11 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
     else
       delete_verb="permanently delete"
     fi
-    confirm "Mark reviewed and $delete_verb source .m4a ($SOURCE_PATH)?"
+    if [[ ${#DEL_PATHS[@]} -gt 1 ]]; then
+      confirm "Mark reviewed and $delete_verb ${#DEL_PATHS[@]} source .m4a files (${DEL_PATHS[*]})?"
+    else
+      confirm "Mark reviewed and $delete_verb source .m4a (${DEL_PATHS[0]})?"
+    fi
   fi
   # Order matters, and both obvious orderings are wrong:
   #
@@ -807,27 +1309,38 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
   # Prefer trash(1) (macOS 14+) so a mistake is recoverable from Finder.
   # This is the only irreversible step in the script, and the guards above
   # are the sole protection once the audio is really gone.
-  source_was_present=1
-  if [[ ! -f "$SOURCE_PATH" ]]; then
-    source_was_present=0
-  elif command -v trash >/dev/null 2>&1; then
-    if ! trash "$SOURCE_PATH"; then
-      echo "Error: failed to trash $SOURCE_PATH. Sidecar left unchanged." >&2
+  sources_present=0
+  # One path per recording the sidecar names; a re-run skips files already gone.
+  for del_path in "${DEL_PATHS[@]}"; do
+    if [[ ! -f "$del_path" ]]; then
+      :
+    elif command -v trash >/dev/null 2>&1; then
+      if ! trash "$del_path"; then
+        echo "Error: failed to trash $del_path. Sidecar left unchanged." >&2
+        exit 1
+      fi
+      sources_present=$((sources_present + 1))
+    elif ! rm -f "$del_path"; then
+      echo "Error: failed to delete $del_path. Sidecar left unchanged." >&2
+      exit 1
+    else
+      sources_present=$((sources_present + 1))
+    fi
+    # Belt-and-braces for the trash(1) branch specifically: rm -f reports its
+    # own failures, but trash can exit 0 without having moved the file.
+    if [[ -e "$del_path" ]]; then
+      echo "Error: $del_path still present after removal. Sidecar left unchanged." >&2
       exit 1
     fi
-  elif ! rm -f "$SOURCE_PATH"; then
-    echo "Error: failed to delete $SOURCE_PATH. Sidecar left unchanged." >&2
-    exit 1
-  fi
-  # Belt-and-braces for the trash(1) branch specifically: rm -f reports its
-  # own failures, but trash can exit 0 without having moved the file.
-  if [[ -e "$SOURCE_PATH" ]]; then
-    echo "Error: $SOURCE_PATH still present after removal. Sidecar left unchanged." >&2
-    exit 1
-  fi
+  done
 
   mv "$tmp" "$OUT_META"
   trap - EXIT
+  # Released pieces leave the re-stitch cache too; exact paths, never a glob.
+  caches=$(released_caches)
+  while IFS= read -r cache; do
+    [[ -z "$cache" ]] || rm -f "$cache" || echo "Warning: failed to remove cached piece $cache" >&2
+  done <<<"$caches"
   # The mark-reviewed operation is already durably complete at this point;
   # a failure inside write_index (e.g. ENOSPC, permissions on a synced
   # Drive folder) must not be reported as this command having failed --
@@ -836,14 +1349,23 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
   # both already succeeded. The index is a convenience view, rebuilt on
   # every run, so a stale one self-heals next time.
   write_index || echo "Warning: failed to regenerate $OUTPUT_DIR/_index.md" >&2
-  if [[ $source_was_present -eq 1 ]]; then
-    if command -v trash >/dev/null 2>&1; then
-      echo "Marked reviewed and moved source to Trash: $SOURCE_PATH"
+  if [[ ${#DEL_PATHS[@]} -gt 1 ]]; then
+    if [[ $sources_present -eq 0 ]]; then
+      echo "Marked reviewed (source audio was already gone): ${#DEL_PATHS[@]} files"
+    elif command -v trash >/dev/null 2>&1; then
+      echo "Marked reviewed and moved $sources_present of ${#DEL_PATHS[@]} source files to Trash:"
     else
-      echo "Marked reviewed and deleted source: $SOURCE_PATH"
+      echo "Marked reviewed and deleted $sources_present of ${#DEL_PATHS[@]} source files:"
+    fi
+    printf '  %s\n' "${DEL_PATHS[@]}"
+  elif [[ $sources_present -eq 1 ]]; then
+    if command -v trash >/dev/null 2>&1; then
+      echo "Marked reviewed and moved source to Trash: ${DEL_PATHS[0]}"
+    else
+      echo "Marked reviewed and deleted source: ${DEL_PATHS[0]}"
     fi
   else
-    echo "Marked reviewed (source audio was already gone): $SOURCE_PATH"
+    echo "Marked reviewed (source audio was already gone): ${DEL_PATHS[0]}"
   fi
   exit 0
 fi
@@ -852,26 +1374,125 @@ if [[ $ASSUME_YES -ne 1 ]]; then
   confirm "Transcribe this session?"
 fi
 
+# mw with the repo's fixed flags: run_mw OUTPUT AUDIO.
+run_mw() {
+  "$MW_BIN" transcribe \
+    --speakers \
+    --speaker-names \
+    --timestamps \
+    --end-timestamps \
+    --format md \
+    --overwrite \
+    -o "$1" \
+    "$2"
+}
+
 # Transcribe to a temp path and move into place only once mw has succeeded
 # and produced a non-empty file. Writing straight to $OUT_DOC means an
 # interrupted or failed run (Ctrl-C, crash, full disk) destroys a previously
 # good transcript, since mw is invoked with --overwrite.
 DOC_TMP=$(mktemp "${OUT_DOC}.partial.XXXXXX")
 trap 'rm -f "$DOC_TMP"' EXIT
-if ! "$MW_BIN" transcribe \
-  --speakers \
-  --speaker-names \
-  --timestamps \
-  --end-timestamps \
-  --format md \
-  --overwrite \
-  -o "$DOC_TMP" \
-  "$SOURCE_PATH"; then
-  echo "Error: mw transcribe failed for $SOURCE_PATH" >&2
-  # No sidecar is written on failure. That is deliberate: --mark-reviewed
-  # refuses to run without one, so a failed transcription can never lead to
-  # the source audio being deleted.
-  exit 1
+PART_OK=()
+PART_WHY=()
+if [[ $PIECES -eq 0 ]]; then
+  if ! run_mw "$DOC_TMP" "$SOURCE_PATH"; then
+    echo "Error: mw transcribe failed for $SOURCE_PATH" >&2
+    # No sidecar is written on failure. That is deliberate: --mark-reviewed
+    # refuses to run without one, so a failed transcription can never lead to
+    # the source audio being deleted.
+    exit 1
+  fi
+else
+  # Each part into the cache (temp beside it, then mv), unless --restitch
+  # finds it there already or its audio is gone.
+  parts_ok=0
+  parts_new=0
+  for i in "${!PART_IDS[@]}"; do
+    m="${PART_IDS[i]}"
+    cache="$PIECES_DIR/$m.md"
+    audio=""
+    [[ -z "${PART_FILES[i]}" ]] || audio="$MEDIA_DIR/${PART_FILES[i]}"
+    why=""
+    if [[ -s "$cache" ]] && [[ $RESTITCH -eq 1 || -z "$audio" || ! -f "$audio" ]]; then
+      echo "Part cached: $m"
+    elif [[ -z "$audio" ]]; then
+      why="no saved audio"
+    elif [[ ! -f "$audio" ]]; then
+      why="audio file not found at $audio"
+    elif ! mkdir -p "$PIECES_DIR" || ! piece_tmp=$(mktemp "$cache.partial.XXXXXX"); then
+      why="cannot write to $PIECES_DIR"
+    elif ! run_mw "$piece_tmp" "$audio" || [[ ! -s "$piece_tmp" ]] || ! mv "$piece_tmp" "$cache"; then
+      rm -f "$piece_tmp"
+      why="mw transcribe failed for $audio"
+    else
+      echo "Part transcribed: $m"
+    fi
+    PART_WHY+=("$why")
+    if [[ -n "$why" ]]; then
+      PART_OK+=(0)
+      echo "Part failed: $m ($why)"
+      continue
+    fi
+    PART_OK+=(1)
+    parts_ok=$((parts_ok + 1))
+    if [[ $SKIP_EXISTING -eq 0 ]] || ! all_named "$named_index" "$m"; then
+      parts_new=$((parts_new + 1))
+    fi
+  done
+  if [[ $parts_ok -eq 0 ]]; then
+    echo "Error: no part of the meeting ${SID:0:8} could be transcribed." >&2
+    exit 1
+  fi
+  # A retry that adds nothing must not rewrite the transcript or re-alert.
+  if [[ $parts_new -eq 0 ]]; then
+    echo "Error: no new part of the meeting ${SID:0:8} could be transcribed; its transcript is unchanged." >&2
+    exit 1
+  fi
+  # Numbered among all the meeting's recordings, ready or not.
+  n_parts=${#GROUP_IDS[@]}
+  pend_list=""
+  for i in ${PEND_IDS[@]+"${!PEND_IDS[@]}"}; do
+    [[ -z "$pend_list" ]] || pend_list+="; "
+    pend_list+="part ${PEND_POS[i]} of $n_parts (starts at $(fmt_clock "${PEND_START[i]}"), session ${PEND_IDS[i]:0:8})"
+  done
+  if ! {
+    if [[ $n_parts -eq 1 ]]; then
+      cat "$PIECES_DIR/${PART_IDS[0]}.md"
+    else
+      if [[ -z "$pend_list" ]]; then
+        printf '> **Note:** joined from %d recordings of one meeting.' "$n_parts"
+      else
+        printf '> **Note:** joined from %d of the %d recordings of one meeting; the note at the end names the rest.' \
+          "${#PART_IDS[@]}" "$n_parts"
+      fi
+      printf ' Timestamps run from the start of the first; speaker numbers restart in each part.\n'
+      for i in "${!PART_IDS[@]}"; do
+        part_clock=$(fmt_clock "${PART_START[i]}")
+        printf '\n## Part %d of %d — starts at %s' "${PART_POS[i]}" "$n_parts" "$part_clock"
+        ((PART_POS[i] == 1)) || printf ', after a %d s gap' "${PART_GAP[i]}"
+        printf '\n\n'
+        if [[ "${PART_OK[i]}" -eq 1 ]]; then
+          offset_transcript "$PIECES_DIR/${PART_IDS[i]}.md" "${PART_START[i]}"
+        else
+          printf '> **Note:** this part (session %s) was not transcribed: %s.\n\n' "${PART_IDS[i]}" "${PART_WHY[i]}"
+        fi
+      done
+      if [[ -n "$pend_list" ]]; then
+        printf '\n> **Note:** this transcript may be incomplete. MacWhisper had not finished saving %s when it was written.' "$pend_list"
+        pend_when="that part finishes"
+        [[ ${#PEND_IDS[@]} -eq 1 ]] || pend_when="those parts finish"
+        if [[ $RESTITCH -eq 1 ]]; then
+          printf ' It will be updated when %s.\n' "$pend_when"
+        else
+          printf ' Transcribe the meeting again when %s.\n' "$pend_when"
+        fi
+      fi
+    fi
+  } >"$DOC_TMP"; then
+    echo "Error: failed to join the transcripts of ${SID:0:8}." >&2
+    exit 1
+  fi
 fi
 
 if [[ ! -s "$DOC_TMP" ]]; then
@@ -881,6 +1502,29 @@ fi
 
 if ! grep -q "^\*\*Speaker " "$DOC_TMP" 2>/dev/null; then
   echo "Warning: no 'Speaker' labels found in output. Check MacWhisper Settings > speaker detection." >&2
+fi
+
+# Last look before writing: a review or a hand edit since the replace decision
+# means the replaced doc is kept and this run writes -N.
+if [[ $REPLACING -eq 1 ]] && ! still_replaceable; then
+  DUP_OF=$(basename "$OUT_DOC")
+  take_next_free_name
+  REPLACING=0
+  echo "Note: $DUP_OF was reviewed or edited while this ran; writing $(basename "$OUT_DOC") instead." >&2
+fi
+
+# A possible duplicate says so on its first line, above mw's output.
+if [[ -n "$DUP_OF" ]]; then
+  note_tmp=$(mktemp "${OUT_DOC}.partial.XXXXXX")
+  trap 'rm -f "$DOC_TMP" "$note_tmp"' EXIT
+  if ! {
+    printf '> **Note:** this transcript may duplicate %s, which already existed when it was written.\n\n' "$DUP_OF"
+    cat "$DOC_TMP"
+  } >"$note_tmp"; then
+    echo "Error: failed to add the duplicate note to the transcript." >&2
+    exit 1
+  fi
+  mv "$note_tmp" "$DOC_TMP"
 fi
 
 # --argjson parses its value as JSON and aborts on anything non-numeric, so
@@ -896,23 +1540,71 @@ META_DURATION="$SDUR"
 # same-directory renames.
 meta_tmp=$(mktemp "${OUT_META}.XXXXXX")
 trap 'rm -f "$DOC_TMP" "$meta_tmp"' EXIT
+# A stitched sidecar lists the parts it holds, misses and awaits. session_id is
+# the first part it holds, so it is always in session_ids.
+META_SID="$SID"
+META_SOURCE="$SOURCE_FILENAME"
+META_IDS='{}'
+META_FILES='{}'
+if [[ $STITCH -eq 1 ]]; then
+  ok_ids=()
+  ok_files=()
+  missing_ids=()
+  for i in "${!PART_IDS[@]}"; do
+    if [[ "${PART_OK[i]}" -eq 1 ]]; then
+      ok_ids+=("${PART_IDS[i]}")
+      ok_files+=("${PART_FILES[i]}")
+    else
+      missing_ids+=("${PART_IDS[i]}")
+    fi
+  done
+  META_SID="${ok_ids[0]}"
+  [[ -z "${ok_files[0]}" ]] || META_SOURCE="${ok_files[0]}"
+  META_IDS=$(jq -nc '{session_ids: $ARGS.positional}' --args "${ok_ids[@]}")
+  META_FILES=$(jq -nc '{source_files: $ARGS.positional}' --args "${ok_files[@]}")
+  if [[ ${#missing_ids[@]} -gt 0 ]]; then
+    META_FILES=$(jq -nc --argjson f "$META_FILES" '$f + {missing_session_ids: $ARGS.positional}' --args "${missing_ids[@]}")
+  fi
+  if [[ ${#PEND_IDS[@]} -gt 0 ]]; then
+    META_FILES=$(jq -nc --argjson f "$META_FILES" '$f + {pending_session_ids: $ARGS.positional}' --args ${PEND_IDS[@]+"${PEND_IDS[@]}"})
+  fi
+fi
+META_RESTITCH='{}'
+if [[ $RESTITCH -eq 1 ]]; then
+  if doc_hash=$(doc_sha256 "$DOC_TMP"); then
+    META_RESTITCH=$(jq -nc --arg h "$doc_hash" '{restitchable: true, doc_sha256: $h}')
+  else
+    echo "Warning: cannot hash the transcript (shasum); a later recording will go to a new transcript." >&2
+    META_RESTITCH='{"restitchable": true}'
+  fi
+fi
+META_DUP='{}'
+if [[ -n "$DUP_OF" ]]; then
+  META_DUP=$(jq -nc --arg f "$DUP_OF" '{may_duplicate: $f}')
+fi
 if ! jq -n \
-  --arg session_id "$SID" \
+  --arg session_id "$META_SID" \
   --arg date "$SESSION_DATE_ONLY" \
   --argjson duration_seconds "$META_DURATION" \
-  --arg source_file "$SOURCE_FILENAME" \
+  --arg source_file "$META_SOURCE" \
   --arg output_file "$(basename "$OUT_DOC")" \
   --arg title "$STITLE" \
+  --argjson ids "$META_IDS" \
+  --argjson files "$META_FILES" \
+  --argjson dup "$META_DUP" \
+  --argjson restitch "$META_RESTITCH" \
   '{
-    session_id: $session_id,
+    session_id: $session_id
+  } + $ids + {
     date: $date,
     duration_seconds: $duration_seconds,
-    source_file: $source_file,
+    source_file: $source_file
+  } + $files + {
     output_file: $output_file,
     title: $title,
     reviewed: false,
     deleted_source: false
-  }' >"$meta_tmp"; then
+  } + $dup + $restitch' >"$meta_tmp"; then
   echo "Error: failed to write metadata sidecar $OUT_META. Transcript not saved." >&2
   exit 1
 fi
@@ -927,5 +1619,6 @@ trap - EXIT
 # that already succeeded would silently re-run mw against the same audio.
 write_index || echo "Warning: failed to regenerate $OUTPUT_DIR/_index.md" >&2
 
+[[ $REPLACING -eq 0 ]] || echo "Replaced: $OUT_DOC"
 echo "Transcript written: $OUT_DOC"
 echo "Metadata written:   $OUT_META"
