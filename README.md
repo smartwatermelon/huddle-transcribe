@@ -109,8 +109,19 @@ huddle-transcribe --mark-reviewed 2026-08-27
 
 `huddle-watch` is a companion script that watches MacWhisper's own SQLite
 database and runs `huddle-transcribe <session-id> --yes` as soon as a meeting
-has finished both recording *and* transcription. It posts a macOS
-notification naming the transcript it wrote.
+has finished both recording *and* transcription. It then raises a macOS
+alert, "Meeting transcript ready", naming the transcript it wrote. The alert
+stays on screen until dismissed; its "Open Transcript" button opens the
+`.md` file. The alert is detached into its own process group, so the run
+does not wait for it and launchd does not close it when the job exits.
+
+Alerts do not stack. If a "ready" alert is still on screen when another
+transcript lands, it is replaced by one alert, "2 meeting transcripts
+ready", listing both; its "Open Transcripts" button opens every listed file.
+A transcript whose path was not reported is listed but not opened. Failure
+alerts merge the same way. The pending list lives beside the state file
+(`watch-state.alert-<kind>.list` and `.pid`) and is cleared when the alert
+is dismissed.
 
 ### What it watches, and why the database
 
@@ -209,8 +220,9 @@ are picked up.
   `<session-id> <status>` record per line, where `<status>` is the token
   `done` or a failed-attempt count. A session is recorded `done` only after
   `huddle-transcribe` exits successfully, so a transient failure is retried.
-  After 3 failed attempts the session is given up on, with a notification
-  naming the log — a permanently broken recording cannot loop forever.
+  After 3 failed attempts the session is given up on, with a critical
+  alert naming the session and the log (its "Open Log" button opens it) —
+  a permanently broken recording cannot loop forever.
   Success is a distinct token rather than a count of zero, so a truncated or
   hand-edited line cannot be mistaken for a completed transcription; a line
   that parses as neither is logged and treated as retryable. Records written
@@ -253,8 +265,9 @@ rather than a silent full run. `--dry-run` and `--list` need no mode flag.
 
 Environment overrides, mainly for testing: `HUDDLE_DB`,
 `HUDDLE_TRANSCRIBE_BIN`, `HUDDLE_STATE_FILE`, `HUDDLE_LOG_FILE`,
-`HUDDLE_MIN_DURATION`, `HUDDLE_NO_NOTIFY` (suppress notifications), and
-`HUDDLE_NOTIFY_BIN` (use something other than `osascript`).
+`HUDDLE_MIN_DURATION`, `HUDDLE_NO_NOTIFY` (suppress alerts and
+notifications), and `HUDDLE_NOTIFY_BIN` (use something other than
+`osascript`).
 `HUDDLE_MIN_DURATION` must be a whole number of seconds: it is interpolated
 into SQL and also evaluated arithmetically, so anything else is rejected at
 startup rather than trusted.
@@ -391,8 +404,9 @@ and every `--mark-reviewed` guard. `huddle-watch` is covered the same way,
 through its environment overrides and a stub `huddle-transcribe`, so no real
 transcription runs: the readiness predicate (each column gating on its own),
 first-run seeding, dedupe, the attempt cap, the lock, `HUDDLE_MIN_DURATION`
-validation, state-file corruption handling, and notification content.
-Notifications are routed to a stub via `HUDDLE_NOTIFY_BIN`, so running the
+validation, state-file corruption handling, alert content, and alert
+merging (a held stub stands in for an alert still on screen).
+Alerts are routed to a stub via `HUDDLE_NOTIFY_BIN`, so running the
 suite never posts a desktop alert. `huddle-mic-guard` replays a real day's
 coreaudiod events through stub `log` and `ps` commands at a fixed "now". It
 does not cover the real `mw` binary's

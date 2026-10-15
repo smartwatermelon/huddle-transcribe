@@ -883,7 +883,7 @@ if [[ -n "${ALREADY_TRANSCRIBED:-}" ]]; then
   echo "Already transcribed: /tmp/out/${1:0:8}.meta.json"
   exit 0
 fi
-echo "Transcript written: /tmp/out/${1:0:8}.md"
+echo "Transcript written: ${STUB_OUT_PATH:-/tmp/out/${1:0:8}.md}"
 STUB
 chmod +x "$WBIN/huddle-transcribe"
 
@@ -921,8 +921,24 @@ export NOTIFYLOG
 ln -sf "$WBIN/osascript-stub" "$WBIN/osascript"
 export PATH="$WBIN:$PATH"
 
+# Alerts are detached, so the stub may still be writing after a run returns.
+# Wait (bounded) until none remains.
+notify_drain() {
+  local tries=0
+  if ! command -v pgrep >/dev/null 2>&1; then
+    sleep 0.5
+    return 0
+  fi
+  while pgrep -f -- "$WATCH|$WBIN/osascript-" >/dev/null 2>&1 && ((tries < 50)); do
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  return 0
+}
+
 notify_reset() {
-  rm -f "$NOTIFYLOG"
+  notify_drain
+  rm -f "$NOTIFYLOG" "$WSTATE".alert-*
 }
 
 # Synthetic database carrying the readiness columns. One session per gating
@@ -1037,28 +1053,35 @@ build_watch_db
 # watch <args...>: run huddle-watch against the fixture. Every path the
 # watcher could use is repointed, so it can touch nothing real.
 watch() {
+  local rc=0
   env -u FAIL_TRANSCRIBE \
     HUDDLE_DB="$WDB" \
     HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe" \
     HUDDLE_STATE_FILE="$WSTATE" \
     HUDDLE_LOG_FILE="$WLOG" \
     CALLS="$CALLS" \
-    "$WATCH" "$@"
+    "$WATCH" "$@" || rc=$?
+  notify_drain
+  return $rc
 }
 
 # watch_failing <args...>: same, but the stub transcribe exits non-zero.
 watch_failing() {
+  local rc=0
   env FAIL_TRANSCRIBE=1 \
     HUDDLE_DB="$WDB" \
     HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe" \
     HUDDLE_STATE_FILE="$WSTATE" \
     HUDDLE_LOG_FILE="$WLOG" \
     CALLS="$CALLS" \
-    "$WATCH" "$@"
+    "$WATCH" "$@" || rc=$?
+  notify_drain
+  return $rc
 }
 
 watch_reset() {
-  rm -f "$WSTATE" "$WLOG" "$CALLS" "$NOTIFYLOG"
+  notify_drain
+  rm -f "$WSTATE" "$WLOG" "$CALLS" "$NOTIFYLOG" "$WSTATE".alert-*
   rm -rf "$WSTATE.lock"
 }
 
@@ -2314,24 +2337,71 @@ sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', '
 notify_reset
 watch --once >/dev/null 2>&1 || true
 if [[ -f "$NOTIFYLOG" ]]; then
-  pass "a successful run posts a notification through the override"
+  pass "a successful run raises an alert through the override"
 else
-  fail "a successful run posts a notification through the override" \
-    "no notification recorded at $NOTIFYLOG"
+  fail "a successful run raises an alert through the override" \
+    "no alert recorded at $NOTIFYLOG"
 fi
-# The success notification names the transcript file, which is what the user
-# is actually looking for.
-if grep -qF 'with title "Transcript ready"' "$NOTIFYLOG" 2>/dev/null; then
-  pass "the success notification is titled 'Transcript ready'"
+# A dialog that stays until dismissed, not a banner: banners were missed.
+if grep -qxF 'set r to display alert "Meeting transcript ready" message "bbbb2222.md" buttons {"Open Transcript", "OK"} default button "OK"' "$NOTIFYLOG" 2>/dev/null; then
+  pass "the success alert names the transcript and offers 'Open Transcript'"
 else
   diag=$(dump "$NOTIFYLOG")
-  fail "the success notification is titled 'Transcript ready'" "$diag"
+  fail "the success alert names the transcript and offers 'Open Transcript'" "$diag"
 fi
-if grep -qF 'bbbb2222.md' "$NOTIFYLOG" 2>/dev/null; then
-  pass "the success notification names the transcript basename"
+if grep -qxF 'if button returned of r is "Open Transcript" then do shell script "open -- " & quoted form of "/tmp/out/bbbb2222.md"' "$NOTIFYLOG" 2>/dev/null; then
+  pass "'Open Transcript' opens the written transcript path"
 else
   diag=$(dump "$NOTIFYLOG")
-  fail "the success notification names the transcript basename" "$diag"
+  fail "'Open Transcript' opens the written transcript path" "$diag"
+fi
+if grep -qF 'display notification' "$NOTIFYLOG" 2>/dev/null; then
+  diag=$(dump "$NOTIFYLOG")
+  fail "the success alert is a dialog, not a transient banner" "$diag"
+else
+  pass "the success alert is a dialog, not a transient banner"
+fi
+if command -v osacompile >/dev/null 2>&1; then
+  ok_script=()
+  while IFS= read -r line; do ok_script+=(-e "$line"); done <"$NOTIFYLOG"
+  if osacompile -o "$WORK/alert-ok.scpt" "${ok_script[@]}" >/dev/null 2>&1; then
+    pass "the success alert's AppleScript compiles"
+  else
+    diag=$(dump "$NOTIFYLOG")
+    fail "the success alert's AppleScript compiles" "$diag"
+  fi
+else
+  skip "the success alert's AppleScript compiles (osacompile unavailable)"
+fi
+
+# A real transcript path has spaces; quotes and backslashes must survive too.
+build_watch_db
+watch_reset
+watch --once >/dev/null 2>&1 || true
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
+notify_reset
+odd_path='/tmp/out dir/Team "sync" back\slash.md'
+STUB_OUT_PATH="$odd_path" watch --once >/dev/null 2>&1 || true
+open_line=$(grep -F '"open -- "' "$NOTIFYLOG" 2>/dev/null || true)
+if [[ "$open_line" == 'if button returned of r is "Open Transcript" then do shell script "open -- " & quoted form of "/tmp/out dir/Team \"sync\" back\\slash.md"' ]]; then
+  pass "an awkward transcript path is escaped in the open line"
+else
+  diag=$(dump "$NOTIFYLOG")
+  fail "an awkward transcript path is escaped in the open line" "$diag"
+fi
+# Round-trip through real AppleScript, with printf in place of open.
+if [[ ! -x /usr/bin/osascript ]]; then
+  skip "'Open Transcript' hands open the exact transcript path (osascript unavailable)"
+elif [[ -z "$open_line" ]]; then
+  fail "'Open Transcript' hands open the exact transcript path" "no open line recorded"
+else
+  probe_line="${open_line/'"open -- "'/'"printf %s "'}"
+  round=$(/usr/bin/osascript -e 'set r to {button returned:"Open Transcript"}' -e "$probe_line" 2>&1 || true)
+  if [[ "$round" == "$odd_path" ]]; then
+    pass "'Open Transcript' hands open the exact transcript path"
+  else
+    fail "'Open Transcript' hands open the exact transcript path" "got: $round"
+  fi
 fi
 
 # HUDDLE_NO_NOTIFY suppresses entirely, checked before the command -v probe.
@@ -2343,9 +2413,16 @@ env HUDDLE_NO_NOTIFY=1 HUDDLE_DB="$WDB" \
   HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe" \
   HUDDLE_STATE_FILE="$WSTATE" HUDDLE_LOG_FILE="$WLOG" CALLS="$CALLS" \
   "$WATCH" --once >/dev/null 2>&1 || true
-absent "HUDDLE_NO_NOTIFY suppresses notifications" "$NOTIFYLOG"
+notify_drain
+absent "HUDDLE_NO_NOTIFY suppresses alerts" "$NOTIFYLOG"
+if compgen -G "$WSTATE.alert-*" >/dev/null; then
+  stray=$(ls "$WSTATE".alert-* 2>&1 || true)
+  fail "HUDDLE_NO_NOTIFY writes no alert list or pid file" "$stray"
+else
+  pass "HUDDLE_NO_NOTIFY writes no alert list or pid file"
+fi
 
-# The give-up notification must be distinct from the success one and must
+# The give-up alert must be distinct from the success one and must
 # name the log, since that is the only record of what went wrong.
 build_watch_db
 watch_reset
@@ -2355,24 +2432,232 @@ notify_reset
 for _attempt in 1 2 3; do
   watch_failing --once >/dev/null 2>&1 || true
 done
-if grep -qF 'with title "Transcription FAILED"' "$NOTIFYLOG" 2>/dev/null; then
-  pass "the give-up notification is titled 'Transcription FAILED'"
+if grep -qxF "set r to display alert \"Transcription FAILED\" message \"Gave up on bbbb2222 (No Audio Yet) after 3 tries. Log: $WLOG\" buttons {\"Open Log\", \"OK\"} default button \"OK\" as critical" "$NOTIFYLOG" 2>/dev/null; then
+  pass "the give-up alert is critical and names the session and the log"
 else
   diag=$(dump "$NOTIFYLOG")
-  fail "the give-up notification is titled 'Transcription FAILED'" "$diag"
+  fail "the give-up alert is critical and names the session and the log" "$diag"
 fi
-if grep -qF "$WLOG" "$NOTIFYLOG" 2>/dev/null; then
-  pass "the give-up notification names the log path"
+if grep -qxF "if button returned of r is \"Open Log\" then do shell script \"open -- \" & quoted form of \"$WLOG\"" "$NOTIFYLOG" 2>/dev/null; then
+  pass "'Open Log' opens the log file"
 else
   diag=$(dump "$NOTIFYLOG")
-  fail "the give-up notification names the log path" "$diag"
+  fail "'Open Log' opens the log file" "$diag"
 fi
-if grep -qF "Transcript ready" "$NOTIFYLOG" 2>/dev/null; then
+if grep -qF "Meeting transcript ready" "$NOTIFYLOG" 2>/dev/null; then
   diag=$(dump "$NOTIFYLOG")
-  fail "the give-up notification is distinct from the success one" "$diag"
+  fail "the give-up alert is distinct from the success one" "$diag"
 else
-  pass "the give-up notification is distinct from the success one"
+  pass "the give-up alert is distinct from the success one"
 fi
+alert_n=$(grep -c 'display alert' "$NOTIFYLOG" 2>/dev/null || true)
+if [[ "$alert_n" == "1" ]]; then
+  pass "only the give-up raises an alert, not each retryable failure"
+else
+  diag=$(dump "$NOTIFYLOG")
+  fail "only the give-up raises an alert, not each retryable failure" "$diag"
+fi
+if command -v osacompile >/dev/null 2>&1; then
+  fail_script=()
+  while IFS= read -r line; do fail_script+=(-e "$line"); done <"$NOTIFYLOG"
+  if osacompile -o "$WORK/alert-fail.scpt" "${fail_script[@]}" >/dev/null 2>&1; then
+    pass "the give-up alert's AppleScript compiles"
+  else
+    diag=$(dump "$NOTIFYLOG")
+    fail "the give-up alert's AppleScript compiles" "$diag"
+  fi
+else
+  skip "the give-up alert's AppleScript compiles (osacompile unavailable)"
+fi
+
+# The alert is detached: --once must return while it is still on screen.
+cat >"$WBIN/osascript-hold" <<'STUB'
+#!/usr/bin/env bash
+# Like osascript-stub, but stays up like a dialog and records its pid/pgid.
+printf '%s %s\n' "$$" "$(ps -o pgid= -p "$$" | tr -d ' ')" >>"$HOLD_PGIDS"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -e)
+      printf '%s\n' "$2" >>"$NOTIFYLOG"
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+tries=0
+while [[ ! -e "$HOLD_RELEASE" ]] && ((tries < 150)); do
+  sleep 0.1
+  tries=$((tries + 1))
+done
+STUB
+chmod +x "$WBIN/osascript-hold"
+HOLD_RELEASE="$WORK/hold-release"
+HOLD_PGIDS="$WORK/hold-pgids"
+rm -f "$HOLD_RELEASE" "$HOLD_PGIDS"
+build_watch_db
+watch_reset
+watch --once >/dev/null 2>&1 || true
+sqlite3 "$WDB" "INSERT INTO mediafile VALUES (x'bbbb2222', 'mergedMultitrack', 'saved.m4a');"
+notify_reset
+env HUDDLE_NOTIFY_BIN="$WBIN/osascript-hold" HOLD_RELEASE="$HOLD_RELEASE" \
+  HOLD_PGIDS="$HOLD_PGIDS" HUDDLE_DB="$WDB" HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe" \
+  HUDDLE_STATE_FILE="$WSTATE" HUDDLE_LOG_FILE="$WLOG" CALLS="$CALLS" \
+  "$WATCH" --once >/dev/null 2>&1 &
+hold_pid=$!
+tries=0
+while kill -0 "$hold_pid" 2>/dev/null && ((tries < 50)); do
+  sleep 0.1
+  tries=$((tries + 1))
+done
+if kill -0 "$hold_pid" 2>/dev/null; then
+  fail "--once returns while the alert is still open" "still running after 5 s"
+else
+  pass "--once returns while the alert is still open"
+fi
+tries=0
+while ! grep -qF 'Meeting transcript ready' "$NOTIFYLOG" 2>/dev/null && ((tries < 50)); do
+  sleep 0.1
+  tries=$((tries + 1))
+done
+if ! command -v pgrep >/dev/null 2>&1; then
+  skip "the alert outlives the run that raised it (pgrep unavailable)"
+elif grep -qF 'Meeting transcript ready' "$NOTIFYLOG" 2>/dev/null &&
+  pgrep -f -- "$WBIN/osascript-hold" >/dev/null 2>&1; then
+  pass "the alert outlives the run that raised it"
+else
+  diag=$(dump "$NOTIFYLOG")
+  fail "the alert outlives the run that raised it" "$diag"
+fi
+# set -m in alert(): the alert leads its own process group, so launchd's
+# kill of the job's group at exit does not reach it.
+hold_rec=$(head -n1 "$HOLD_PGIDS" 2>/dev/null || true)
+hold_alert_pid="${hold_rec%% *}"
+hold_alert_pgid="${hold_rec##* }"
+suite_pgid=$(ps -o pgid= -p "$$" | tr -d ' ')
+if [[ -n "$hold_alert_pid" && "$hold_alert_pgid" == "$hold_alert_pid" &&
+  "$hold_alert_pgid" != "$suite_pgid" ]]; then
+  pass "the alert runs in its own process group, apart from huddle-watch's"
+else
+  fail "the alert runs in its own process group, apart from huddle-watch's" \
+    "alert pid/pgid=$hold_rec, huddle-watch pgid=$suite_pgid"
+fi
+recorded_pid=$(cat "$WSTATE.alert-ready.pid" 2>/dev/null || true)
+if [[ -n "$recorded_pid" && "$recorded_pid" == "$hold_alert_pid" ]]; then
+  pass "the alert's pid is recorded beside the state file"
+else
+  fail "the alert's pid is recorded beside the state file" \
+    "pid file=$recorded_pid, alert pid=$hold_alert_pid"
+fi
+
+# watch_repend SID: forget SID's done record so the next run transcribes it.
+watch_repend() {
+  grep -v "^$1 " "$WSTATE" >"$WSTATE.tmp" || true
+  mv "$WSTATE.tmp" "$WSTATE"
+}
+
+# A second ready alert while the first is up replaces it with one naming both.
+watch_repend aaaa1111
+env HUDDLE_NOTIFY_BIN="$WBIN/osascript-hold" HOLD_RELEASE="$HOLD_RELEASE" \
+  HOLD_PGIDS="$HOLD_PGIDS" HUDDLE_DB="$WDB" \
+  HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe" \
+  HUDDLE_STATE_FILE="$WSTATE" HUDDLE_LOG_FILE="$WLOG" CALLS="$CALLS" \
+  "$WATCH" --once >/dev/null 2>&1 || true
+merged_show='set r to display alert "2 meeting transcripts ready" message "bbbb2222.md\naaaa1111.md" buttons {"Open Transcripts", "OK"} default button "OK"'
+tries=0
+while ! grep -qxF "$merged_show" "$NOTIFYLOG" 2>/dev/null && ((tries < 50)); do
+  sleep 0.1
+  tries=$((tries + 1))
+done
+if grep -qxF "$merged_show" "$NOTIFYLOG" 2>/dev/null; then
+  pass "a second ready alert merges with the one on screen"
+else
+  diag=$(dump "$NOTIFYLOG")
+  fail "a second ready alert merges with the one on screen" "$diag"
+fi
+if grep -qxF 'if button returned of r is "Open Transcripts" then do shell script "open -- " & quoted form of "/tmp/out/bbbb2222.md" & " " & quoted form of "/tmp/out/aaaa1111.md"' "$NOTIFYLOG" 2>/dev/null; then
+  pass "'Open Transcripts' opens every listed transcript"
+else
+  diag=$(dump "$NOTIFYLOG")
+  fail "'Open Transcripts' opens every listed transcript" "$diag"
+fi
+tries=0
+while [[ -n "$hold_alert_pid" ]] && kill -0 "$hold_alert_pid" 2>/dev/null && ((tries < 50)); do
+  sleep 0.1
+  tries=$((tries + 1))
+done
+if [[ -n "$hold_alert_pid" ]] && ! kill -0 "$hold_alert_pid" 2>/dev/null; then
+  pass "the merged alert closes the one it replaces"
+else
+  fail "the merged alert closes the one it replaces" "pid $hold_alert_pid still running"
+fi
+merged_pid=$(sed -n 2p "$HOLD_PGIDS" 2>/dev/null || true)
+merged_pid="${merged_pid%% *}"
+recorded_pid=$(cat "$WSTATE.alert-ready.pid" 2>/dev/null || true)
+if [[ -n "$merged_pid" ]] && kill -0 "$merged_pid" 2>/dev/null &&
+  [[ "$recorded_pid" == "$merged_pid" ]]; then
+  pass "the merged alert stays up and its pid replaces the old one"
+else
+  fail "the merged alert stays up and its pid replaces the old one" \
+    "merged pid=$merged_pid, pid file=$recorded_pid"
+fi
+if command -v osacompile >/dev/null 2>&1; then
+  merged_script=()
+  while IFS= read -r line; do merged_script+=(-e "$line"); done <"$NOTIFYLOG"
+  if osacompile -o "$WORK/alert-merged.scpt" "${merged_script[@]}" >/dev/null 2>&1; then
+    pass "the merged alert's AppleScript compiles"
+  else
+    diag=$(dump "$NOTIFYLOG")
+    fail "the merged alert's AppleScript compiles" "$diag"
+  fi
+else
+  skip "the merged alert's AppleScript compiles (osacompile unavailable)"
+fi
+touch "$HOLD_RELEASE"
+wait "$hold_pid" 2>/dev/null || true
+notify_drain
+
+# Dismissal runs the alert's rm line. Run it via real AppleScript (no
+# dialog, just do shell script): it must clear the merge state.
+rm_line=$(grep -F '"rm -f -- "' "$NOTIFYLOG" 2>/dev/null | tail -n1 || true)
+if [[ ! -x /usr/bin/osascript ]]; then
+  skip "dismissing an alert clears its list and pid file (osascript unavailable)"
+elif [[ -z "$rm_line" ]]; then
+  fail "dismissing an alert clears its list and pid file" "no rm line recorded"
+elif [[ ! -f "$WSTATE.alert-ready.list" ]]; then
+  fail "dismissing an alert clears its list and pid file" "no list file to clear"
+else
+  /usr/bin/osascript -e "$rm_line" >/dev/null 2>&1 || true
+  if [[ -e "$WSTATE.alert-ready.list" || -e "$WSTATE.alert-ready.pid" ]]; then
+    fail "dismissing an alert clears its list and pid file" "$rm_line"
+  else
+    pass "dismissing an alert clears its list and pid file"
+  fi
+fi
+
+# A pid file naming a live process that is not our alert (pid reuse):
+# never killed or merged with; the next alert starts a fresh list.
+sleep 30 &
+decoy_pid=$!
+printf 'zzzz9999.md%s/tmp/out/zzzz9999.md\n' $'\x1f' >"$WSTATE.alert-ready.list"
+printf '%s\n' "$decoy_pid" >"$WSTATE.alert-ready.pid"
+decoy_list=$(cat "$WSTATE.alert-ready.list")
+rm -f "$NOTIFYLOG"
+watch_repend aaaa1111
+watch --once >/dev/null 2>&1 || true
+if grep -qxF 'set r to display alert "Meeting transcript ready" message "aaaa1111.md" buttons {"Open Transcript", "OK"} default button "OK"' "$NOTIFYLOG" 2>/dev/null; then
+  pass "a pid that is not our alert starts a fresh list"
+else
+  diag=$(dump "$NOTIFYLOG")
+  fail "a pid that is not our alert starts a fresh list" "list was: $decoy_list; $diag"
+fi
+if kill -0 "$decoy_pid" 2>/dev/null; then
+  pass "a pid that is not our alert is not killed"
+else
+  fail "a pid that is not our alert is not killed" "decoy $decoy_pid is gone"
+fi
+kill "$decoy_pid" 2>/dev/null || true
+wait "$decoy_pid" 2>/dev/null || true
+notify_reset
 
 # --- AppleScript escaping ---------------------------------------------
 #
@@ -2408,6 +2693,7 @@ printf 'beef7777 retry\n' >"$WSTATE"
 env HUDDLE_DB="$WDB" HUDDLE_TRANSCRIBE_BIN="$WBIN/huddle-transcribe-silent" \
   HUDDLE_STATE_FILE="$WSTATE" HUDDLE_LOG_FILE="$WLOG" CALLS="$CALLS" \
   "$WATCH" --once >/dev/null 2>&1 || true
+notify_drain
 if [[ -e "$WORK/APPLEPWNED" ]]; then
   fail "a hostile title does not execute via AppleScript" "APPLEPWNED was created"
   rm -f "$WORK/APPLEPWNED"
@@ -2432,11 +2718,17 @@ fi
 # `do shell script` must survive only as inert text inside the quoted string,
 # never as a statement: an unescaped quote before it is what would make it
 # executable.
-if grep -qE 'display notification "([^"\\]|\\.)*" with title' "$NOTIFYLOG" 2>/dev/null; then
+if grep -qE '^set r to display alert "([^"\\]|\\.)*" message "([^"\\]|\\.)*" buttons \{"OK"\} default button "OK"$' "$NOTIFYLOG" 2>/dev/null; then
   pass "the AppleScript body remains a single well-formed string literal"
 else
   diag=$(dump "$NOTIFYLOG")
   fail "the AppleScript body remains a single well-formed string literal" "$diag"
+fi
+if grep -qF '"open -- "' "$NOTIFYLOG" 2>/dev/null; then
+  diag=$(dump "$NOTIFYLOG")
+  fail "with no transcript path, the alert offers only OK" "$diag"
+else
+  pass "with no transcript path, the alert offers only OK"
 fi
 
 # --- --once is required, not inert ------------------------------------

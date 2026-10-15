@@ -125,7 +125,8 @@ Usage: huddle-watch [OPTIONS]
 
 Watches MacWhisper's SQLite database for a session that has finished both
 recording and transcription, then runs `huddle-transcribe <session-id> --yes`
-and posts a macOS notification.
+and raises a macOS alert that stays until dismissed: "Open Transcript" on
+success, or a critical "Open Log" alert when a session is given up on.
 
 Options:
   --once                Process any pending sessions and exit. Required for
@@ -149,8 +150,10 @@ Environment overrides (chiefly for testing):
   HUDDLE_MIN_DURATION   Minimum session duration in seconds (default 300)
   HUDDLE_POLL_INTERVAL  Seconds between timed launchd runs, recorded into the
                         plist by --install (default 600)
-  HUDDLE_NO_NOTIFY      Set to any value to suppress macOS notifications
-  HUDDLE_NOTIFY_BIN     Use this instead of osascript for notifications
+  HUDDLE_NO_NOTIFY      Set to any value to suppress macOS alerts and
+                        notifications
+  HUDDLE_NOTIFY_BIN     Use this instead of osascript for alerts and
+                        notifications
 EOF
 }
 
@@ -278,20 +281,131 @@ log_to_file() {
 #   HUDDLE_NO_NOTIFY=1   suppress notifications entirely
 #   HUDDLE_NOTIFY_BIN    use this instead of osascript (a stub, in tests)
 notify() {
-  local title="$1" message="$2"
+  local title message
+  title=$(as_escape "$1")
+  message=$(as_escape "$2")
   [[ -z "${HUDDLE_NO_NOTIFY:-}" ]] || return 0
   local notify_bin="${HUDDLE_NOTIFY_BIN:-osascript}"
   command -v "$notify_bin" >/dev/null 2>&1 || return 0
-  # The message and title are interpolated into AppleScript, so escape
-  # backslashes first and then double quotes -- a meeting title containing
-  # either would otherwise break the script (or extend it).
-  local esc_msg="$message" esc_title="$title"
-  esc_msg="${esc_msg//\\/\\\\}"
-  esc_msg="${esc_msg//\"/\\\"}"
-  esc_title="${esc_title//\\/\\\\}"
-  esc_title="${esc_title//\"/\\\"}"
-  "$notify_bin" -e "display notification \"$esc_msg\" with title \"$esc_title\"" \
+  "$notify_bin" -e "display notification \"$message\" with title \"$title\"" \
     >/dev/null 2>&1 || true
+}
+
+# Escape for an AppleScript string literal: backslashes first, then quotes.
+as_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+# alert KIND TEXT [PATH]: a dialog that stays until dismissed. KIND is ready,
+# failed or state. An alert of the same kind still on screen is replaced by
+# one listing every item; its button opens each item's PATH.
+alert() {
+  local kind="$1" text="$2" path="${3:-}"
+  [[ -z "${HUDDLE_NO_NOTIFY:-}" ]] || return 0
+  local notify_bin="${HUDDLE_NOTIFY_BIN:-osascript}"
+  command -v "$notify_bin" >/dev/null 2>&1 || return 0
+  local one many open_one open_many level=""
+  case "$kind" in
+    ready)
+      one="Meeting transcript ready" many="meeting transcripts ready"
+      open_one="Open Transcript" open_many="Open Transcripts"
+      ;;
+    failed)
+      one="Transcription FAILED" many="transcriptions FAILED"
+      open_one="Open Log" open_many="Open Log" level="critical"
+      ;;
+    state)
+      one="huddle-transcribe state error" many="huddle-transcribe state errors"
+      open_one="Open Log" open_many="Open Log" level="critical"
+      ;;
+    *) return 0 ;;
+  esac
+  local list="${STATE_FILE}.alert-${kind}.list" pid_file="${STATE_FILE}.alert-${kind}.pid"
+  local esc_list esc_pid
+  esc_list=$(as_escape "$list")
+  esc_pid=$(as_escape "$pid_file")
+  # One list line per item: TEXT, SEP, PATH. A path that cannot sit on one
+  # line is listed but not opened.
+  text="${text//[$'\n'$SEP]/ }"
+  [[ "$path" != *[$'\n'$SEP]* ]] || path=""
+
+  # Merge only with an alert still on screen: a live pid whose command line
+  # is the notify bin AND names this list, so a reused pid is never killed.
+  local texts=() paths=() old_pid old_cmd t p
+  old_pid=$(cat "$pid_file" 2>/dev/null || true)
+  if [[ "$old_pid" =~ ^[0-9]+$ && -f "$list" ]] &&
+    old_cmd=$(ps -ww -o command= -p "$old_pid" 2>/dev/null) &&
+    [[ "$old_cmd" == *"$notify_bin"* && "$old_cmd" == *"$esc_list"* ]]; then
+    while IFS="$SEP" read -r t p; do
+      [[ -n "$t" ]] || continue
+      texts+=("$t")
+      paths+=("$p")
+    done <"$list"
+    kill "$old_pid" 2>/dev/null || true
+  fi
+  texts+=("$text")
+  paths+=("$path")
+  # The list is cosmetic: failing to write it costs only the merge.
+  local list_tmp i
+  if mkdir -p "$(dirname -- "$list")" 2>/dev/null &&
+    list_tmp=$(mktemp "${list}.XXXXXX" 2>/dev/null); then
+    if ! for i in "${!texts[@]}"; do
+      printf '%s%s%s\n' "${texts[i]}" "$SEP" "${paths[i]}"
+    done >"$list_tmp" 2>/dev/null || ! mv -f "$list_tmp" "$list" 2>/dev/null; then
+      rm -f "$list_tmp"
+    fi
+  fi
+
+  local n=${#texts[@]} title message="" opens=() seen
+  if ((n == 1)); then
+    title="$one"
+  else
+    title="$n $many"
+  fi
+  for i in "${!texts[@]}"; do
+    [[ -z "$message" ]] || message+='\n'
+    message+=$(as_escape "${texts[i]}")
+    [[ -n "${paths[i]}" ]] || continue
+    for seen in ${opens[@]+"${opens[@]}"}; do
+      [[ "$seen" != "${paths[i]}" ]] || continue 2
+    done
+    opens+=("${paths[i]}")
+  done
+  local button="" buttons='{"OK"}'
+  if ((${#opens[@]} == 1)); then
+    button="$open_one"
+  elif ((${#opens[@]} > 1)); then
+    button="$open_many"
+  fi
+  [[ -z "$button" ]] || buttons="{\"$button\", \"OK\"}"
+  local show
+  show="set r to display alert \"$(as_escape "$title")\" message \"$message\""
+  show+=" buttons $buttons default button \"OK\""
+  [[ "$level" != "critical" ]] || show+=" as critical"
+  # Any dismissal clears the list; a replaced alert is killed before this.
+  local args=(-e "$show")
+  args+=(-e "do shell script \"rm -f -- \" & quoted form of \"$esc_list\" & \" \" & quoted form of \"$esc_pid\"")
+  if [[ -n "$button" ]]; then
+    local open_cmd="do shell script \"open -- \""
+    for i in "${!opens[@]}"; do
+      ((i == 0)) || open_cmd+=" & \" \""
+      open_cmd+=" & quoted form of \"$(as_escape "${opens[i]}")\""
+    done
+    args+=(-e "if button returned of r is \"$button\" then $open_cmd")
+  fi
+  # Detached, streams closed, so the run never waits on it. set -m gives it
+  # its own process group, which launchd does not kill when the job exits.
+  # Benign race: a dismissal landing mid-replace can re-show a seen item.
+  (
+    set -m
+    "$notify_bin" "${args[@]}" </dev/null >/dev/null 2>&1 &
+    # A torn pid file reads as non-numeric, which only skips the merge.
+    printf '%s\n' "$!" >"$pid_file"
+  ) 2>/dev/null || true
+  return 0
 }
 
 # --- database access ---------------------------------------------------
@@ -1130,6 +1244,7 @@ fi
 if [[ ! -x "$TRANSCRIBE_BIN" ]]; then
   log_to_file "ERROR huddle-transcribe not executable at $TRANSCRIBE_BIN"
   echo "Error: huddle-transcribe not found or not executable at $TRANSCRIBE_BIN" >&2
+  # A banner, not an alert: this fires on every run, so a modal would stack.
   notify "huddle-transcribe failed" "huddle-transcribe not found at $TRANSCRIBE_BIN"
   exit 1
 fi
@@ -1186,14 +1301,15 @@ for entry in "${PENDING[@]}"; do
     echo "Skipped ${sid:0:8}: already transcribed"
   elif [[ $run_rc -eq 0 ]]; then
     # Exit status is the authoritative success signal. The transcript path is
-    # parsed from the success line only to name the file in the notification;
-    # a missing line degrades the message, not the outcome.
+    # parsed from the success line only to name and open the file in the alert;
+    # a missing line degrades the alert, not the outcome.
     out_line=$(grep -m1 '^Transcript written: ' <<<"$run_out" || true)
     out_path="${out_line#Transcript written: }"
     if [[ -n "$out_path" && "$out_path" != "$out_line" ]]; then
       base=$(basename -- "$out_path")
     else
       base="$title"
+      out_path=""
     fi
     # Mark seen ONLY after a successful run, so a transient failure retries.
     # A failure to record it is loud but NOT fatal: the transcription already
@@ -1202,12 +1318,14 @@ for entry in "${PENDING[@]}"; do
     if ! state_set "$sid" "$STATE_DONE"; then
       log_to_file "ERROR could not record success for ${sid:0:8} in $STATE_FILE; it will be re-transcribed"
       echo "Error: transcribed ${sid:0:8} but could not update $STATE_FILE; it will be re-transcribed." >&2
-      notify "huddle-transcribe state error" "Could not record ${sid:0:8}; it will be re-transcribed."
+      alert state \
+        "Could not record ${sid:0:8} in $STATE_FILE; it will be re-transcribed. Log: $LOG_FILE" \
+        "$LOG_FILE"
       overall_rc=1
     fi
     log_to_file "OK ${sid:0:8} -> ${base}"
     echo "Transcribed ${sid:0:8}: $base"
-    notify "Transcript ready" "$base"
+    alert ready "$base" "$out_path"
   else
     attempts=$((attempts + 1))
     if ! state_set "$sid" "$attempts"; then
@@ -1218,7 +1336,9 @@ for entry in "${PENDING[@]}"; do
     if ((attempts >= MAX_ATTEMPTS)); then
       log_to_file "GAVE UP on ${sid:0:8} after $attempts attempt(s) (exit $run_rc)"
       echo "Error: gave up on session ${sid:0:8} after $attempts attempt(s). See $LOG_FILE" >&2
-      notify "Transcription FAILED" "Gave up on ${sid:0:8} after $attempts tries. Log: $LOG_FILE"
+      alert failed \
+        "Gave up on ${sid:0:8} ($title) after $attempts tries. Log: $LOG_FILE" \
+        "$LOG_FILE"
     else
       log_to_file "FAILED ${sid:0:8} (exit $run_rc), attempt $attempts/$MAX_ATTEMPTS; will retry"
       echo "Error: session ${sid:0:8} failed (attempt $attempts/$MAX_ATTEMPTS). See $LOG_FILE" >&2
