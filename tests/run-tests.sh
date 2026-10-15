@@ -1470,6 +1470,18 @@ if [[ $rc -eq 1 ]] && grep -qF "other sidecars in $RS also name" <<<"$mr_out" &&
 else
   fail "--mark-reviewed through an unshared piece refuses while another sidecar holds a shared one" "exit $rc: $mr_out"
 fi
+# A non-string entry in the -2's ids does not switch the shared-piece guard off.
+rs_two_meta="${rs_two%.md}.meta.json"
+cp "$rs_two_meta" "$WORK/rs-two.orig"
+jq '.session_ids += [{}]' "$WORK/rs-two.orig" >"$rs_two_meta"
+mr_out=$("$HT" --mark-reviewed --yes --output-dir "$RS" a1a10003 2>&1) && rc=0 || rc=$?
+mv "$WORK/rs-two.orig" "$rs_two_meta"
+if [[ $rc -eq 1 ]] && grep -qF "other sidecars in $RS also name" <<<"$mr_out" &&
+  [[ -f "$MEDIA/S1_merged.m4a" && -f "$MEDIA/S3 it's merged.m4a" ]]; then
+  pass "--mark-reviewed refuses a shared piece when the sidecar also holds a non-string id"
+else
+  fail "--mark-reviewed refuses a shared piece when the sidecar also holds a non-string id" "exit $rc: $mr_out"
+fi
 
 # A retry that adds nothing (the only new piece fails again) leaves the
 # transcript alone and fails, so the watcher counts the attempt.

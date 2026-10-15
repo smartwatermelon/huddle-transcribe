@@ -1017,7 +1017,12 @@ if [[ $MARK_REVIEWED -eq 1 ]]; then
   # The one sidecar found may hold pieces another sidecar also names; its
   # release would take their audio too, so that refuses the same way.
   if [[ $STITCH -eq 1 && ${#id_matches[@]} -eq 1 ]]; then
-    held_ids=$(jq -r '(.session_ids // [.session_id]) | join(" ")' "${id_matches[0]}" 2>/dev/null || true)
+    # Read the ids as sidecar_index does. An unreadable list fails the run:
+    # an empty one would switch this guard off and the audio would go.
+    if ! held_ids=$(jq -r '[(.session_ids // [.session_id])[] | strings] | join(" ")' "${id_matches[0]}" 2>/dev/null); then
+      echo "Error: cannot read the session ids in $(basename "${id_matches[0]}"); refusing to delete source audio." >&2
+      exit 1
+    fi
     sharing=$(sidecar_index | awk -F"$SEP" -v m="${id_matches[0]}" -v ids="$held_ids" '
       BEGIN { n = split(ids, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
       ($1 in want) && $2 != m { print $2 }' | sort -u)
