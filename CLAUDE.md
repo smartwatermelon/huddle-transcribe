@@ -543,9 +543,9 @@ path is not spelled out here since it embeds the account's Drive email).
 
 ## CI
 
-`lint.yml` runs shellcheck, shfmt, an exec-bit check, `--help`, and the
-behavioral suite on every PR, with both tools pinned by version and SHA so
-CI and local dev agree.
+`lint.yml` runs shellcheck, shfmt, an exec-bit check, and `--help`
+on every PR, with both tools pinned by version and SHA so CI and local dev
+agree. `sanity.yml` runs the behavioral suite (`tests/run-tests.sh`).
 
 The other three workflows are thin caller stubs for reusable workflows in
 `smartwatermelon/github-workflows`. Read the header comment in

@@ -197,7 +197,7 @@ jobs:
       # The scripts are the deliverable and are installed by symlink, so a
       # lost exec bit breaks a fresh clone in a way nothing else here
       # catches. tests/ is excluded: the suite is invoked as ./run-tests.sh
-      # but a lost bit there fails the Behavioral tests step loudly anyway.
+      # but a lost bit there fails the sanity job loudly anyway.
       - name: Check executable bit
         env:
           SCRIPTS: ${{ steps.scripts.outputs.list }}
@@ -255,21 +255,3 @@ jobs:
             rm -rf "$fake_home"
           done
           exit "$rc"
-
-      # The behavioral suite is the only check that exercises what this
-      # script actually does -- session selection, row parsing, and the
-      # --mark-reviewed guards that stand between a typo and a deleted
-      # recording. Linting alone would pass every data-loss bug this repo
-      # has had. sqlite3 and jq are preinstalled on ubuntu-latest; assert
-      # that rather than discovering it as a confusing test failure.
-      - name: Check test prerequisites
-        run: |
-          for dep in sqlite3 jq; do
-            if ! command -v "$dep" >/dev/null 2>&1; then
-              echo "::error::$dep is required by tests/run-tests.sh but is not installed" >&2
-              exit 1
-            fi
-          done
-
-      - name: Behavioral tests
-        run: ./tests/run-tests.sh

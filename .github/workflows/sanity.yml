@@ -1,0 +1,33 @@
+name: Sanity
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  sanity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The suite needs sqlite3 and jq. Both ship on ubuntu-latest; assert
+      # that so a missing tool is a clear error, not a confusing test failure.
+      - name: Check test prerequisites
+        run: |
+          for dep in sqlite3 jq; do
+            if ! command -v "$dep" >/dev/null 2>&1; then
+              echo "::error::$dep is required by tests/run-tests.sh but is not installed" >&2
+              exit 1
+            fi
+          done
+
+      # Real scripts run against a synthetic database and stubbed tools.
+      - name: Behavioral tests
+        run: ./tests/run-tests.sh
