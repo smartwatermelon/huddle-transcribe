@@ -1,11 +1,6 @@
 name: Dependabot Auto-Merge
 
 on: # zizmor: ignore[dangerous-triggers] required to run from base branch; no PR code executed here
-  # This suppression is only valid as long as this caller stays a thin
-  # delegate: no actions/checkout, no execution of PR-controlled code.
-  # See "Security invariant: no actions/checkout" below for the full
-  # justification. If you add checkout or run PR content in this file,
-  # remove this suppression — it would then be hiding a real risk.
   pull_request_target:
     types: [opened, synchronize, reopened]
 
@@ -14,18 +9,10 @@ permissions:
   pull-requests: write
 
 jobs:
-  # This caller stub is intentionally a thin delegate, not a full
-  # implementation. The version-comparison logic, the dependabot/actions
-  # always-trusted namespace defaults, and the actor-spoofing guard all
-  # live in the canonical workflow (smartwatermelon/github-workflows,
-  # this file) rather than here — a local diff that only shows this
-  # stub shrinking will not show that logic; it moved, not disappeared.
-  # See smartwatermelon/dev-env#20 for why: copy-pasting this workflow
-  # into every consuming repo meant fixing a bug meant editing N repos,
-  # not one. The tag pin below (not a SHA) is deliberate: reusable
-  # workflows here use a repo-wide semver tag convention (see
-  # "Versioning" below), not per-action SHA pinning.
   dependabot-auto-merge:
-    uses: smartwatermelon/github-workflows/.github/workflows/dependabot-auto-merge.yml@dependabot-auto-merge-v2
+    uses: smartwatermelon/github-workflows/.github/workflows/dependabot-auto-merge.yml@dependabot-auto-merge-v3.1.0
     with:
-      trusted_namespaces: 'twistedmelonman' # this repo's own org; dependabot/actions are always trusted
+      sanity_checks: 'sanity' # sanity.yml: sanity job
+    secrets: # these two by name; never `secrets: inherit`
+      MERGE_APP_CLIENT_ID: ${{ secrets.MERGE_APP_CLIENT_ID }}
+      MERGE_APP_PRIVATE_KEY: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
